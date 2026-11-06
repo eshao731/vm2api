@@ -16,11 +16,11 @@ const IDENTITY_KEYS = [
   'client_metadata',
 ]
 
-export function stripCodexIdentity(body = {}) {
+export function stripCodexIdentity(body = {}, { preserveMetadata = false } = {}) {
   if (!body || typeof body !== 'object') return {}
   const next = { ...body }
   for (const key of IDENTITY_KEYS) delete next[key]
-  if (next.metadata && typeof next.metadata === 'object') {
+  if (!preserveMetadata && next.metadata && typeof next.metadata === 'object') {
     const metadata = { ...next.metadata }
     delete metadata.user_id
     delete metadata.device_id
@@ -358,11 +358,13 @@ export function anthropicToCodexResponses(body = {}) {
   })
 }
 
-export function toCodexResponses(protocol, body, convert = {}) {
-  const stripped = stripCodexIdentity(body)
+export function toCodexResponses(protocol, body, convert = {}, { officialPassthrough = false } = {}) {
+  const preserveOfficial = officialPassthrough && protocol === 'openai.responses'
+  const stripped = stripCodexIdentity(body, { preserveMetadata: preserveOfficial })
   const fast = normalizeFastAliasBody(stripped)
   if (!fast.ok) return fast
   const normalized = fast.body
+  if (preserveOfficial) return { ok: true, body: normalized, converted: false }
   if (protocol === 'openai.responses') {
     return {
       ok: true,

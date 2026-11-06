@@ -1638,3 +1638,36 @@ test('a woken GPT waiter whose seat was taken re-parks first instead of waking t
   rt.resetOpenAIAccountRuntime()
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('official Codex content passthrough preserves sampling while rebuilding the outbound session', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-official-'))
+  writeGptVm(root, 'vm-gpt-a')
+  try {
+    const { envelopes } = await hopCodex({
+      root,
+      headers: { 'user-agent': 'codex_cli_rs/0.160.0', 'x-session-id': 'caller-session' },
+      routing: { codex: { official_passthrough: true }, sticky: { outbound_session: 'passthrough' } },
+      body: {
+        model: 'gpt-5.5',
+        input: 'keep-string',
+        instructions: 'caller instructions',
+        max_output_tokens: 8192,
+        temperature: 0.2,
+        prompt_cache_key: 'caller-key',
+        conversation_id: 'caller-conversation',
+        session_id: 'caller-session',
+        stream: false,
+      },
+    })
+    assert.equal(envelopes.length, 1)
+    assert.equal(envelopes[0].body.input, 'keep-string')
+    assert.equal(envelopes[0].body.instructions, 'caller instructions')
+    assert.equal(envelopes[0].body.max_output_tokens, 8192)
+    assert.equal(envelopes[0].body.temperature, 0.2)
+    assert.notEqual(envelopes[0].body.prompt_cache_key, 'caller-key')
+    assert.equal(envelopes[0].body.conversation_id, undefined)
+    assert.equal(envelopes[0].body.session_id, undefined)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

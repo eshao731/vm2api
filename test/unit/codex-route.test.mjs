@@ -123,3 +123,11 @@ test('PUT websocket patch rejects non-booleans and illegal transport', () => {
     },
   })
 })
+test('official Codex passthrough defaults off and round-trips', () => {
+  assert.equal(normalizeCodexRouting().official_passthrough, false)
+  assert.equal(normalizeCodexRouting({ official_passthrough: true }).official_passthrough, true)
+  assert.throws(
+    () => validateInferenceWebsocketPatch({ codex: { official_passthrough: 'yes' } }),
+    (err) => err.code === 'invalid_codex_official_passthrough',
+  )
+})

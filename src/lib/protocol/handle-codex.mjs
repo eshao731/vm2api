@@ -593,7 +593,10 @@ export async function handleCodexProtocol({
       error: { type: 'permission_error', code: restriction.code, message: restriction.message },
     })
   }
-  const converted = toCodexResponses(protocol, ctx.body, codex.convert)
+  const officialCodexPassthrough = codex.official_passthrough === true && restriction.kind === 'official_codex'
+  const converted = toCodexResponses(protocol, ctx.body, codex.convert, {
+    officialPassthrough: officialCodexPassthrough,
+  })
   if (!converted.ok) {
     stats.errors++
     logBag.via = 'codex-kernel'
@@ -633,7 +636,7 @@ export async function handleCodexProtocol({
   // Upstream Codex always streams; the caller still chooses JSON versus SSE.
   const stream = isClientStream(inbound || ctx.body, req.headers) && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
-  const sessionMode = outboundSessionMode(routing)
+  const sessionMode = officialCodexPassthrough ? 'rebuild' : outboundSessionMode(routing)
   const callerSession = extractCallerSession({
     inbound: converted.body,
     body: converted.body,
