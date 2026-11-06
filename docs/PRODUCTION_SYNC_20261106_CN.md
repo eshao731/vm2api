@@ -30,3 +30,15 @@
 - 对环境相关项复核：切换普通用户并去除镜像自带 KIN 运行变量后，kernel-router/kvm-runtime 67/67 通过，worker 控制面 gid 测试在普通用户下通过。地理探测文件在 90 秒限时下通过（原全量限时 60 秒）。
 - 仍失败的三个配置发布断言（seed-settings、routing-runtime-load、telemetry-status）在未修改源码的官方固定 digest 镜像上逐项复现，属于该测试环境/社区基线既有问题；此次没有修改这些模块。
 - macOS / Node 24 的全量运行在内核安装锁测试停滞，已停止；同文件 Linux / Node 22 的 5 项测试通过。
+
+## 线上发布记录
+
+2026-11-06 16:06（北京时间）完成切换。运行代码提交 `b1ef00a3`；后续本分支提交仅补充本核对文档。
+
+- 运行镜像 `vm2api:production-b1ef00a3`，镜像 ID `sha256:34f187b1db85b130730aa40b4899a27ba7591fd89109a6d71e5c899a57926867`，版本 `1.4.048`。
+- Codex payload SHA-256 为 `afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a`，与社区固定清单一致。
+- 一致性状态备份：客体 `/root/vm2api-backups/20261106T080618Z-pre-production-b1ef00a3/state.tar.gz.enc`，恢复密钥在同目录 `restore.key`，目录和文件仅 root 可读；旧镜像保留。
+- 管理 HTTPS 200、`/health` 正常、模型目录 200。真实 `gpt-6-luna` 非流式 Responses 返回 HTTP 200、`completed`、文本 `OK`。
+- CPA、New API、Codex2API、Nginx、专用 VM 和隔离防火墙均 active；槽位容器保持运行。
+- 删除本地已承接的 `codex/fix-codex-relay-reliability` 分支，同步本地 `main`；保留两个原有未跟踪部署文档。仅一个工作目录，没有多余 worktree。社区和其他远程功能分支保留。
+- 清除客体此次验证用镜像和宿主/客体临时源码传输包；保留生产构建源、验证日志、旧镜像和备份以供复现及回滚。
