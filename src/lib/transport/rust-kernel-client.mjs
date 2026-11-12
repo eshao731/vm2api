@@ -3,7 +3,16 @@
  * go-worker-client; the socket is run/kernel.sock instead of worker.sock.
  */
 import path from 'node:path'
-import { callGoWorker, callWorkerPost, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+import {
+  callGoWorker,
+  callWorkerPost,
+  credentialSummary,
+  streamGoWorker,
+  workerHealth,
+  workerPaths,
+} from './go-worker-client.mjs'
+import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
 
 function licenseCheck(opts) {
@@ -62,12 +71,36 @@ export async function postRustKernelTelemetryEvent(exec, event, options = {}) {
   return remapVia(await callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/events', event, options))
 }
 
+export function withCragCredential(exec, health) {
+  if (!health || health.credential) return health
+  const native = health.runtime_variant === 'crag-v2' || (health.dataplane === 'crag' && health.kernel_version === 'v2')
+  if (!native) return health
+  const file = readWorkerCredentialFile(exec?.homeDir)
+  if (!file) return health
+  return { ...health, credential: credentialSummary(file) }
+}
+
 export async function rustKernelHealth(exec, opts = {}) {
   const health = await workerHealth(withRustKernelExec(exec), opts)
-  if (health?.source) {
-    return { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
-  }
-  return health
+  const reported = health?.source
+    ? { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
+    : health
+  return withCragCredential(exec, reported)
+}
+
+export function supportsGatewayPolicy(health) {
+  return health?.gateway_policy_v1 === true && cragV2KernelActive({ health })
+}
+
+export function gatewayPolicyReady(health) {
+  return (
+    supportsGatewayPolicy(health) &&
+    health.ok === true &&
+    (health.status == null || health.status === 200) &&
+    health.healthy !== false &&
+    health.ready !== false &&
+    health.recovering !== true
+  )
 }
 
 export function rustKernelProcessUp(health) {
@@ -79,6 +112,7 @@ export function rustKernelProcessUp(health) {
 }
 
 export function rustKernelCliReady(health) {
+  if (health?.ready === false || health?.license_valid === false) return false
   if (health?.ready_slots == null) return true
   const n = Number(health.ready_slots)
   return Number.isFinite(n) && n > 0
@@ -92,15 +126,25 @@ export function rustKernelCliReady(health) {
  */
 export function rustKernelBusy(health) {
   if (!rustKernelProcessUp(health)) return false
-  if (health?.healthy === false) return false
+  if (health?.healthy === false || health?.license_valid === false) return false
   if (health?.recovering === true) return true
   if (rustKernelCliReady(health)) return false
+  if (cragV2KernelActive({ health })) {
+    return (
+      Number(health.active) > 0 || Number(health.waiting) > 0 || Number(health.queued) > 0 || health.pids?.length > 0
+    )
+  }
   const pid = finiteNumber(health?.cli_pid)
   return pid != null && pid > 0
 }
 
 export function rustKernelReachable(health) {
-  return rustKernelProcessUp(health) && health?.healthy !== false && rustKernelCliReady(health)
+  return (
+    rustKernelProcessUp(health) &&
+    health?.healthy !== false &&
+    health?.recovering !== true &&
+    rustKernelCliReady(health)
+  )
 }
 
 /** Only the container restart (L4) can help: the kernel is gone, gave up on CLI, or all slots are closed. */

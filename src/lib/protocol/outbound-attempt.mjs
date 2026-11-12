@@ -23,6 +23,7 @@ import {
   sessionIdFromOutboundBody,
 } from '../identity/identity-rewrite.mjs'
 import { resolveCrsHeaders } from '../identity/crs-headers.mjs'
+import { officialClaudeCliUa } from '../identity/vm-identity.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
 import { withRequestProtocolBetas } from './claude-code-betas.mjs'
 import {
@@ -34,6 +35,7 @@ import {
   CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
   CRS_COMPACT_IDENTITY,
+  ccEntrypointFromRouting,
 } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import {
@@ -414,6 +416,27 @@ export function prepareCliHopBody(
         const ttl = markers.some((marker) => marker.ttl !== '1h') ? '5m' : cacheTtl
         body.messages = officialMessageMarker(body.messages, ttl, Math.min(2, available))
       }
+      // These CLI presets always stamp both system boundaries, including one
+      // Node may have unmarked while preserving interpolated caller anchors.
+      // Budget the final wire shape, retaining the newest message anchors.
+      if (personaPreset === 'official' || personaPreset === 'official_full') {
+        const markers = listCacheMarkers(body)
+        const prefixCount = markers.filter((marker) => marker.section !== 'messages').length
+        const messages = markers.filter((marker) => marker.section === 'messages')
+        const excess = messages.length - Math.max(0, 4 - Math.max(2, prefixCount))
+        if (excess > 0) {
+          const drop = new Set(messages.slice(0, excess).map((marker) => `${marker.index}:${marker.blockIndex}`))
+          body.messages = body.messages.map((message, index) => {
+            if (!Array.isArray(message?.content)) return message
+            const content = message.content.map((block, blockIndex) => {
+              if (!drop.has(`${index}:${blockIndex}`)) return block
+              const { cache_control, ...rest } = block
+              return rest
+            })
+            return { ...message, content }
+          })
+        }
+      }
     }
   }
   return applyEagerToolStreaming(body, routing)
@@ -520,7 +543,7 @@ export function prepareOutboundAttempt({
   return { body: tools.body, toolNames }
 }
 
-export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m } = {}) {
+export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m, routing } = {}) {
   if (isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)) {
     return {
       'user-agent': INFERENCE_UA,
@@ -528,7 +551,10 @@ export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { c
       'anthropic-beta': isApiKeyMode(credentialMode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(model),
     }
   }
-  return resolveCrsHeaders(reqHeaders, homeDir, identity, model, { want1m: want1m === true })
+  const headers = resolveCrsHeaders(reqHeaders, homeDir, identity, model, { want1m: want1m === true })
+  // Slot identity supplies the version; the saved protocol setting owns the entrypoint.
+  headers['user-agent'] = officialClaudeCliUa(headers['user-agent'], ccEntrypointFromRouting(routing))
+  return headers
 }
 
 /** Body + headers after the context_management ↔ context-management beta gate. */
@@ -608,6 +634,7 @@ export function prepareOutboundEnvelope({
       prepared.body?.model || inbound?.model || canonicalBody?.model,
       {
         credentialMode,
+        routing,
         want1m: want1m === true || hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(canonicalBody?.model),
       },
     ),

@@ -60,6 +60,13 @@ function imageUrlOf(part) {
   if (typeof part?.image_url === 'string') return part.image_url
   if (typeof part?.image_url?.url === 'string') return part.image_url.url
   if (typeof part?.url === 'string') return part.url
+  const source = part?.source
+  if (source && typeof source === 'object') {
+    if (source.type === 'base64' && typeof source.data === 'string' && typeof source.media_type === 'string') {
+      return `data:${source.media_type};base64,${source.data}`
+    }
+    if (source.type === 'url' && typeof source.url === 'string') return source.url
+  }
   return ''
 }
 
@@ -237,6 +244,8 @@ export function completionsToCodexResponses(body = {}) {
     stream: body.stream !== false,
     store: false,
   }
+  if (body.reasoning) out.reasoning = body.reasoning
+  if (body.reasoning_effort) out.reasoning_effort = body.reasoning_effort
   if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
   if (body.service_tier != null) out.service_tier = body.service_tier
   return out
@@ -253,7 +262,7 @@ export function codexTextInput(text) {
   ]
 }
 
-export const CODEX_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+export const CODEX_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 export const DEFAULT_CODEX_REASONING_EFFORT = 'medium'
 
 export function normalizeCodexReasoningEffort(raw) {

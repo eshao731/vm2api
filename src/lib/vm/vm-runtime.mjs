@@ -16,7 +16,7 @@ import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { checkCragLicense } from './crag-license.mjs'
+import { checkCragLicense, projectCragUniversalVm } from './crag-license.mjs'
 import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
 import {
   assertCliHopAllowed,
@@ -49,6 +49,7 @@ import { ensureKvmMachineRecord, kvmContainerEnvIncomplete, kvmMachineFields } f
 import { probeLocalKvm } from './kvm-host.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
 import { isDockerInspectNotFound } from './docker-container.mjs'
+import { kernelCpuCommand, usesKernelCpuLimit } from './kernel-cpu.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -60,6 +61,34 @@ const PUBLIC_IP = process.env.PUBLIC_HOST || '166.88.96.199'
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const CRAG_V2_SECCOMP_PATH = fileURLToPath(new URL('./crag-v2-seccomp.json', import.meta.url))
 const CRAG_V2_SECCOMP = JSON.parse(fs.readFileSync(CRAG_V2_SECCOMP_PATH, 'utf8'))
+function apparmorUserNamespaceRestricted() {
+  try {
+    return fs.readFileSync('/proc/sys/kernel/unprivileged_userns_apparmor_policy', 'utf8').trim() === '1'
+  } catch {
+    return false
+  }
+}
+
+function hostAppArmorEnabled() {
+  try {
+    return fs.readFileSync('/sys/module/apparmor/parameters/enabled', 'utf8').trim() === 'Y'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * docker-default denies writes under /proc/self (uid_map, setgroups, gid_map)
+ * and denies mount. Guest identity needs both, so the denial is EACCES (13),
+ * not the seccomp EPERM (1). The Ubuntu userns sysctl is only one of the cases.
+ */
+export function cragV2NeedsApparmorUnconfined(options = {}) {
+  if (Object.hasOwn(options, 'appArmorEnabled') || Object.hasOwn(options, 'userNamespaceRestricted')) {
+    return options.appArmorEnabled === true || options.userNamespaceRestricted === true
+  }
+  return hostAppArmorEnabled() || apparmorUserNamespaceRestricted()
+}
+
 // Root in the runner must write into the slot-uid 0700 dirs and drop qemu to the slot uid.
 export const KVM_CAPS = ['SETUID', 'SETGID', 'SETPCAP', 'CHOWN', 'FOWNER', 'DAC_OVERRIDE']
 
@@ -175,6 +204,7 @@ function parseInspectStdout(name, stdout) {
     restarting,
     restartPolicy,
     securityOpts,
+    init,
   ] = stdout.split('|')
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
@@ -192,11 +222,12 @@ function parseInspectStdout(name, stdout) {
     role: String(role || '').trim() || null,
     restartPolicy: restartPolicy || null,
     securityOpts: securityOpts ? JSON.parse(securityOpts) : [],
+    init: init === 'true',
   }
 }
 
 const INSPECT_FORMAT =
-  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}|{{json .HostConfig.SecurityOpt}}'
+  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}|{{json .HostConfig.SecurityOpt}}|{{.HostConfig.Init}}'
 
 /**
  * @returns {{ status: 'found', container: object } | { status: 'missing' } | { status: 'error', error: string, code?: number }}
@@ -238,8 +269,8 @@ export function suspendVmRuntimeRestart(vm, { run = sh } = {}) {
   return { ok: result.ok === true, code: result.ok ? undefined : 'kernel_restart_policy_failed', error: result.stderr }
 }
 
-/** Docker cannot change seccomp on restart; upgrade only targets missing this exact narrow profile. */
-export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
+/** Docker cannot change seccomp or AppArmor on restart. */
+export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, options = {}) {
   if (
     !existing ||
     isKvmRuntime(vm) ||
@@ -247,7 +278,8 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
     resolveCragKernelVersion(vm, routing) !== 'v2'
   )
     return false
-  return !(existing.securityOpts || []).some((option) => {
+  const opts = existing.securityOpts || []
+  const seccompOk = opts.some((option) => {
     if (option === `seccomp=${CRAG_V2_SECCOMP_PATH}`) return true
     if (!option.startsWith('seccomp=')) return false
     try {
@@ -256,6 +288,9 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
       return false
     }
   })
+  if (!seccompOk) return true
+  const needsUnconfined = cragV2NeedsApparmorUnconfined(options)
+  return (needsUnconfined && !opts.includes('apparmor=unconfined')) || existing.init !== true
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
@@ -283,14 +318,15 @@ export const CODEX_SLOT_ROLE = 'codex'
  * Claude local_cli with no Claude credential, which times out and exits every
  * few minutes under `--restart unless-stopped`.
  */
-export function slotContainerCommand(vm, { wrapKernel = false } = {}) {
+export function slotContainerCommand(vm, { wrapKernel = false, routing = {} } = {}) {
   if (isCodexVm(vm)) return ['sleep', 'infinity']
-  return [
+  const argv = [
     wrapKernel ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
     '--gateway-worker',
     '--config',
     '/run/kin/kernel.json',
   ]
+  return usesKernelCpuLimit(vm, routing) ? kernelCpuCommand(argv) : argv
 }
 
 /** A GPT slot container created before CODEX_SLOT_ROLE still runs kin-kernel as PID 1. */
@@ -486,8 +522,9 @@ export function slotWorkerNeedsRecreate(existing, vm, paths) {
 
 /**
  * Rewrite worker.json from the current vm proxy and bounce the process.
- * Recreate when the kernel is dead or NetworkMode != slotNetworkForVm(vm);
- * otherwise never docker rm — killing a live worker mid-refresh can invalidate the grant.
+ * Recreate when the kernel is dead, NetworkMode != slotNetworkForVm(vm),
+ * or a CRAG v2 container lacks the user-namespace seccomp, AppArmor profile, or init.
+ * Otherwise never docker rm — killing a live worker mid-refresh can invalidate the grant.
  * KVM without a relay sock is still live and must not be recreated for that reason.
  * KVM restarts the guest kin-kernel unit; docker restart would reboot the VM.
  */
@@ -513,7 +550,11 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
   const existing = inspectContainer(name)
   if (!existing) return await startVmRuntime(vm, projectRoot, { recreate: false, routing })
   // Before the KVM branch so a runner on the wrong kin-eg-* is recreated too.
-  if (slotWorkerNeedsRecreate(existing, vm, paths)) {
+  // Docker restart keeps HostConfig, so a pre-sandbox CRAG v2 container stays EPERM until rm.
+  if (
+    slotWorkerNeedsRecreate(existing, vm, paths) ||
+    nativeSlotSandboxNeedsRecreate(existing, vm, resolveSlotRouting(projectRoot, routing))
+  ) {
     return await startVmRuntime(vm, projectRoot, { recreate: true, routing })
   }
   if (isKvmRuntime(vm)) {
@@ -684,7 +725,7 @@ export function shouldReplaceSlotContainer({ existing, recreate = false, network
   return !!(wrongNet || wrongImg || wrongRuntime)
 }
 
-function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios }) {
+function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios, routing }) {
   const m = kvmMachineFields(vm)
   // Current kin-kvm-entry requires these vars, then uses qemu-smbios.args for -smbios.
   // A missing fingerprint field stays "-", never the OptiPlex default. smc_version and
@@ -715,6 +756,7 @@ function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, 
     `KIN_KVM_MACHINE_ID=${machineId}`,
     `KIN_KVM_ACCEL=${accel}`,
     `KIN_KVM_SHARES=${shares}`,
+    ...(usesKernelCpuLimit(vm, routing) ? ['KIN_KVM_KERNEL_CPU_LIMIT=1'] : []),
   ]
 }
 
@@ -920,13 +962,14 @@ export function buildKvmRunArgs({
   shares = 'home,run',
   hostOf = (p) => p,
   projectRoot,
+  routing = {},
 }) {
   const slotName = displayName(vm.id)
   const mem = kvmContainerMemory(memory)
   const memMb = memoryMiB(memory)
   const machineId = String(vm.fingerprint?.guest_machine_id || vm.fingerprint?.machine_id || '').trim()
   const smbios = readFingerprintSmbios(kvmDir)
-  const env = kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios })
+  const env = kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios, routing })
   const capAdd = KVM_CAPS.flatMap((cap) => ['--cap-add', cap])
   const device = accel === 'kvm' ? ['--device', '/dev/kvm'] : []
   return [
@@ -998,6 +1041,7 @@ export function dockerSlotResourceArgs(vm, routing) {
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
   const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
   if (!licensed.ok) return licensed
+  if (licensed.license?.scope === 'kernel') await projectCragUniversalVm(projectRoot, vm)
   if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
   if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
     const recorded = vm.runtime?.accel
@@ -1178,6 +1222,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       shares: 'home,run',
       hostOf,
       projectRoot,
+      routing: resolvedRouting,
     })
   } else {
     const machineMounts = machineIdFile
@@ -1215,7 +1260,15 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       'no-new-privileges',
       ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
       resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
-        ? ['--security-opt', `seccomp=${CRAG_V2_SECCOMP_PATH}`]
+        ? ['--init']
+        : []),
+      ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
+      resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
+        ? [
+            '--security-opt',
+            `seccomp=${CRAG_V2_SECCOMP_PATH}`,
+            ...(cragV2NeedsApparmorUnconfined() ? ['--security-opt', 'apparmor=unconfined'] : []),
+          ]
         : []),
       '--cap-drop',
       'ALL',
@@ -1265,7 +1318,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '-w',
       '/home/kincli',
       image,
-      ...slotContainerCommand(vm, { wrapKernel: fs.existsSync(wrapKernel) }),
+      ...slotContainerCommand(vm, { wrapKernel: fs.existsSync(wrapKernel), routing: resolvedRouting }),
     ]
   }
 

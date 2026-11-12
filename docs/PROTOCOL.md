@@ -8,9 +8,9 @@
 
 ## CRAG native V2 部署边界
 
-仅 `dataplane: "crag"` 且显式 `crag_kernel_version: "v2"` 的本地 Linux Docker 槽采用 native V2；省略版本仍选 legacy ELF。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude；不接受旧 Node、明文 native V2 或未 bundled 的独立部署变体。
+`dataplane: "crag"` 一律采用 native V2 与官方 Claude；省略版本和已存的 `legacy` 也走 v2，不再安装 `cc-node` 或 `share/crag/kin-kernel`。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude；不接受旧 Node、明文 native V2 或未 bundled 的独立部署变体。
 
-物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，Claude 位于 `.kin/crag-v2/claude-code-2.1.317/claude`；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart 流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
+物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，Claude 位于 `.kin/crag-v2/claude-code-2.1.321/claude`；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart 流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
 
 所有 CRAG 选择与正常 hop 都要求该 VM 的离线注册码；V2 原生网关再次校验签名、设备绑定和当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 注册码。
 
@@ -69,6 +69,20 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该值仅是默认值，不覆盖请求头、请求显式 TTL、已有会话锁定值或 system 模板显式 TTL；官方透传的调用方 marker 及缺失 TTL 保持原样。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
+### CRAG v2 print
+
+CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.321`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。是否走 print 只看这台 VM 实际启用的内核：运行中的 health `runtime_variant=crag-v2` 优先，其次是槽位自己写明的 `dataplane` / `crag_kernel_version`，再其次是该槽 `run/kernel.json`。全局 `routing.inference` 不能把 wrap、cc 或未写内核的槽送上 print。legacy CRAG 仍走 cli-node。
+
+system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认 `compatibility.crag_persona_preset`：
+
+| 值 | 清洗 |
+|----|------|
+| `official_full`（缺省） | 不把官方四块 system 再贴进去。调用方剩余文本走 `crag_prompt.mode=append`（裸 `system` 在 v2 里也是 append）。≤ 64 KiB 才是 `--append-system-prompt`；更长由 helper 写进用户消息，不是 system 缓存块。没有尾巴就不发 system 旗标。 |
+| `zero` | 必须 `crag_prompt.mode=replace`。超过 64 KiB 直接 400，不假装替换成功。没有调用方文本时发不出 replace。`--system-prompt` 是否换掉 identity/harness/guidance，2.1.303 没复抓，未证实。 |
+
+槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
+
+
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
 Go worker JSON 透传，不必因人设重建 worker。
@@ -104,7 +118,7 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 ## beta 与 1M
 
 - 存盘的 `kin-cc-headers.json` **只**留 `anthropic-version` / `anthropic-beta`。UA、stainless、session、accept-language 只出槽位指纹 + 代码 pin。
-- 出站 UA 使用 `claude-cli/<当前档版本> (external, <CLAUDE_CODE_ENTRYPOINT>)`，缺省 `cli`；kernel 启动的 Agent SDK CLI 槽设置为 `sdk-cli`。Stainless 是 `js` / `Linux` / `x64` / `node` / `v26.3.0` / `0.128.0`，`retry-count=0`；CLI 把配置的毫秒 timeout 转为秒写入头（缺省 `600`）。CCH 是 billing body 参数，不属于 UA。
+- Node 协议清洗和 worker envelope 的 UA 入口统一读取 `routing.compatibility.cc_entrypoint`（缺省 `cli`，可显式选择 `sdk-cli`），覆盖槽位身份中的旧入口，不采用调用方 UA；版本号仍取槽位身份 / 代码 pin。Setup Token / API Key 的 inference-only UA 不变。原生 cli-node 的最终 UA 由 CLI 读取 `kernel.json.cc_entrypoint` 生成，不把 envelope 当作最终抓包。Stainless 是 `js` / `Linux` / `x64` / `node` / `v26.3.0` / `0.128.0`，`retry-count=0`；CLI 把配置的毫秒 timeout 转为秒写入头（缺省 `600`）。CCH 是 billing body 参数，不属于 UA。
 - cli-node SDK 请求显式带 `Accept: application/json, text/event-stream`、`Accept-Encoding: gzip, br`。`Content-Length` 在 CCH 密封和最终序列化之后按 UTF-8 字节数设置；不是响应长度，不能拿它填写 SSE 响应。该补齐构建尚未进 payload，不能据代码或 envelope 推断运行中的 CLI 已发送这些头。
 - 新 CLI 在最终 `fetch` 调用前，经任务隔离的内部事件回传请求头。debug 日志的 `outbound_headers_source=cli_final` 时，`outbound_headers` 才是此处采集的实际值；凭证及未列入公开清单的自定义头值在离开 CLI 前脱敏。此值不含底层 HTTP 实现后加的 Host / HTTP/2 伪头，不是 TLS 抓包。内部事件不下发调用方、不计作首 token 或启动上游 idle 计时；重试记录最后一次采集结果。
 - Node → worker 的头另存 `worker_envelope_headers`。旧 CLI 无回传或该次尝试尚未发送时，最终头为 null、source 为 `unavailable`，不回退成 envelope。旧日志缺少 source，保留原值但不标为最终值。`outbound_body` 仍是 worker envelope 的请求体，未改为 CLI 最终序列化字节；需同时升级 Node / web / cli-node，kernel 已有的通道无需修改。
@@ -164,6 +178,14 @@ native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代�
 `routing.failover.signature_repair=true`（设置页「探测 → 签名修复」）才走 `signature_repairable` 的 `repair-and-retry`（剥 thinking 历史 + 删 `body.thinking` 后重试一次），客户端只看到 200。关闭时包括 cli-hop 在内都原样透传 400；`cli-node` 自身行为不受该面板开关改变。
 
 `routing.compatibility.thinking_display` 默认 `summarized`（设置 → 协议 → thinking 显示；缺省即开，显式 `passthrough` 关闭）。只改已经打开的 thinking（`adaptive` / `enabled`）：`omitted`、`updates`，以及 Opus 4.7+、5 系列、Haiku 5.5、Fable、Mythos 上没写 display 的请求，出站改成 `summarized`。其它值、`disabled`、没开 thinking 不动。改写在 beta 计算之前，所以被改掉的 `updates` 不再带 `thinking-display-updates-2026-08-18`。`passthrough` 时 `updates` 仍只在出站 beta 声明该 token 时保留，否则降成 `omitted`。分类器请求不经过这条出站改写。
+
+## Codex 模型与运行环境
+
+Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.167.1`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
+
+GPT 模型以账号返回的 `/backend-api/codex/models` 为准，6.2 等新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。同步发现的新 ID 沿用默认关闭，管理员启用后才调度。静态回退目录补齐官方参考目录中的 `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
+
+`codex.analytics.enabled` 仍默认关闭。启用后的 `codex_thread_initialized` 使用当前槽内采集的系统、系统版本和架构，不读取内核所在控制面宿主。先执行槽位 `collect-identity`；数据不完整时不发送，不伪造环境或 CLI 工具事件。字段、队列和隐私边界见 [面板 API · OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
 
 ## 健康探测缓存
 

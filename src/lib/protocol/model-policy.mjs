@@ -39,6 +39,7 @@ function isCatalogModelId(id) {
 const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
 const FABLE_51_ID = 'claude-fable-5-1'
+const FABLE_52_ID = 'claude-fable-5-2'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
 const OPUS_55_ID = 'claude-opus-5-5'
 const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
@@ -100,6 +101,15 @@ const CAP_ADAPTIVE_ONLY = {
   supports_interleaved: true,
   supports_effort: true,
   supports_context_management: true,
+}
+
+// Adaptive is allowed, not required. CRAG rejectsDisabledThinking is false for
+// these ids, so a third-party forced tool_choice with thinking omitted is legal.
+const ADAPTIVE_OPTIONAL_IDS = new Set(['claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-opus-5'])
+const CAP_ADAPTIVE = {
+  ...CAP_ADAPTIVE_ONLY,
+  thinking_mode: 'adaptive_or_enabled',
+  requires_adaptive: false,
 }
 
 const CAP_CODEX = {
@@ -258,7 +268,7 @@ export function seedDefaultPolicy() {
     display_name: 'Opus 4.7',
     family: 'opus',
     sort: 28,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: false },
     params: {
       max_tokens_default: 32000,
@@ -272,7 +282,7 @@ export function seedDefaultPolicy() {
     display_name: 'Opus 4.8',
     family: 'opus',
     sort: 29,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: false },
     params: {
       max_tokens_default: 32000,
@@ -286,7 +296,7 @@ export function seedDefaultPolicy() {
     display_name: 'Sonnet 5',
     family: 'sonnet',
     sort: 30,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: true },
     params: {
       max_tokens_default: 64000,
@@ -319,7 +329,7 @@ export function seedDefaultPolicy() {
     display_name: 'Opus 5',
     family: 'opus',
     sort: 35,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: false },
     params: {
       max_tokens_default: 32000,
@@ -378,6 +388,22 @@ export function seedDefaultPolicy() {
     aliases: [FABLE_51_LEGACY_ID],
   })
 
+  add(FABLE_52_ID, {
+    display_name: 'Fable 5.2',
+    family: 'fable',
+    sort: 42,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: false },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'passthrough',
+      default_effort: 'medium',
+    },
+    aliases: ['claude-fable-5.2'],
+  })
+
   add('auto', {
     display_name: 'Auto',
     family: 'auto',
@@ -415,6 +441,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku': 'claude-haiku-4-5-20251001',
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
+      'claude-fable-5.2': FABLE_52_ID,
       [FABLE_51_LEGACY_ID]: FABLE_51_ID,
       [OPUS_55_LEGACY_ID]: OPUS_55_ID,
     },
@@ -494,6 +521,16 @@ export function normalizePolicy(raw) {
     if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID) {
       cfg.params = { ...cfg.params, on_enabled: 'passthrough' }
     }
+    // Older panel rows copied adaptive-only onto models that still accept
+    // disabled thinking. Stored true would keep rejecting forced tool_choice.
+    if (ADAPTIVE_OPTIONAL_IDS.has(id)) {
+      cfg.capabilities = {
+        ...cfg.capabilities,
+        thinking_mode: 'adaptive_or_enabled',
+        supports_adaptive: true,
+        requires_adaptive: false,
+      }
+    }
     if (typeof cfg.betas?.pass_context_1m !== 'boolean') {
       const seeded = seed.models[id]?.betas?.pass_context_1m
       cfg.betas = {
@@ -546,8 +583,11 @@ function heuristicCapabilities(modelId = '') {
   if (/claude-haiku-5/.test(m)) return { ...CAP_HAIKU_55 }
   if (m.includes('haiku') || /claude-3[.-]/.test(m)) return { ...CAP_HAIKU }
   if (/claude-(sonnet|opus)-4-5/.test(m)) return { ...CAP_SONNET45 }
-  if (/claude-(opus|sonnet|fable|mythos)-5/.test(m) || /claude-opus-4-[78]/.test(m)) {
+  if (/claude-(?:opus|sonnet)-5(?:-5|\.5)(?![0-9])/.test(m) || /claude-(?:fable|mythos)-5/.test(m)) {
     return { ...CAP_ADAPTIVE_ONLY }
+  }
+  if (/claude-(?:opus|sonnet)-5/.test(m) || /claude-opus-4-[78]/.test(m)) {
+    return { ...CAP_ADAPTIVE }
   }
   if (/claude-(sonnet|opus)-4-6/.test(m)) return { ...CAP_46 }
   return { ...CAP_46 }
@@ -731,8 +771,41 @@ export function getCapabilities(modelId = '') {
   return getModelEntry(modelId).capabilities
 }
 
-export function getBetaPolicy(modelId = '') {
-  return getModelEntry(modelId).betas
+/**
+ * Preset capability boundary for one model. CRAG's official CLI table is not
+ * this matrix: the pre-clean stage hands the entry across, and CRAG applies it.
+ */
+export function modelDirectiveForCrag(modelId = '') {
+  const entry = getModelEntry(modelId)
+  const caps = entry.capabilities || {}
+  const params = entry.params || {}
+  const positive = (value) => {
+    const n = Number(value)
+    return Number.isSafeInteger(n) && n > 0 ? n : 0
+  }
+  const drop = Array.isArray(entry.betas?.drop)
+    ? entry.betas.drop.map((beta) => String(beta || '')).filter(Boolean)
+    : []
+  return {
+    id: entry.id || String(modelId || ''),
+    capabilities: {
+      thinking_mode: String(caps.thinking_mode || ''),
+      supports_adaptive: caps.supports_adaptive === true,
+      supports_effort: caps.supports_effort === true,
+      supports_context_management: caps.supports_context_management === true,
+      supports_1m: caps.supports_1m === true,
+      supports_interleaved: caps.supports_interleaved === true,
+    },
+    params: {
+      max_tokens_default: positive(params.max_tokens_default),
+      max_tokens_cap: positive(params.max_tokens_cap),
+      thinking_fallback_budget: positive(params.thinking_fallback_budget),
+      on_adaptive: String(params.on_adaptive || ''),
+      on_enabled: String(params.on_enabled || ''),
+      ...(params.default_effort ? { default_effort: String(params.default_effort) } : {}),
+    },
+    betas: { drop },
+  }
 }
 
 export function getContext1mWhitelist() {

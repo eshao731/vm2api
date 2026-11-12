@@ -74,6 +74,51 @@ function success(text = 'ok') {
   }
 }
 
+test('failed attempt logging returns the permit without dispatch or failover', async () => {
+  let releases = 0
+  const scheduler = new Scheduler([])
+  scheduler.selectAndReserve = async () => ({ ...candidate(1), ok: true, release: () => releases++ })
+  const attemptsRepo = {
+    begin: () => {
+      throw new Error('attempt log unavailable')
+    },
+  }
+  const runner = new FailoverRunner({ scheduler, attemptsRepo })
+  await assert.rejects(
+    runner.run({
+      requestId: 'logging-failed',
+      model: 'claude-sonnet-test',
+      canonicalBody: { model: 'claude-sonnet-test' },
+      callAttempt: () => assert.fail('must not dispatch'),
+    }),
+    /attempt log unavailable/,
+  )
+  assert.equal(releases, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+})
+
+test('abort during request preparation never dispatches and returns the permit', async () => {
+  let releases = 0
+  const controller = new AbortController()
+  const scheduler = new Scheduler([])
+  scheduler.selectAndReserve = async () => ({ ...candidate(1), ok: true, release: () => releases++ })
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'prepare-aborted',
+    model: 'claude-sonnet-test',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    signal: controller.signal,
+    applyAttempt: async (body) => {
+      controller.abort()
+      return body
+    },
+    callAttempt: () => assert.fail('must not dispatch'),
+  })
+  assert.equal(result.status, 499)
+  assert.equal(result.attemptCount, 0)
+  assert.equal(releases, 1)
+})
+
 test('unsupported classifier runtime stops without counting execution or cooling accounts', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({ scheduler })
@@ -124,6 +169,30 @@ test('invalid panel cache layout stops before execution without rotating or cool
   })
   assert.equal(result.status, 400)
   assert.equal(result.body.error.code, 'invalid_cache_control')
+  assert.equal(result.attemptCount, 0)
+  assert.equal(scheduler.selectCalls, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(attempts.items[0].errorScope, 'request')
+})
+
+test('oversized CRAG zero replace stops before execution without cooling accounts', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const attempts = new Attempts()
+  const runner = new FailoverRunner({ scheduler, attemptsRepo: attempts })
+  const result = await runner.run({
+    requestId: 'crag-replace-too-large',
+    model: 'claude-opus-5-5',
+    canonicalBody: { model: 'claude-opus-5-5' },
+    applyAttempt: () => {
+      const error = new Error('prompt too large for original CLI replace mode')
+      error.status = 400
+      error.body = { error: { type: 'invalid_request_error', code: 'crag_prompt_too_large', message: error.message } }
+      throw error
+    },
+    callAttempt: () => assert.fail('oversized replace must not execute'),
+  })
+  assert.equal(result.status, 400)
+  assert.equal(result.body.error.code, 'crag_prompt_too_large')
   assert.equal(result.attemptCount, 0)
   assert.equal(scheduler.selectCalls, 1)
   assert.deepEqual(scheduler.cooldowns, [])

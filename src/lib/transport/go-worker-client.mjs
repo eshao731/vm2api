@@ -2,12 +2,16 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { sanitizeAnthropicBody } from '../protocol/sanitize.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
-import { stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
+import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
+import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -26,6 +30,14 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
+import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
+import {
+  cragConsumesModelDirective,
+  cragV2KernelActive,
+  readSlotKernelConfig,
+  validateCallerCwd,
+} from '../protocol/crag-print-prompt.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -36,8 +48,13 @@ import {
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
+import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
+import { inferenceCodec } from './inference-codec.mjs'
+import { parseWorkerJson as parseJson } from './inference-codec-json.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
+const MAX_GATEWAY_CLOCK_MS = 86_400_000
+const CRAG_HEADER_ALLOWANCE_MS = 5_000
 const credentialRefreshTail = new Map()
 
 function withCredentialRefreshLock(key, fn) {
@@ -83,7 +100,7 @@ function readInternalToken(exec) {
   }
 }
 
-function workerRequest(
+async function workerRequest(
   exec,
   {
     method = 'GET',
@@ -94,15 +111,24 @@ function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    inference = false,
+    onRequestStarted,
+    requireInternalToken = false,
   } = {},
 ) {
+  if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+  const { socketPath } = workerPaths(exec)
+  if (!socketPath) {
+    throw Object.assign(new Error('slot worker socket is not configured'), { code: 'worker_socket_missing' })
+  }
+  const payload =
+    body == null
+      ? null
+      : inference
+        ? await inferenceCodec.encode(body, { signal })
+        : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+  if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
   return new Promise((resolve, reject) => {
-    const { socketPath } = workerPaths(exec)
-    if (!socketPath) {
-      reject(Object.assign(new Error('slot worker socket is not configured'), { code: 'worker_socket_missing' }))
-      return
-    }
-    const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
     // Include the headers, session metadata and request_id added around the caller's body.
     if (maxRequestBytes > 0 && payload?.length > maxRequestBytes) {
       reject(
@@ -114,6 +140,10 @@ function workerRequest(
       return
     }
     const internalToken = readInternalToken(exec)
+    if (requireInternalToken && !internalToken) {
+      reject(Object.assign(new Error('slot worker internal token is not configured'), { code: 'worker_token_missing' }))
+      return
+    }
     const requestHeaders = { ...headers }
     if (payload) {
       requestHeaders['content-type'] = 'application/json'
@@ -152,12 +182,96 @@ function workerRequest(
         resolve(res)
       },
     )
-    arm(timeoutMs, `slot worker timeout after ${timeoutMs}ms`)
+    if (timeoutMs != null) arm(timeoutMs, `slot worker timeout after ${timeoutMs}ms`)
     req.once('close', clearTimer)
     req.once('error', reject)
     if (payload) req.write(payload)
     req.end()
+    // Once handed to HTTP, the kernel may see the request before 'finish'.
+    onRequestStarted?.()
   })
+}
+
+function clockMs(value, fallback) {
+  const ms = Number(value)
+  return Number.isFinite(ms) && ms > 0 ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(1, Math.round(ms))) : fallback
+}
+
+function withoutGatewayPolicy(body) {
+  if (!body || !Object.hasOwn(body, 'gateway_policy')) return body
+  const { gateway_policy: _ignored, ...rest } = body
+  return rest
+}
+
+function inferenceRequest(
+  exec,
+  {
+    envelope,
+    requestId,
+    stream,
+    deliveryMode,
+    managedCrag,
+    tenantId,
+    slotWaitDeadlineMs,
+    timeoutMs,
+    idleTimeoutMs,
+    routing,
+    requestPath,
+    ...options
+  },
+) {
+  const headers = stream ? { te: 'trailers' } : {}
+  const body = { ...envelope, request_id: requestId }
+  const authenticatedPolicy = managedCrag && requestPath === '/internal/v1/messages'
+  if (authenticatedPolicy) {
+    body.stream = stream
+    body.delivery_mode = deliveryMode === 'verified' ? 'verified' : 'realtime'
+    if (tenantId) headers['x-tenant-id'] = tenantId
+    const firstByteMs = clockMs(timeoutMs, 600_000)
+    const idleMs = clockMs(idleTimeoutMs, clockMs(resolveStreamIdleTimeoutMs(routing), 180_000))
+    const queueWaitMs = Number.isFinite(slotWaitDeadlineMs)
+      ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(0, Math.floor(slotWaitDeadlineMs - Date.now())))
+      : 0
+    body.gateway_policy = {
+      queue_wait_ms: queueWaitMs,
+      first_byte_timeout_ms: firstByteMs,
+      stream_idle_timeout_ms: idleMs,
+      session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds),
+    }
+    // Only realtime exposes headers before completion. The native worker owns
+    // activity deadlines while verified and JSON responses are held back.
+    timeoutMs =
+      stream && body.delivery_mode === 'realtime' ? queueWaitMs + firstByteMs + CRAG_HEADER_ALLOWANCE_MS : null
+  }
+  return workerRequest(exec, {
+    ...options,
+    requestPath,
+    // Do not let async codec queue time be added back to the worker's budget.
+    inference: options.inference && !authenticatedPolicy,
+    requireInternalToken: authenticatedPolicy,
+    method: 'POST',
+    body,
+    headers,
+    timeoutMs,
+    timeoutMode: stream ? 'first-byte' : 'overall',
+  })
+}
+
+function classifyManagedQueueRejection(result, managedCrag) {
+  const error = result.body?.error
+  if (!managedCrag || result.ok || result.body?.type !== 'error') return result
+  if (
+    !(result.status === 503 && error?.type === 'overloaded_error' && error.message === 'runtime queue is full') &&
+    !(result.status === 504 && error?.type === 'timeout_error' && error.message === 'runtime queue timeout')
+  ) {
+    return result
+  }
+  return {
+    ...result,
+    body: { ...result.body, error: { ...error, code: 'slot_busy' } },
+    upstreamExecutions: 0,
+    terminalState: 'rejected',
+  }
 }
 
 /**
@@ -167,7 +281,7 @@ function workerRequest(
  * and an old worker without the route just answers 404.
  */
 function cancelOnAbort(exec, signal, requestId) {
-  if (!signal || signal.aborted) return () => {}
+  if (!signal) return () => {}
   const onAbort = () => {
     workerRequest(exec, {
       method: 'POST',
@@ -181,6 +295,7 @@ function cancelOnAbort(exec, signal, requestId) {
       })
   }
   signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) onAbort()
   return () => signal.removeEventListener('abort', onAbort)
 }
 
@@ -197,28 +312,6 @@ async function readAll(stream, limit = MAX_BODY) {
     chunks.push(value)
   }
   return Buffer.concat(chunks)
-}
-
-function parseJson(buffer, status = 0) {
-  try {
-    return JSON.parse(String(buffer || ''))
-  } catch {
-    if (status === 413) {
-      return {
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          code: 'body_too_large',
-          message: 'Request body exceeds the slot kernel limit',
-          details: { retryable: false },
-        },
-      }
-    }
-    return {
-      type: 'error',
-      error: { type: 'worker_error', code: 'worker_invalid_json', message: String(buffer || '').slice(0, 400) },
-    }
-  }
 }
 
 function publicHeaders(headers = {}) {
@@ -402,13 +495,36 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
+function gateCragBody(body, print, health) {
+  if (!body || typeof body !== 'object') return body
+  const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
+  const prompt = body.crag_prompt
+  const model = print && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
+  const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
+  if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
+    return body
+  }
+  const out = { ...body }
+  if (!['append', 'replace'].includes(prompt?.mode) || !caps.includes(`prompt_${prompt.mode}`)) delete out.crag_prompt
+  if (model) out.crag_model = model
+  else delete out.crag_model
+  if (out.crag_options && typeof out.crag_options === 'object' && !Array.isArray(out.crag_options)) {
+    const { prompt: _prompt, ...rest } = out.crag_options
+    if (Object.keys(rest).length) out.crag_options = rest
+    else delete out.crag_options
+  }
+  return out
+}
+
 /**
  * `cliHop`: the slot cli-node builds the wire and always sends
  * mid-conversation-system; the kernel drops these envelope headers. Gating the
  * body on the VM's HTTP betas would lift every role=system turn into system[],
  * so system grows each turn and no cached prefix is ever read.
+ * `cragPrint`: explicit hop decision. Null derives it from the VM's own kernel,
+ * never from routing.inference.
  */
-export function finalizeWorkerPayload({
+export function prepareWorkerPayload({
   body,
   reqHeaders,
   exec,
@@ -416,19 +532,28 @@ export function finalizeWorkerPayload({
   routing,
   want1m = false,
   cliHop = false,
+  cragPrint = null,
   requestContext = null,
   repaired = false,
 } = {}) {
-  const model = body?.model || ''
+  // This is the last panel-owned boundary before either kernel. Keep the
+  // worker contract Anthropic-shaped even when a caller selected passthrough;
+  // cli-node and CRAG must never receive OpenAI/client-only request fields.
+  const canonicalBody = withoutGatewayPolicy(sanitizeAnthropicBody(body, { preserveContentShape: false }) || body)
+  const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
+    routing,
     want1m: want1m === true,
   })
   const displayed =
     requestContext?.purpose === 'auto_mode_classifier' || repaired
-      ? body
-      : ensureOfficialPrintThinking(applyThinkingDisplay(body, thinkingDisplayMode(routing)))
+      ? canonicalBody
+      : ensureOfficialPrintThinking(
+          applyThinkingDisplay(canonicalBody, thinkingDisplayMode(routing)),
+          ccEntrypointFromRouting(routing),
+        )
   const main = stripSubagentBilling(displayed)
   const thread = pinThreadBetas(
     main,
@@ -439,14 +564,42 @@ export function finalizeWorkerPayload({
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
+  const health = exec?.workerStatus
+  const print =
+    cragPrint !== false &&
+    cragV2KernelActive({
+      vm: exec?.vm,
+      health,
+      kernelConfig: readSlotKernelConfig(exec?.homeDir),
+    })
+  const directed = gateCragBody(gated, print, health)
   return {
     headers,
-    body: sealClaudeCodeCch(gated, { enabled: routing?.compatibility?.cch_enabled !== false, seal: !cliHop }),
+    gated: directed,
+    cliHop,
+    routing,
+    acceptsCallerCwd: print && Array.isArray(health?.capabilities) && health.capabilities.includes('caller_cwd'),
     thread: thread.turn,
   }
 }
 
-function workerEnvelope({
+function sealPreparedPayload(prepared, gated) {
+  return {
+    headers: prepared.headers,
+    body: sealClaudeCodeCch(gated, {
+      enabled: prepared.routing?.compatibility?.cch_enabled !== false,
+      seal: !prepared.cliHop,
+    }),
+    thread: prepared.thread,
+  }
+}
+
+export function finalizeWorkerPayload(args = {}) {
+  const prepared = prepareWorkerPayload(args)
+  return sealPreparedPayload(prepared, prepared.gated)
+}
+
+async function workerEnvelope({
   requestContext = null,
   body,
   reqHeaders,
@@ -459,9 +612,13 @@ function workerEnvelope({
   cacheTtl = null,
   preserveCacheBreakpoints = null,
   cliHop = false,
+  cragPrint = null,
+  callerCwd = null,
   repaired = false,
+  redactionPrincipal = '',
+  redactionSession = '',
 } = {}) {
-  const finalized = finalizeWorkerPayload({
+  const prepared = prepareWorkerPayload({
     body,
     reqHeaders,
     exec,
@@ -469,11 +626,20 @@ function workerEnvelope({
     routing,
     want1m,
     cliHop,
+    cragPrint,
     requestContext,
     repaired,
   })
+  const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
+  // Mask the separated path with the same policy as the original system text.
+  const cwd = (prepared.acceptsCallerCwd && validateCallerCwd(callerCwd)) || undefined
+  const masked = redaction ? await maskJson({ body: prepared.gated, caller_cwd: cwd }, redaction) : null
+  const gated = redaction ? masked.body : prepared.gated
+  const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
+  const finalized = sealPreparedPayload(prepared, gated)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
+    ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
     body: finalized.body,
     headers: finalized.headers,
     stream: !!stream,
@@ -482,7 +648,56 @@ function workerEnvelope({
     cache_ttl: cacheTtl == null ? null : String(cacheTtl),
   }
   dumpSessionEnvelope(envelope)
-  return { envelope, thread: finalized.thread }
+  return { envelope, thread: finalized.thread, redaction }
+}
+
+async function redactionContext({ routing, exec, redactionPrincipal, redactionSession }) {
+  const projectRoot = exec?.projectRoot || process.env.KIN_PROJECT_ROOT || ''
+  const state = await ensureRedaction(routing, { projectRoot })
+  if (!state.enabled) return null
+  return { principal: redactionPrincipal, session: redactionSession || '' }
+}
+
+async function preparePrebuiltEnvelope(envelope, redaction, messages) {
+  // A prebuilt (e.g. Codex) envelope has no trusted Messages-side cwd source.
+  const { caller_cwd: _callerCwd, ...out } = envelope
+  if (messages) {
+    delete out.gateway_policy
+    out.body = withoutGatewayPolicy(out.body)
+    if (out.headers && typeof out.headers === 'object') {
+      out.headers = Object.fromEntries(
+        Object.entries(out.headers).filter(([name]) => name.toLowerCase() !== 'x-tenant-id'),
+      )
+    }
+  }
+  if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
+    const { caller_cwd: _bodyCwd, ...body } = out.body
+    out.body = body
+  }
+  if (redaction && out.body) out.body = await maskJson(out.body, redaction)
+  return out
+}
+
+function redactionResult(error) {
+  if (!String(error?.code || '').startsWith('redaction_')) return null
+  return {
+    ok: false,
+    status: error.status || 503,
+    via: 'redaction',
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: error.code,
+        message: String(error.message || error).slice(0, 300),
+      },
+    },
+    headers: {},
+    terminalState: 'rejected',
+    transportError: false,
+    committed: false,
+    upstreamExecutions: 0,
+  }
 }
 
 /**
@@ -511,6 +726,10 @@ export async function callGoWorker({
   body,
   reqHeaders = {},
   timeoutMs,
+  idleTimeoutMs,
+  managedCrag = false,
+  tenantId = '',
+  slotWaitDeadlineMs,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -521,8 +740,12 @@ export async function callGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  cragPrint = null,
+  callerCwd = null,
   repaired = false,
   onEnvelope = null,
+  redactionPrincipal = '',
+  redactionSession = '',
 } = {}) {
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
@@ -533,6 +756,7 @@ export async function callGoWorker({
       routing,
       want1m,
       cliHop,
+      cragPrint,
       requestContext,
       repaired,
     })
@@ -549,11 +773,16 @@ export async function callGoWorker({
     }
   }
   const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
+    const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope, thread: null }
-      : workerEnvelope({
+      ? {
+          envelope: await preparePrebuiltEnvelope(envelope, redaction, requestPath === '/internal/v1/messages'),
+          thread: null,
+          redaction,
+        }
+      : await workerEnvelope({
           body,
           reqHeaders,
           exec,
@@ -564,24 +793,38 @@ export async function callGoWorker({
           cacheTtl,
           preserveCacheBreakpoints,
           cliHop,
+          cragPrint,
+          callerCwd,
           requestContext,
           repaired,
+          redactionPrincipal,
+          redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
-    const response = await workerRequest(exec, {
-      method: 'POST',
+    const response = await inferenceRequest(exec, {
+      stream: false,
+      managedCrag,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
       requestPath,
-      body: { ...prepared.envelope, request_id: requestId },
+      envelope: prepared.envelope,
+      requestId,
       maxRequestBytes,
+      inference: true,
+      onRequestStarted: () => {
+        stopCancel = cancelOnAbort(exec, signal, requestId)
+      },
       signal,
       timeoutMs,
     })
     const data = await readAll(response)
-    const parsed = parseJson(data, response.statusCode)
+    const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+    const parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
-    if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
-    return restoreKernelErrorStatus({
+    const result = restoreKernelErrorStatus({
       ok,
       status: response.statusCode || 0,
       via: 'go-worker',
@@ -594,7 +837,11 @@ export async function callGoWorker({
       transportError: false,
       threadBetas: prepared.thread,
     })
+    return classifyManagedQueueRejection(result, managedCrag)
   } catch (error) {
+    const blocked = redactionResult(error)
+    if (blocked) return blocked
+    if (signal?.aborted) return clientCancelledResult({ via: 'go-worker' })
     return {
       ok: false,
       status: error.status === 413 ? 413 : 0,
@@ -624,6 +871,9 @@ export async function streamGoWorker({
   reqHeaders = {},
   timeoutMs,
   idleTimeoutMs = 0,
+  managedCrag = false,
+  tenantId = '',
+  slotWaitDeadlineMs,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -637,9 +887,13 @@ export async function streamGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  cragPrint = null,
+  callerCwd = null,
   repaired = false,
   onEnvelope = null,
   onOutboundHeaders = null,
+  redactionPrincipal = '',
+  redactionSession = '',
 } = {}) {
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
@@ -650,6 +904,7 @@ export async function streamGoWorker({
       routing,
       want1m,
       cliHop,
+      cragPrint,
       requestContext,
       repaired,
     })
@@ -724,11 +979,16 @@ export async function streamGoWorker({
   let committed = false
   const timing = createStreamTiming()
   const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
+    const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope, thread: null }
-      : workerEnvelope({
+      ? {
+          envelope: await preparePrebuiltEnvelope(envelope, redaction, requestPath === '/internal/v1/messages'),
+          thread: null,
+          redaction,
+        }
+      : await workerEnvelope({
           body,
           reqHeaders,
           exec,
@@ -740,34 +1000,48 @@ export async function streamGoWorker({
           cacheTtl,
           preserveCacheBreakpoints,
           cliHop,
+          cragPrint,
+          callerCwd,
           requestContext,
           repaired,
+          redactionPrincipal,
+          redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
-    const response = await workerRequest(exec, {
-      method: 'POST',
+    const response = await inferenceRequest(exec, {
+      stream: true,
+      deliveryMode,
+      managedCrag,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
       requestPath,
-      body: { ...prepared.envelope, request_id: requestId },
+      envelope: prepared.envelope,
+      requestId,
       maxRequestBytes,
+      inference: true,
+      onRequestStarted: () => {
+        stopCancel = cancelOnAbort(exec, signal, requestId)
+      },
       signal,
       timeoutMs,
-      timeoutMode: 'first-byte',
-      headers: { te: 'trailers' },
     })
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
-      return restoreKernelErrorStatus({
+      const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: parseJson(data, response.statusCode),
+        body: await inferenceCodec.decode(data, { status: response.statusCode, signal }),
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
       })
+      return classifyManagedQueueRejection(result, managedCrag)
     }
     let buffer = ''
     let receivedAt = null
@@ -827,7 +1101,7 @@ export async function streamGoWorker({
     let sawMessageStop = false
     let outboundHeadersFrame = false
     let idleTimer = null
-    if (firstByteMs > 0 || idleMs > 0) {
+    if (!managedCrag && (firstByteMs > 0 || idleMs > 0)) {
       idleTimer = setInterval(() => {
         const limit = sawChunk ? idleMs : firstByteMs
         if (limit <= 0) return
@@ -843,12 +1117,14 @@ export async function streamGoWorker({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
+      const sseRestorer = prepared.redaction ? createSseRestorer(prepared.redaction) : null
       for await (const chunk of response) {
         receivedAt = Date.now()
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newline).replace(/\r$/, '')
+          let line = buffer.slice(0, newline).replace(/\r$/, '')
+          if (sseRestorer) line = await sseRestorer.line(line)
           buffer = buffer.slice(newline + 1)
           // CLI diagnostics share the internal stream, never the caller's SSE.
           if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
@@ -863,7 +1139,12 @@ export async function streamGoWorker({
                 typeof onOutboundHeaders === 'function'
               ) {
                 try {
-                  onOutboundHeaders(event.headers)
+                  const body = event.body == null ? undefined : capOutboundBody(event.body)
+                  onOutboundHeaders(event.headers, {
+                    body,
+                    body_truncated:
+                      event.body_truncated === true || (typeof event.body === 'string' && body !== event.body),
+                  })
                 } catch {
                   console.warn('[worker] outbound header observer failed')
                 }
@@ -924,9 +1205,12 @@ export async function streamGoWorker({
       if (!committed && complete) await flushCommit()
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
+      // A native activity timeout can follow HTTP/SSE metadata but precede
+      // visible output. It is neither an empty hop nor a transport failure.
+      const nativeTimeout = managedCrag && lastError?.error?.type === 'timeout_error'
       return restoreUncommittedHop({
         ok: response.statusCode === 200 && !lastError && complete,
-        status: response.statusCode || 0,
+        status: nativeTimeout && !committed ? 504 : response.statusCode || 0,
         via: 'go-worker-stream',
 
         body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
@@ -939,7 +1223,7 @@ export async function streamGoWorker({
         sawMessageStop,
         ...timing.snapshot(),
         committed,
-        terminalState,
+        terminalState: nativeTimeout && !committed ? 'rejected' : terminalState,
         transportError: false,
         threadBetas: prepared.thread,
       })
@@ -947,6 +1231,8 @@ export async function streamGoWorker({
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    const blocked = redactionResult(error)
+    if (blocked) return { ...blocked, ...timing.snapshot(), committed }
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
@@ -1112,7 +1398,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
   })
 }
 
-function credentialSummary(credential, now = Date.now()) {
+export function credentialSummary(credential, now = Date.now()) {
   if (!credential) return undefined
   const expiresAt = credential.expires_at ?? null
   const expiresAtMs =
@@ -1138,27 +1424,62 @@ function credentialSummary(credential, now = Date.now()) {
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
-  try {
-    writeWorkerCredentialFile(exec.homeDir, credential)
-    // Import is the one case where the control plane's credential replaces the slot's copy.
-    await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
-  } catch (error) {
-    return {
-      ok: false,
-      status: 500,
-      error: { code: 'credential_import_failed', message: String(error.message || error).slice(0, 300) },
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      if (!writeWorkerCredentialFile(exec.homeDir, credential)) throw new Error('credential_required')
+      // Import is the one case where the control plane's credential replaces the slot's copy.
+      await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
+    } catch (error) {
+      return {
+        ok: false,
+        status: 500,
+        error: { code: 'credential_import_failed', message: '凭证导入未完成，请检查 VM 连接后重试面板导入' },
+      }
     }
-  }
-  return {
-    ok: true,
-    status: 200,
-    credential: {
-      has_access: !!credential?.access_token || !!credential?.api_key,
-      has_refresh: !!credential?.refresh_token,
-      expires_at: credential?.expires_at || null,
-      generation: Date.now(),
-    },
-  }
+    return {
+      ok: true,
+      status: 200,
+      credential: {
+        has_access: !!credential?.access_token || !!credential?.api_key,
+        has_refresh: !!credential?.refresh_token,
+        expires_at: credential?.expires_at || null,
+        generation: Date.now(),
+      },
+    }
+  })
+}
+
+export async function syncClaudeClientCredentials(
+  exec,
+  { host = slotHost(exec.vm), ensureRemoteLink = ensureRemoteOfficialCredentialLink } = {},
+) {
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      const slotDir = path.dirname(exec.homeDir)
+      if (host.kind === 'node') {
+        const pulled = await host.afterRefresh(exec.vm, slotDir)
+        if (pulled?.reason === 'remote_missing') throw new Error('remote_missing')
+        const linked = await ensureRemoteLink(exec.vm, slotDir)
+        if (!linked?.linked) throw new Error('remote_link_failed')
+      }
+      const credential = readWorkerCredentialFile(exec.homeDir)
+      if (!credential?.access_token && !credential?.api_key) {
+        return { ok: false, status: 409, error: { code: 'credential_required', message: '请先在面板导入凭证' } }
+      }
+      const linked = ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
+      if (!linked.linked) throw new Error('credential_link_failed')
+      return { ok: true, synced: true, credential: credentialSummary(credential) }
+    } catch {
+      return {
+        ok: false,
+        status: 502,
+        error: {
+          code: 'client_credential_sync_failed',
+          message: '客户端凭证同步失败，请检查 VM 连接后重试同步；无需重新换票',
+        },
+      }
+    }
+  })
 }
 
 export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {

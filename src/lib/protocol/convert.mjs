@@ -68,17 +68,6 @@ function contentToText(content) {
   return content?.text || ''
 }
 
-export function isClaudeMessagesShape(body) {
-  return !!(
-    body &&
-    typeof body === 'object' &&
-    Array.isArray(body.messages) &&
-    typeof body.max_tokens === 'number' &&
-    !('input' in body) &&
-    !('choices' in body)
-  )
-}
-
 /** OpenAI tools → Claude tools. Server search maps to web_search_20250305; function tools stay client tools. */
 export function openaiToolsToClaude(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined
@@ -317,7 +306,10 @@ export function normalizeOpenAIToolsOnMessages(body) {
 export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_map: true }) {
   if (protocol === 'anthropic.messages' && !opts.rewrite) {
     const normalized = normalizeOpenAIToolsOnMessages(body)
-    const out = sanitizeAnthropicBody(normalized, { preserveContentShape: opts.preserve_content_shape === true })
+    const out = sanitizeAnthropicBody(normalized, {
+      preserveContentShape: opts.preserve_content_shape === true,
+      onSystemBlock: opts.onSystemBlock,
+    })
     if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
     return { claude: withUpstreamStream(out), mode: inboundHasOpenAIToolShape(body) ? 'convert' : 'passthrough' }
   }
