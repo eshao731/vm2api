@@ -17,6 +17,7 @@ import {
   proxyNamedLabel,
   restrictionCopy,
   scheduleStateLabel,
+  vmRequestingCount,
   vmCircuit,
   vmCircuitTitle,
 } from './vm-status'
@@ -275,6 +276,50 @@ describe('claudeTier follows OAuth subscription metadata', () => {
     ).toBe('unknown')
   })
 
+  it('corrects imported default Pro using the Max rate-limit tier', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_max_5x',
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max 5x' })
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_ai',
+        })
+      ).key
+    ).toBe('pro')
+  })
+
+  it('trusts verified profile ahead of conflicting subscription and rate metadata', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          account_tier_source: 'profile',
+          subscription_type: 'max',
+          rate_limit_tier: 'default_claude_max_20x',
+          usage_has_fable: true,
+        })
+      )
+    ).toMatchObject({ key: 'pro', label: 'Pro' })
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'max',
+          account_tier_source: 'profile',
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_ai',
+          usage_has_fable: false,
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max' })
+  })
+
   it('keeps Max when Fable is unavailable and exposes the official multiplier', () => {
     expect(
       claudeTier(
@@ -470,6 +515,26 @@ describe('fleetGroup splits 受限 from 在池 and 关闭调用', () => {
       text: '7d 警告',
     })
     expect(fleetGroup(fallback7d)).toBe('pool')
+  })
+
+  it('paints a spent kernel-recovery budget as a red restriction, not quota', () => {
+    const vm = liveVm({
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'kernel_faulted',
+      restriction_text: '内核故障',
+      availability: { key: 'ok', usable: true, text: '可用' },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'kernel_fault',
+      text: '内核故障',
+      cls: 'bad',
+    })
+    expect(fleetGroup(vm)).toBe('restricted')
+    expect(scheduleStateLabel(vm)).toBe('受限')
+    expect(restrictionCopy(vm)).toBe('内核故障')
+    // 与额度限制区分：不是让人等窗口，而是叫人去诊断。
+    expect(poolStatus(vm).cls).not.toBe('warn')
   })
 })
 
@@ -819,5 +884,41 @@ describe('four-state schedule model (backend resolveSlotState)', () => {
       text: '熔断中',
       cls: 'bad',
     })
+  })
+})
+
+describe('vmRequestingCount', () => {
+  it('sums inflight on sessions the VM is actually using', () => {
+    expect(
+      vmRequestingCount({
+        inflight: 0,
+        seat_sessions: [
+          { index: 0, session_id: 'a', state: 'active', inflight: 1 },
+          { index: 1, session_id: 'b', state: 'active', inflight: 2 },
+          { index: 2, session_id: 'c', state: 'held', inflight: 0 },
+          { index: 3, session_id: 'd', state: 'idle', inflight: 0 },
+        ],
+      })
+    ).toBe(3)
+  })
+
+  it('counts an active session whose inflight has not been filled in', () => {
+    expect(
+      vmRequestingCount({
+        inflight: 0,
+        seat_sessions: [
+          { index: 0, session_id: 'a', state: 'active', inflight: 0 },
+        ],
+      })
+    ).toBe(1)
+  })
+
+  it('does not let a stale VM inflight counter stand in for an empty seat book', () => {
+    expect(vmRequestingCount({ inflight: 1, seat_sessions: [] })).toBe(0)
+  })
+
+  it('falls back to VM inflight when the row has no per-session book', () => {
+    expect(vmRequestingCount({ inflight: 2 })).toBe(2)
+    expect(vmRequestingCount({ inflight: 0, seat_sessions: null })).toBe(0)
   })
 })

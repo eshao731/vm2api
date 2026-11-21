@@ -1,10 +1,9 @@
 /**
- * SQLite database layer — sub2api data-layer inspired, on node:sqlite.
+ * SQLite database layer built on `node:sqlite`.
  *
- * - Single-process gateway → embedded SQLite (WAL) instead of sub2api's
- *   PostgreSQL+Redis. Same patterns: versioned SQL migrations with SHA-256
- *   checksum verification (sub2api migrations_runner), repository modules,
- *   settings table, backup records.
+ * - The single-process gateway uses embedded SQLite in WAL mode, versioned
+ *   SQL migrations with SHA-256 checksum verification, repository modules,
+ *   a settings table, and backup records.
  * - Zero new dependencies: uses the built-in `node:sqlite` DatabaseSync.
  *
  * Env:
@@ -103,6 +102,37 @@ function reconcileHistorical001ProxySchema(db, checksum) {
   })
   return true
 }
+
+// Upstream assigned 055 to lifetime usage after the buyer-orders branch had used
+// 055–057 for the shop. The SQL is unchanged; move only the applied records.
+function reconcileCragShopMigrationVersions(db, dir, files) {
+  if (!files.includes('055_account_lifetime_usage.sql')) return
+  const get = db.prepare('SELECT name, checksum FROM schema_migrations WHERE version = ?')
+  if (get.get('055')?.name !== '055_crag_shop_orders.sql') return
+
+  withTransaction(db, () => {
+    const move = db.prepare('UPDATE schema_migrations SET version = ?, name = ?, checksum = ? WHERE version = ?')
+    // Move from the highest version down so existing primary keys never collide.
+    for (const [from, to, suffix] of [
+      ['057', '058', 'crag_shop_activation.sql'],
+      ['056', '057', 'crag_shop_commerce.sql'],
+      ['055', '056', 'crag_shop_orders.sql'],
+    ]) {
+      const row = get.get(from)
+      if (!row) continue
+      const file = `${to}_${suffix}`
+      if (row.name !== `${from}_${suffix}` || !files.includes(file)) {
+        throw new Error(`unexpected CRAG shop migration history at ${from}`)
+      }
+      const { canonical, variants } = migrationChecksums(fs.readFileSync(path.join(dir, file), 'utf8'))
+      if (!variants.has(row.checksum)) {
+        throw new Error(`migration checksum mismatch for ${row.name}: applied=${row.checksum} current=${canonical}`)
+      }
+      move.run(to, file, canonical, from)
+    }
+  })
+}
+
 let _db = null
 let _dbPath = null
 let poolWanted = false
@@ -194,7 +224,7 @@ export function closeDatabase() {
 }
 
 /**
- * Versioned SQL migrations with checksum verification (sub2api-style).
+ * Versioned SQL migrations with SHA-256 checksum verification.
  * Files: migrations/NNN_name.sql, applied in filename order inside a
  * transaction each. `schema_migrations` records version+checksum; a
  * checksum mismatch on an already-applied migration is a hard error.
@@ -214,6 +244,8 @@ export function applyMigrations(db, { migrationsDir } = {}) {
         .filter((f) => /^\d+.*\.sql$/.test(f))
         .sort()
     : []
+
+  reconcileCragShopMigrationVersions(db, dir, files)
 
   const appliedRows = db.prepare('SELECT version, checksum FROM schema_migrations').all()
   const applied = new Map(appliedRows.map((r) => [r.version, r.checksum]))

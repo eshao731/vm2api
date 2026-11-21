@@ -1,10 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { isClaudeCodeFamilyRequest } from '../../src/lib/identity/claude-code-only.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
+  CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_CLI_SYSTEM,
   applyCrsUnofficialPersona,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
@@ -172,7 +177,7 @@ test('Claude Code family recognition: max_tokens 1 is not a bypass for arbitrary
 
 const REACHED = new Error('reached-scheduler')
 
-function protocolHarness({ routing, body, healthMonitor }) {
+function protocolHarness({ routing, body, healthMonitor, logs = [], users = null, onRun = null, routingConfigPath }) {
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
   const handler = createHandleProtocol({
@@ -191,23 +196,30 @@ function protocolHarness({ routing, body, healthMonitor }) {
       limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
       paths: {},
     },
-    requestLog: { start: () => ({ request_id: 'cc-only-test' }), finish() {} },
+    requestLog: {
+      start: () => ({ request_id: 'cc-only-test' }),
+      finish(_ctx, entry) {
+        logs.push(entry)
+      },
+    },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {}, users },
     apiScheduler: {
       pick: () => {
         throw REACHED
       },
     },
     failoverRunner: {
-      run: async () => {
+      run: async (args) => {
+        onRun?.(args)
         throw REACHED
       },
     },
     apiEndpointStore: {},
     stats,
     getRoutingConfig: () => routing,
+    routingConfigPath,
     groupsRepo: { rateMultiplier: () => 1 },
     getHealthMonitor: () => healthMonitor,
   })
@@ -222,8 +234,10 @@ async function runProtocol({
   healthMonitor,
   apiKeyKind = 'managed',
   apiKeyRecord = { category: 'api' },
+  routingConfigPath,
+  onRun,
 }) {
-  const { handler, response } = protocolHarness({ routing, body, healthMonitor })
+  const { handler, response } = protocolHarness({ routing, body, healthMonitor, routingConfigPath, onRun })
   const req = {
     method: 'POST',
     url: '/v1/messages',
@@ -236,6 +250,9 @@ async function runProtocol({
     once() {},
     off() {},
   }
+  response.on = (event, listener) => {
+    if (event === 'finish') response.finish = listener
+  }
   let reached = false
   try {
     await handler.handleProtocol(req, response, protocol, '/v1/messages')
@@ -243,11 +260,41 @@ async function runProtocol({
     if (error !== REACHED) throw error
     reached = true
   }
-  return { reached, status: response.status, code: response.body?.error?.code }
+  response.finish?.()
+  return {
+    reached,
+    status: response.status,
+    code: response.body?.error?.code,
+  }
 }
 
 const AXIOS = { 'user-agent': 'axios/1.7' }
 const BLOCKED = { reached: false, status: 403, code: 'claude_code_only' }
+
+test('switch on: 403 tells the caller to use the official client and logs that reason', async () => {
+  const logs = []
+  const { handler, response } = protocolHarness({ routing: ON, body: THIRD_PARTY_BODY, logs })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-api', ...AXIOS },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
+    once() {},
+    off() {},
+  }
+  response.on = (event, listener) => {
+    if (event === 'finish') response.finish = listener
+  }
+  await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+  response.finish?.()
+  const message = '当前仅允许官方 Claude Code 客户端调用 Claude 模型。请使用 Claude 官方客户端。'
+  assert.equal(response.body?.error?.message, message)
+  assert.equal(logs.at(-1).error_code, 'claude_code_only')
+  assert.equal(logs.at(-1).final_state, 'claude_code_only')
+  assert.equal(logs.at(-1).error_message, message)
+  assert.equal(logs.at(-1).status, 403)
+})
 
 test('switch on: third-party Claude requests are 403 before any account is picked', async () => {
   assert.deepEqual(await runProtocol({ routing: ON, body: THIRD_PARTY_BODY, headers: AXIOS }), BLOCKED)
@@ -269,7 +316,7 @@ test('switch on: health probes are refused, never answered from the probe cache'
     },
   }
   assert.deepEqual(await runProtocol({ routing: ON, body: THIRD_PARTY_BODY, headers: AXIOS, healthMonitor }), BLOCKED)
-  // sub2api's account test carries the CLI banner; even with a full CLI header set it is a probe.
+  // The account probe carries the CLI banner but is still a probe with a full CLI header set.
   const accountTest = {
     model: 'claude-sonnet-5',
     max_tokens: 1024,
@@ -299,6 +346,54 @@ test('switch on: local-agent desktop reaches the scheduler without relay detecti
   assert.deepEqual(await runProtocol({ routing, body, headers: DESKTOP_HEADERS }), BLOCKED)
 })
 
+const OPENCLAW_SYSTEM =
+  'You are a personal assistant running inside OpenClaw.\n\n## OpenClaw Control\nUse the configured workspace.'
+const DRIFTED_AGENT = `${CRS_OFFICIAL_AGENT_PROMPT}\n\n# New Section\nVerify the result before replying.`
+const sdkBilling = { type: 'text', text: BILLING.replace('cc_entrypoint=cli', 'cc_entrypoint=sdk-cli') }
+const identity = { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }
+
+for (const [name, texts, relocated] of [
+  ['a separate OpenClaw block', [DRIFTED_AGENT, OPENCLAW_SYSTEM], true],
+  ['an official prompt with a new section', [DRIFTED_AGENT], false],
+  ['a suffix combined with the official prompt', [`${CRS_OFFICIAL_AGENT_PROMPT}\n\n${OPENCLAW_SYSTEM}`], false],
+]) {
+  test(`handleProtocol with official CLI headers: ${name}`, async (t) => {
+    // Zero preserves non-billing system blocks without bypassing the relocation gate.
+    const routing = { compatibility: { persona_preset: 'zero', detect_proxied_official_cc: false } }
+    const dir = mkdtempSync(join(tmpdir(), 'cc-system-relocation-'))
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    const routingConfigPath = join(dir, 'routing.json')
+    writeFileSync(routingConfigPath, JSON.stringify(routing))
+
+    const contentBlocks = texts.map((text) => ({ type: 'text', text }))
+    const body = {
+      ...OFFICIAL_BODY,
+      system: [sdkBilling, identity, ...contentBlocks],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
+    assert.equal(isOfficialClaudeCodeTraffic(CLI_HEADERS, body), true)
+    let outbound
+    const result = await runProtocol({
+      routing,
+      routingConfigPath,
+      body,
+      headers: CLI_HEADERS,
+      apiKeyKind: 'master',
+      onRun: ({ canonicalBody }) => {
+        outbound = canonicalBody
+      },
+    })
+    assert.equal(result.reached, true)
+    // Persona rendering still replaces the billing block.
+    assert.match(outbound.system[0].text, /^x-anthropic-billing-header:/)
+    assert.deepEqual(outbound.system.slice(1), relocated ? [identity] : body.system.slice(1))
+    const expectedContent = relocated
+      ? [{ type: 'text', text: OPENCLAW_SYSTEM }, ...body.messages[0].content]
+      : body.messages[0].content
+    assert.deepEqual(outbound.messages, [{ role: 'user', content: expectedContent }])
+  })
+}
+
 test('switch on: master-key pinned panel diagnostics are not inbound clients', async () => {
   const result = await runProtocol({
     routing: ON,
@@ -307,6 +402,37 @@ test('switch on: master-key pinned panel diagnostics are not inbound clients', a
     apiKeyKind: 'master',
   })
   assert.equal(result.reached, true)
+})
+
+test('an admin-owned key pins a slot but stays an inbound client', async () => {
+  const users = { getById: (id) => ({ a1: { role: 'admin' }, u1: { role: 'user' } })[id] || null }
+  const run = async (userId, routing, body, headers) => {
+    const seen = []
+    const { handler, response } = protocolHarness({ routing, body, users, onRun: (args) => seen.push(args) })
+    const req = {
+      method: 'POST',
+      url: '/v1/messages',
+      headers: { authorization: 'Bearer sk-vm-api', ...headers, 'x-kin-vm': 'vm-01' },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { category: 'oauth', user_id: userId },
+      once() {},
+      off() {},
+    }
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages').catch((error) => {
+      if (error !== REACHED) throw error
+    })
+    return { status: response.status, args: seen[0] }
+  }
+  const admin = await run('a1', {}, OFFICIAL_BODY, CLI_HEADERS)
+  assert.equal(admin.args.pinVmId, 'vm-01')
+  assert.deepEqual(admin.args.ownerScope, { type: 'platform' })
+  const tenant = await run('u1', {}, OFFICIAL_BODY, CLI_HEADERS)
+  assert.equal(tenant.args.pinVmId, null)
+  assert.deepEqual(tenant.args.ownerScope, { type: 'user', userId: 'u1' })
+  // The pin does not exempt an admin's key from the Claude Code only gate.
+  const gated = await run('a1', ON, THIRD_PARTY_BODY, AXIOS)
+  assert.equal(gated.status, 403)
+  assert.equal(gated.args, undefined)
 })
 
 test('switch off: third-party Claude requests are not gated', async () => {

@@ -1,9 +1,9 @@
 /**
  * Browser OAuth-link import.
- * CAI (sub2api) and official Claude Code share PKCE + paste-code,
- * then exchange inside the target VM using its bound egress. proxyUrl still
- * validates the authorize session, but production execution uses the VM context;
- * null means unbound and is refused.
+ * CAI and Setup Token share PKCE + paste-code, then exchange using the target
+ * VM's bound egress. Native Claude Code login does not use this helper. Legacy kernels use the
+ * controller helper with the same exit. The VM context selects the live binding;
+ * proxyUrl validates the authorize session and null means unbound.
  */
 import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
@@ -23,20 +23,11 @@ export const OAUTH_FLAVORS = Object.freeze({
     scope: FULL_OAUTH_SCOPE,
     source: 'oauth-auth-url',
   },
-  claude_code: {
-    flavor: 'claude_code',
-    authorizeUrl: 'https://claude.ai/oauth/authorize',
-    redirectUri: 'https://console.anthropic.com/oauth/code/callback',
-    tokenUrls: [
-      'https://platform.claude.com/v1/oauth/token',
-      'https://api.anthropic.com/v1/oauth/token',
-      'https://console.anthropic.com/v1/oauth/token',
-    ],
-    scope: FULL_OAUTH_SCOPE,
-    source: 'oauth-claude-code',
-  },
   setup_token: {
     flavor: 'setup_token',
+    // Same consent page and same grant as CAI: identity (profile/roles/
+    // bootstrap) needs `user:profile`, so the mint is not narrowed. The only
+    // difference is the one-year lifetime requested at exchange time.
     authorizeUrl: 'https://claude.com/cai/oauth/authorize',
     redirectUri: 'https://platform.claude.com/oauth/code/callback',
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
@@ -83,11 +74,14 @@ function fail(code, message) {
   return err
 }
 
-function normalizeSocks(proxyUrl) {
-  if (proxyUrl === '') return ''
-  const s = String(proxyUrl || '').trim()
-  if (!s) return null
-  return s.replace(/^socks5:\/\//i, 'socks5h://')
+/**
+ * Whether a slot has a bound exit at all, for refusing an authorize link before
+ * the user walks through a browser flow. `''` is local egress (bound, direct).
+ * This is not address resolution: the exchange resolves its own exit at the
+ * point of use, and the public SOCKS formatter lives in socks-address.mjs.
+ */
+function hasBoundExitUrl(proxyUrl) {
+  return proxyUrl === '' || Boolean(String(proxyUrl || '').trim())
 }
 
 export function normalizeOauthFlavor(raw) {
@@ -101,7 +95,9 @@ export function normalizeOauthFlavor(raw) {
 }
 
 export function oauthFlavorSpec(raw) {
-  return OAUTH_FLAVORS[normalizeOauthFlavor(raw)]
+  const flavor = normalizeOauthFlavor(raw)
+  if (flavor === 'claude_code') throw fail('native_login_required', 'Claude Code 授权须在槽位原生终端完成')
+  return OAUTH_FLAVORS[flavor]
 }
 
 export function resetAuthUrlSessions() {
@@ -123,7 +119,7 @@ export function buildAuthorizationURL(state, codeChallenge, scope = SCOPE_OAUTH,
 export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
   sweepExpired()
   if (!vmId) throw fail('vm_required', 'vm_id required (先创建虚拟机)')
-  if (normalizeSocks(proxyUrl) == null) {
+  if (!hasBoundExitUrl(proxyUrl)) {
     throw fail('proxy_required', '虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接')
   }
   const spec = oauthFlavorSpec(flavor)
@@ -160,18 +156,20 @@ function parseAuthCode(fullCode) {
   return { code: raw.slice(0, hash), state: raw.slice(hash + 1) }
 }
 
-async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session, options = {}) {
-  // With an execution context the helper runs inside the target VM and
-  // selects that VM's bound egress. The host proxy is only a test/direct path.
-  const px = options.exec ? null : normalizeSocks(proxyUrl)
-  if (px == null && !options.exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+async function exchangeCodeForToken(authCode, codeVerifier, state, session, options = {}) {
+  // The execution context resolves the VM's current bound exit at the point of
+  // use, including controller execution for legacy kernels and native nodes.
+  // `proxyUrl` here is the fetchImpl test seam only; a session's stored proxy is
+  // a snapshot from authorize time and never decides the exchange.
   return exchangeTokenViaCookieAuth({
     code: authCode,
     codeVerifier,
     state,
-    proxyUrl: px,
     redirectUri: session.redirectUri,
     tokenUrls: session.tokenUrls,
+    // Runtime mode selects the transport profile: setup-token for the README
+    // mint flow, OAuth for pasted CAI authorization codes.
+    runtimeMode: session.flavor === 'setup_token' ? 'setup-token' : 'oauth',
     ...options,
   })
 }
@@ -185,6 +183,7 @@ export async function exchangeAuthCode({
   exec,
   projectRoot,
   routing,
+  proxyPool,
 } = {}) {
   sweepExpired()
   const session = sessions.get(sessionId)
@@ -202,8 +201,9 @@ export async function exchangeAuthCode({
   if (!parsed.code) throw fail('code_required', '请粘贴授权码')
   if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
     throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
-  const px = proxyUrl ?? session.proxyUrl
-  if (px == null && !exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  // session.proxyUrl stays on the record for audit only. A pool reallocation
+  // inside SESSION_TTL_MS is a legitimate operation, so the exchange resolves
+  // the exit itself rather than refusing or reusing this snapshot.
 
   if (process.env.KIN_FAKE_SESSION_OAUTH === '1' || process.env.KIN_FAKE_SESSION_OAUTH === 'true') {
     sessions.delete(sessionId)
@@ -226,18 +226,20 @@ export async function exchangeAuthCode({
   // Full OAuth paste codes carry the provider's exchange state, not necessarily
   // the authorize nonce. PKCE still binds the code to this VM's live session.
   const exchangeState = session.flavor === 'setup_token' ? parsed.state || session.state : parsed.state
-  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, px, session, {
+  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, session, {
     exec,
     projectRoot,
     routing,
+    proxyPool,
+    proxyUrl,
     fetchImpl,
   })
   sessions.delete(sessionId)
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
   const identity = flattenOauthIdentity(token)
-  // kin-oauth-auth completes bootstrap inside the VM, through the same bound
-  // egress as token exchange. Do not bootstrap again from the control plane.
+  // kin-oauth-auth completes bootstrap through the same bound exit as the
+  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
   return carryOAuthAttempt(token, {
     access_token: token.access_token,
     refresh_token: token.refresh_token || '',

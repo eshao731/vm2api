@@ -11,6 +11,7 @@ import {
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
+  restoreKernelErrorStatus,
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
@@ -22,7 +23,10 @@ import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/code
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
+import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
+import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
   const restored = restoreUncommittedHop({
@@ -107,6 +111,47 @@ test('semanticStatusForStreamError reads outer Codex status 500 instead of defau
     502,
   )
 })
+test('server overload errors map to 503 and preserve retry identity', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'Our servers are currently overloaded. Please try again later.',
+    },
+  }
+  assert.equal(semanticStatusForStreamError(body), 503)
+  const restored = restoreUncommittedHop({
+    ok: false,
+    status: 200,
+    committed: false,
+    terminalState: 'incomplete',
+    headers: {},
+    body,
+  })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  assert.equal(restored.streamError, true)
+})
+test('kernel-wrapped server overload restores 503 but explicit status wins', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'overloaded',
+    },
+  }
+  const restored = restoreKernelErrorStatus({ ok: false, status: 502, body })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  const explicit = restoreKernelErrorStatus({
+    ok: false,
+    status: 502,
+    body: { ...body, error: { ...body.error, status: 502 } },
+  })
+  assert.equal(explicit.status, 502)
+})
 
 test('restoreUncommittedHop reports Codex outer status 500 rather than 502', () => {
   const restored = restoreUncommittedHop({
@@ -141,6 +186,26 @@ test('setup-token worker envelope is inference-only', () => {
   assert.equal(out.headers['user-agent'], 'kin-inference/1.0')
   assert.doesNotMatch(String(out.headers['anthropic-beta'] || ''), /claude-code-20250219/)
   assert.match(String(out.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
+})
+
+test('native queue delegates ordinary headers to CC but keeps compatibility headers', () => {
+  const body = { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }
+  const workerStatus = {
+    runtime_variant: 'crag-v2',
+    capabilities: ['generation_controls_v3', 'linux_tui_native_queue', 'message_threads_beta'],
+  }
+  const args = { body, exec: { workerStatus }, cliHop: true, cragPrint: true }
+  assert.equal(finalizeWorkerPayload(args).headers, undefined)
+  assert.equal(finalizeWorkerPayload(args).body.betas, undefined)
+  for (const overrides of [
+    { requestContext: { purpose: 'auto_mode_classifier', format: 'xml' } },
+    { repaired: true },
+    { body: { ...body, thread: { type: 'create' } } },
+    { exec: { workerStatus: { ...workerStatus, capabilities: ['generation_controls_v3'] } } },
+    { cragPrint: false },
+  ]) {
+    assert.ok(finalizeWorkerPayload({ ...args, ...overrides }).headers['anthropic-beta'])
+  }
 })
 
 test('worker canonicalizes passthrough bodies before either kernel', () => {
@@ -258,6 +323,37 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   })
   assert.equal(passed.body.thinking.display, 'updates')
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
+})
+
+test('CRAG aligns sampling after resolving explicit or default thinking', () => {
+  const exec = { workerStatus: { runtime_variant: 'crag-v2', capabilities: ['generation_controls_v3'] } }
+  const sampling = { temperature: 0.5, top_p: 0.9, top_k: 10 }
+  for (const [thinking, expectedType] of [
+    [undefined, 'adaptive'],
+    [{ type: 'adaptive' }, 'adaptive'],
+    [{ type: 'enabled', budget_tokens: 1024 }, 'enabled'],
+    [{ type: 'disabled' }, 'disabled'],
+  ]) {
+    const { body } = finalizeWorkerPayload({
+      body: {
+        model: thinking?.type === 'adaptive' || !thinking ? 'claude-opus-5-5' : 'claude-opus-4-8',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking,
+        ...sampling,
+      },
+      exec,
+      cliHop: true,
+    })
+    assert.equal(body.thinking.type, expectedType)
+    if (expectedType === 'disabled') {
+      for (const [key, value] of Object.entries(sampling)) assert.equal(body[key], value)
+      continue
+    }
+    assert.equal(body.temperature, 1)
+    assert.equal(Object.hasOwn(body, 'top_p'), false)
+    assert.equal(Object.hasOwn(body, 'top_k'), false)
+  }
 })
 
 test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
@@ -411,6 +507,204 @@ async function fixture(handler) {
 function writeData(res, event) {
   res.write(`data: ${JSON.stringify(event)}\n\n`)
 }
+
+const noClaudeAccount = { error: 'No signed-in Claude account found', code: 'NO_ACCOUNT' }
+
+for (const [status, stream] of [
+  [200, false],
+  [502, false],
+  [200, true],
+]) {
+  unixTest(`Claude slot login failure in HTTP ${status} JSON (stream=${stream}) is not a caller error`, async (t) => {
+    const fx = await fixture((_req, res) => {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(noClaudeAccount))
+    })
+    t.after(() => fx.close())
+    const lines = []
+    const result = await (stream ? streamGoWorker : callGoWorker)({
+      exec: fx.exec,
+      body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 503)
+    assert.equal(result.body.error.code, 'slot_oauth_unavailable')
+    const policy = classifyUpstreamResult(result)
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+    const mapped = mapUpstreamError(result.status, result.body, result.headers)
+    assert.equal(mapped.body.error.code, 'pool_unavailable')
+    assert.doesNotMatch(JSON.stringify(mapped), /NO_ACCOUNT|No signed-in Claude account found|slot_oauth_unavailable/)
+    assert.deepEqual(lines, [])
+  })
+}
+
+for (const committed of [false, true]) {
+  unixTest(`Claude SSE login error stays private (committed=${committed})`, async (t) => {
+    const fx = await fixture((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      writeData(res, { type: 'message_start', message: { content: [] } })
+      if (committed)
+        writeData(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'partial' } })
+      res.write('event: error\n')
+      writeData(
+        res,
+        committed
+          ? {
+              type: 'error',
+              error: { type: 'api_error', message: `provider error: ${JSON.stringify(noClaudeAccount)}` },
+            }
+          : noClaudeAccount,
+      )
+      res.end()
+    })
+    t.after(() => fx.close())
+    const lines = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.committed, committed)
+    assert.equal(result.status, 503)
+    assert.equal(result.body.error.code, 'slot_oauth_unavailable')
+    assert.equal(classifyUpstreamResult(result).action, committed ? 'stop' : 'continue')
+    if (committed) {
+      assert.match(lines.join('\n'), /partial/)
+      const remapper = createAnthropicSseErrorRemapper()
+      assert.match(lines.map((line) => remapper.remapLine(line)).join('\n'), /pool_unavailable/)
+    } else assert.deepEqual(lines, [])
+    assert.doesNotMatch(lines.join('\n'), /NO_ACCOUNT|No signed-in Claude account found|slot_oauth_unavailable/)
+  })
+}
+
+unixTest('native handoff keeps flat slot login errors off the public stream', async (t) => {
+  const fx = await fixture((_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    res.write('event: error\n')
+    writeData(res, noClaudeAccount)
+    res.end()
+  })
+  t.after(() => fx.close())
+  fx.exec.workerStatus = { runtime_variant: 'crag-v2', capabilities: ['native_handoff_v1'] }
+  const lines = []
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  const result = await streamGoWorker({
+    exec: fx.exec,
+    managedCrag: true,
+    cragPrint: false,
+    envelope: { body, headers: {}, stream: true },
+    onEvent: (line) => lines.push(line),
+  })
+  assert.equal(result.nativeHandoff, true)
+  assert.equal(result.committed, false)
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'slot_oauth_unavailable')
+  assert.deepEqual(lines, [])
+})
+
+for (const eventType of ['response.completed', 'response.incomplete']) {
+  unixTest(`Codex delivers ${eventType} without any assistant deltas`, async (t) => {
+    const incomplete = eventType === 'response.incomplete'
+    const response = {
+      id: 'resp_test',
+      status: incomplete ? 'incomplete' : 'completed',
+      output: [],
+      ...(incomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+      usage: { input_tokens: 20000, output_tokens: 0 },
+    }
+    const events = [
+      { type: 'response.created', response: { id: response.id } },
+      { type: eventType, response },
+    ]
+    const fx = await fixture((req, res) => {
+      req.resume()
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      for (const event of events) writeData(res, event)
+      res.end()
+    })
+    t.after(() => fx.close())
+    fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+    const received = []
+    const result = await streamCodexKernel({
+      exec: fx.exec,
+      envelope: { body: { model: 'gpt-6.2-sol', input: [] } },
+      onEvent(line) {
+        if (line.startsWith('data:')) received.push(JSON.parse(line.slice(5)))
+      },
+    })
+    assert.deepEqual(received, events)
+    assert.equal(result.ok, true)
+    assert.equal(result.status, 200)
+    assert.equal(result.terminalState, incomplete ? 'incomplete' : 'verified')
+    assert.deepEqual(result.body, response)
+    assert.deepEqual(result.usage, response.usage)
+  })
+}
+
+unixTest('Codex EOF without a terminal event is a failure even with reported usage', async (t) => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    writeData(res, { type: 'response.in_progress', response: { usage: { input_tokens: 20000, output_tokens: 0 } } })
+    res.end()
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const result = await streamCodexKernel({ exec: fx.exec, envelope: { body: { input: [] } } })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 502)
+  assert.equal(result.upstreamStatus, 200)
+  assert.equal(result.body.error.code, 'upstream_stream_incomplete')
+  assert.equal(result.usage.input_tokens, 20000)
+})
+
+unixTest('Codex EOF after visible output sends a failed event, not an implicit success', async (t) => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    writeData(res, { type: 'response.created', response: { id: 'resp_truncated' } })
+    writeData(res, { type: 'response.output_text.delta', delta: 'Partial' })
+    res.end()
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const frames = []
+  const result = await streamCodexKernel({
+    exec: fx.exec,
+    envelope: { body: { input: [] } },
+    onEvent(line) {
+      if (line.startsWith('data:')) frames.push(JSON.parse(line.slice(5)))
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.committed, true)
+  assert.deepEqual(
+    frames.map((frame) => frame.type),
+    ['response.created', 'response.output_text.delta', 'response.failed'],
+  )
+  assert.equal(frames.at(-1).response.id, 'resp_truncated')
+  assert.equal(frames.at(-1).response.error.code, 'upstream_stream_incomplete')
+})
+
+unixTest('Codex response.failed before commitment keeps its provider error', async (t) => {
+  const error = { type: 'invalid_request_error', code: 'invalid_tool', message: 'Invalid tool', param: 'tools' }
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    writeData(res, { type: 'response.failed', response: { status: 'failed', error } })
+    res.end()
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const result = await streamCodexKernel({ exec: fx.exec, envelope: { body: { input: [] } } })
+  assert.equal(result.ok, false)
+  assert.equal(result.committed, false)
+  assert.equal(result.status, 400)
+  assert.deepEqual(result.body.error, error)
+})
 
 function gate() {
   let release
@@ -1100,7 +1394,6 @@ unixTest('streamGoWorker stamps TTFT on text and thinking deltas', async () => {
 unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible output', async (t) => {
   let now = 1_000
   t.mock.method(Date, 'now', () => now)
-  const sawEmpty = gate()
   const sawProgress = gate()
   const fx = await fixture(async (req, res) => {
     res.setHeader('content-type', 'text/event-stream')
@@ -1111,7 +1404,9 @@ unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible
       index: 0,
       delta: { type: 'thinking_delta', thinking: '', estimated_tokens: 0 },
     })
-    await sawEmpty.ready
+    // Empty progress is intentionally held before commit. Advance the server
+    // clock rather than waiting for that uncommitted frame downstream.
+    now = 2_000
     writeData(res, {
       type: 'content_block_delta',
       index: 0,
@@ -1135,10 +1430,7 @@ unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible
         messages: [{ role: 'user', content: 'hi' }],
       },
       onEvent: (line) => {
-        if (line.includes('"estimated_tokens":0')) {
-          now = 2_000
-          sawEmpty.release()
-        } else if (line.includes('"estimated_tokens":50')) {
+        if (line.includes('"estimated_tokens":50')) {
           now = 5_000
           sawProgress.release()
         }
@@ -1273,7 +1565,7 @@ unixTest('streamGoWorker keeps rate-limit trailers after message_stop', async ()
 })
 
 unixTest('streamGoWorker restores a streamed plan-limit error to 429 with a parsed reset', async () => {
-  // Kernel cli-hop: HTTP 200, then `event: error` (sub2api sseStreamErrorEventError).
+  // The CLI hop reports the failure as an SSE error after sending HTTP 200.
   const fx = await fixture((req, res) => {
     res.setHeader('content-type', 'text/event-stream')
     res.write('event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n')
@@ -1491,12 +1783,32 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
   }
 })
 
-test('terminal metadata is not a downstream commit', () => {
+test('terminal metadata and empty blocks are not downstream commits', () => {
   assert.equal(isDownstreamCommitEvent({ type: 'message_start', message: {} }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'error', error: { message: 'Connection error' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_stop' }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: {} }), false)
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'text', text: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'thinking', thinking: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'thinking_delta', estimated_tokens: 1 } }),
+    true,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: 'x' } }),
+    true,
+  )
   assert.equal(
     isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } }),
     true,
@@ -1715,6 +2027,78 @@ unixTest('Codex clients enforce the panel limit on their serialized envelope', a
   }
 })
 
+unixTest('redaction 413 stops failover before any worker dispatch for call and stream clients', async (t) => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(500).end('{}')
+  })
+  t.after(async () => {
+    publishRedactionForTests(null)
+    await fx.close()
+  })
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const policy = normalizeRedaction({ enabled: true, secrets: true, personal: false })
+  let masks = 0
+  publishRedactionForTests({
+    enabled: true,
+    ready: true,
+    policy,
+    client: {
+      async mask({ maxBodyBytes }) {
+        masks++
+        assert.equal(maxBodyBytes, 64 * 1024 * 1024)
+        throw Object.assign(new Error('redaction body exceeds the configured request body limit'), {
+          code: 'redaction_body_too_large',
+          status: 413,
+          details: { retryable: false },
+        })
+      },
+    },
+  })
+  for (const call of [callGoWorker, streamGoWorker, callCodexKernel, streamCodexKernel]) {
+    const body =
+      call === callCodexKernel || call === streamCodexKernel
+        ? { input: 'fixture' }
+        : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
+    let selections = 0
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          selections++
+          assert.equal(selections, 1, 'a local size error must not select another account')
+          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
+        },
+        markCooldown() {
+          assert.fail('a local size error must not cool down an account')
+        },
+      },
+    })
+    const result = await runner.run({
+      requestId: `redaction-size-${call.name}`,
+      model: 'fixture-model',
+      canonicalBody: body,
+      callAttempt: () =>
+        call({
+          exec: fx.exec,
+          envelope: { body },
+          routing: { redaction: policy, failover: { max_request_mib: 64 } },
+          redactionPrincipal: 'fixture-principal',
+        }),
+    })
+    assert.equal(result.status, 413, call.name)
+    assert.equal(result.body.error.code, 'redaction_body_too_large')
+    assert.equal(result.body.error.type, 'invalid_request_error')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.equal(result.transportError, false)
+    assert.equal(result.attemptCount, 0)
+    assert.equal(selections, 1)
+  }
+  assert.equal(masks, 4)
+  assert.equal(requests, 0)
+})
+
 unixTest('invalid Messages are rejected before either kernel accepts a turn', async (t) => {
   let requests = 0
   const fx = await fixture((req, res) => {
@@ -1724,16 +2108,34 @@ unixTest('invalid Messages are rejected before either kernel accepts a turn', as
   })
   t.after(() => fx.close())
   for (const runtime_variant of ['cli-node', 'crag-v2']) {
-    const exec = { ...fx.exec, workerStatus: { runtime_variant } }
+    const isCrag = runtime_variant === 'crag-v2'
+    const exec = {
+      ...fx.exec,
+      workerStatus: { runtime_variant, capabilities: isCrag ? ['generation_controls_v3'] : [] },
+    }
     for (const send of [callGoWorker, streamGoWorker]) {
       for (const prebuilt of [false, true]) {
-        for (const messages of [
-          [],
-          [{ role: 'user', content: ' \n\t' }],
-          [{ role: 'user', content: 42 }],
-          [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }],
+        for (const fields of [
+          { messages: [] },
+          { messages: [{ role: 'user', content: ' \n\t' }] },
+          { messages: [{ role: 'user', content: 42 }] },
+          { messages: [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }] },
+          {
+            messages: [
+              { role: 'assistant', content: [{ type: 'tool_use', id: 'call_bad', name: 'sample', input: [] }] },
+            ],
+          },
+          { tools: [{ type: 'function', name: 'sample', parameters: { type: 'object' } }] },
+          { tools: [{ name: 'sample', input_schema: { type: 'string' } }] },
+          {
+            tools: [
+              { name: 'sample', input_schema: { type: 'object', oneOf: [{ required: ['a'] }, { required: ['b'] }] } },
+            ],
+          },
+          { max_tokens: 3.5 },
+          ...(isCrag ? [{ tools: [{ type: 'web_search_20250305', name: 'web_search' }] }] : []),
         ]) {
-          const body = { model: 'claude-sonnet-5', messages }
+          const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }], ...fields }
           const result = await send({ exec, ...(prebuilt ? { envelope: { body } } : { body }) })
           assert.equal(result.status, 400)
           assert.equal(result.body.error.code, 'invalid_kernel_request')
@@ -1780,10 +2182,12 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
     if (sent.body.crag_prompt) {
       assert.deepEqual(sent.body.crag_options, { effort: 'high' })
       assert.equal(sent.body.auto_compact_window, undefined)
+      assert.equal(Object.hasOwn(sent.body, 'diagnostics'), false)
     } else {
       assert.equal(sent.body.crag_model, undefined)
       assert.equal(sent.body.crag_options, undefined)
       assert.equal(sent.body.auto_compact_window, 200000)
+      assert.deepEqual(sent.body.diagnostics, { previous_message_id: null })
     }
     res.writeHead(409, { 'content-type': 'application/json' })
     res.end(
@@ -1806,11 +2210,51 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
         crag_prompt: { mode: 'append', text: 'caller instruction' },
         crag_options: { transport: 'print', effort: 'high' },
         auto_compact_window: 200000,
+        diagnostics: { previous_message_id: null },
         safeguards: { synthetic_extension: true },
       }
       const result = await callGoWorker({ exec, cliHop: true, ...(prebuilt ? { envelope: { body } } : { body }) })
       assert.equal(result.status, 409)
       assert.equal(result.transportError, false)
     }
+  }
+})
+
+unixTest('streamGoWorker preserves refusal details when an empty response becomes an error', async () => {
+  const details = {
+    type: 'refusal',
+    category: 'reasoning_extraction',
+    explanation: 'Synthetic provider refusal explanation.',
+  }
+  const fx = await fixture((_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'message_start', message: { type: 'message', role: 'assistant', content: [] } })
+    writeData(res, { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: details } })
+    writeData(res, { type: 'message_stop' })
+    writeData(res, {
+      type: 'error',
+      error: { type: 'api_error', message: 'native request completed without response content' },
+    })
+    res.end()
+  })
+  try {
+    const lines = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: {
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'synthetic classifier input' }],
+      },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.committed, false)
+    assert.equal(result.stopReason, 'refusal')
+    assert.deepEqual(result.stopDetails, details)
+    assert.equal(result.body.error.code, 'empty_response')
+    assert.deepEqual(lines, [])
+  } finally {
+    await fx.close()
   }
 })

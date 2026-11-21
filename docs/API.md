@@ -52,6 +52,16 @@ OpenAI 模型页的 Fast 开关只对已同步、已启用且目录明确声明 
 
 别名路径（无 `/v1` 前缀）与上表相同处理函数。
 
+### Anthropic 工具续接
+
+`/v1/messages` 返回的 `tool_use` 是下一轮工具历史的依据。同一认证主体、入站会话和模型下，网关在完整响应后短期保留公开的工具块（含 `id`、`name`、解析后的 `input`、`caller` 和扩展字段）。客户端应优先原样回传。命中记录时，网关用原块还原历史，不改工具结果正文或 `is_error`。
+
+即使调用 ID 未变，紧接的 user 消息也必须用 `tool_result.tool_use_id` 唯一回答整组调用。缺少、重复或引用其他调用的结果时，该组历史保持原样；并行结果可以按不同顺序返回。
+
+若客户端同步重编了 `tool_use.id` 和 `tool_result.tool_use_id`，只有历史前缀、调用顺序、工具名和参数能唯一对应时，网关才一起还原这两处 ID。截断流、歧义或无记录时不猜测。记录只在当前网关进程内有界保留；进程重启、记录被淘汰或未提供可识别的会话时，仍以客户端历史为准。
+
+历史匹配忽略消息内容块外层的 `cache_control`，因此客户端可以移动缓存断点。还原工具块时保留本轮指定的断点；`tool_use.input` 内的同名字段仍是业务参数，参与匹配。
+
 ## Responses WebSocket
 
 用相同 Bearer API key 对 `GET /v1/responses` 发起标准 WebSocket Upgrade，然后发送文本帧：
@@ -102,15 +112,23 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 
 非官方入站会被改写成配置选定的 persona system 再发给上游；**回包不带改写后的 system**。`persona_preset=official` 保留 billing、identity、调用方 agent prompt（若有）和调用方 system；`persona_preset=official_full` 才固定追加完整 Claude Code agent prompt。非官方 `usage` 按「没有 persona system、没有注入 tools」估算。官方 Claude Code 四闸全过则体不改、usage 不藏。
 
+上面这套改写对每个 Anthropic API 地址可单独关掉：地址的 `body_policy` 为 `persona`（缺省）时照上述执行；设为 `caller` 则原样转发调用方自带的 `system`、计费标记与工具身份，不注入人设、persona 隐藏用量记 0。只有运维能在面板「API 渠道」里改它，请求头和请求体都无法开启。它**只影响人设注入** —— 风控审查、Key 配额、模型映射、预算下限、代理与认证照旧，上游的拒绝也照旧透出。适用于上游自己读取这些块的地址（例如上游按调用方计费标记判断额度）。
+
+注意本页的「API 渠道测试」不走上述人设链路，它自建一个最简 Messages 请求。所以**面板测试通过不能推断托管 Key 正式入口的请求形状**；要比对两者，先确认该地址的 `body_policy`。
+
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
 
 native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
 
 ### Sonnet 5.5 兼容边界
 
-`claude-sonnet-5-5` 不支持原生强制工具调用。Node 沿用 Opus 5.5 策略：`tool_choice=any/tool/required` 转成 `{type:auto}`；指定名称的客户端工具设置 `strict:true`，服务端工具不加该字段。不注入提示词，也不把普通文本伪造成工具调用。**strict 只约束实际工具调用的参数，不保证一定调用或只调用指定工具。** 需要原生强制调用时继续使用支持该能力的模型，例如 `claude-sonnet-5`；其行为不变。
+`claude-sonnet-5-5` 不支持原生强制工具调用，请求**直接拒绝，不做自动改写**：`tool_choice` 为 `any` 或 `tool` 时返回 `400 tool_choice_incompatible`。同一规则适用于其他只支持 adaptive thinking 的模型——`claude-opus-5-5`、`claude-fable-5`、`claude-fable-5-1`、`claude-fable-5-2`，以及路由别名 `auto`。校验在模型与 persona 重写之前执行，且与 `thinking` 无关：**没有传 `thinking` 同样会被拒，移除它不能绕过**。
 
-规则覆盖 Messages、Chat Completions、Responses 的出站清洗。`auto` / `none` 保持；不支持的 disabled/enabled thinking 转为 adaptive，保留 display。结构化输出转换保留 `output_config.effort`，已有 `output_config.format` 优先，否则从 `response_format` / `text.format` 合并，cli-hop 与普通出站路径均补齐对象 schema 的 `additionalProperties:false`（不覆盖显式值）。
+允许模型自行选择时显式传 `tool_choice={type:auto}` 或 `{type:none}`；必须强制指定工具时改用支持该能力的模型，例如 `claude-sonnet-5`、`claude-opus-5`、`claude-opus-4-8`、`claude-haiku-5-5`。客户端工具的 `strict` 按调用方所传原样透传，不再自动注入。
+
+强制工具调用另有两条与模型无关的限制，同样返回 `400 tool_choice_incompatible`：与 `thinking.type` 为 `enabled` 或 `adaptive` 同时出现；在 Haiku 5.5 上 effort 高于 `high`，或带 `thinking.budget_tokens`。
+
+出站清洗覆盖 Messages、Chat Completions、Responses。`auto` / `none` 保持；不支持的 disabled/enabled thinking 转为 adaptive，保留 display。结构化输出转换保留 `output_config.effort`，已有 `output_config.format` 优先，否则从 `response_format` / `text.format` 合并，cli-hop 与普通出站路径均补齐对象 schema 的 `additionalProperties:false`（不覆盖显式值）。
 
 
 ## Chat Completions
@@ -385,7 +403,7 @@ curl -sS http://127.0.0.1:8787/health
 | `upstream_error` | 401/403/502 |
 | `api_error` | 500 |
 
-上游 429 失败转移用尽后原样返回 429 `upstream_rate_limit`，有上游 `retry-after` 时透传；529 一定带 `retry-after`（号池估计，上游 529 取上游值，都没有时为 1）。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不修复重试，客户端收到 400 `policy_blocked` / `refusal_guard`，避免 Claude Code 误提示 `/login` 或按一般 400 做修复重试；并把该 prompt 永久写入拒答缓存；再次相同请求，或用户正文与已缓存正文的估计 Jaccard 达到面板阈值（默认 0.90，可选 0.80/0.85/0.90/0.95），都在 hop 前被拦。HTTP 400/503「Third-party apps now draw from your extra usage」和「no third-party apps allowed」同样入库并走近似拦截，但不封 device。`content_policy`、`cyber_policy`、`moderation_blocked` 等内容错误码（含 `upstream_code`）同样入库。协议硬正则，或面板所选的 Jev / Laya / ModernBERT（`/v1/systemone`，`noul ≥ 0.5`）判为 NSFW、蒸馏、破解、破限时返回 403 `policy_blocked`，不 hop，不写入拒答缓存；device 封禁开启时封禁入站 device。模型不可用且 `fail_open` 为 false 时同样 403，文案写明决策模型不可用，不封设备。近似和 device 封禁可在面板关闭。拒答命中在 device 封禁开启时还会永久封禁该入站 device id。400 的原文后追加原因，`details.reason` 为 `device` / `exact` / `similar`。
+Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不修复重试，客户端收到 400 `policy_blocked` / `refusal_guard`，避免 Claude Code 误提示 `/login` 或按一般 400 做修复重试；并把该 prompt 永久写入拒答缓存；再次相同请求，或用户正文与已缓存正文的估计 Jaccard 达到面板阈值（默认 0.90，可选 0.80/0.85/0.90/0.95），都在 hop 前被拦。上游 HTTP 400/503「Third-party apps now draw from your extra usage」和「no third-party apps allowed」是计费限制（Anthropic 把调用方认成第三方客户端，而该号没有 extra usage），不是拒答：客户端收到 400 `third_party_client`（`invalid_request_error`，`details.upstream_message` 带上游原文，`retryable: false`），不换号、不冷却槽位，不写拒答缓存、不封会话或设备，请求日志归「请求格式」，不计 SLA 失败。`content_policy`、`cyber_policy`、`moderation_blocked` 等内容错误码（含 `upstream_code`）同样入库。协议硬正则，或面板所选的 Jev / Laya / ModernBERT（`/v1/systemone`，`noul ≥ 0.5`）判为 NSFW、蒸馏、破解、破限时返回 403 `policy_blocked`，不 hop，不写入拒答缓存；device 封禁开启时封禁入站 device。模型不可用且 `fail_open` 为 false 时同样 403，文案写明决策模型不可用，不封设备。近似和 device 封禁可在面板关闭。拒答命中在 device 封禁开启时还会永久封禁该入站 device id。400 的原文后追加原因，`details.reason` 为 `device` / `exact` / `similar`。
 
 号池结果分开返回，不互相伪装：
 
@@ -399,6 +417,14 @@ curl -sS http://127.0.0.1:8787/health
 `pool_overloaded` 是 HTTP 529、`type: overloaded_error`，总带 `retry-after`（秒，至少 1）：优先取相关 VM 最早的席位宽限到期，其次已知恢复时刻（冷却、RPM 窗口），都没有时为 1。排队已满时立即返回，不入队。OpenAI 槽仍是自己的 429 `pool_overloaded`。续接 `previous_response_id` 的 Responses 请求只能在原 GPT 账号上继续；该账号已不可用时返回 `409 response_not_portable`，请带完整上下文重新发起。
 
 客户端断开不计 SLA、不处罚账号。
+
+### 新号隔离窗口
+
+`PUT /api/panel/routing` 可设置 `routing.pool.fresh_account_isolation_ms`（默认 `0` 关闭）。开启后，账号入池 N 毫秒内不承接**已绑定其他 VM 的续入会话**：把另一个账号的完整对话历史重放到一个全新账号，是供应商侧的强风控信号（同一段转写近期出现在不同账号上=换号关联）。这类请求继续等待老号或按常规回落。
+
+**判据是会话归属，不是请求尺寸**：用户离开对话数小时后回来、缓存已过期、整段历史冷提交，与开一个全新长会话，都是正常流量、照常落到新号——把「大冷前缀」当信号会误伤这两类合法行为。真正区分正常 resume 与跨号续入的是前缀归属关系，而 sticky 行绑在哪个 VM 正是这一事实的本地记录。
+
+新号调度资格不受影响（不写冷却、不摘调度）。**全新部署豁免**：池内全部账号都在窗口内时（全新池），续入会话没有窗口外的 home 可等待，直接放行保证首日可用。建议新号入池后开启 24–48 小时。
 
 ### CLI / kernel 故障与取消
 
@@ -425,7 +451,9 @@ curl -sS http://127.0.0.1:8787/health
 4. 内核不可达或 CLI 恢复已耗尽：Node watchdog 才重启容器，1 小时内最多 3 次，每次先等待 1 / 5 / 15 分钟。
 5. 容器恢复仍失败：停止自动重启，排除该 VM（粘性与诊断 pin 都不能绕过），经配置的通知渠道告警。观察到内核恢复健康后解除故障；运行中的 cc-node/crag 保留原有不重启例外。
 
-VM / 节点下线通知由「设置 → 通知」的 `notify.events.vm_down` 控制，默认开启，并遵循通知总开关及各通道开关。通知监控按 `notify.interval_sec`（默认 60 秒）读取调度器使用的节点 SSH 连通状态、watchdog 终止故障及 VM 运行状态；节点失联、内核恢复预算耗尽，或运行中的 VM 变为 stopped/dead/error 时，经已配置的 Telegram、企业微信群机器人及邮件通道发送 VM ID、节点 ID 和原因。它不额外发起模型推理探测。
+VM / 节点下线通知由「设置 → 通知」的 `notify.events.vm_down` 控制，默认开启，并遵循通知总开关及各通道开关。通知监控按 `notify.interval_sec`（默认 60 秒）读取调度器使用的节点 SSH 连通状态、watchdog 终止故障及 VM 运行状态；节点失联、内核恢复预算耗尽，或运行中的 VM 变为 stopped/dead/error 时，经已配置的 Telegram、企业微信群机器人、飞书群自定义机器人及邮件通道发送 VM ID、节点 ID 和原因。它不额外发起模型推理探测。
+
+管理员可在「设置 → 通知 → 飞书 / Lark 群自定义机器人」填写完整 HTTPS Webhook，支持飞书 `open.feishu.cn` 和 Lark `open.larksuite.com` 的群机器人 v2 地址。保存和发送时均校验地址。机器人启用签名校验时填写签名密钥。「发送测试」可使用尚未保存的配置发送简版卡片。启用并保存后，群机器人会接收已开启的通知事件，卡片包含颜色、事件详情、用量及健康表格。面板仅显示凭据是否已保存。
 
 同一次下线只通知一次，不同 VM 不共享告警冷却；发送失败在后续检查中仅重试失败通道，VM 恢复、删除、进入人工停调或维护状态后取消待发告警。投递状态保存在内存中；控制面重启后重新建立基线，已失联的节点和内核终止故障会重新告警，原已停止的 VM 不补发。此事件独立于按凭证可用性判断的 `account_down`；额度冷却、人工停调、维护及未知运行状态不直接触发下线通知。
 
@@ -474,9 +502,9 @@ stateDiagram-v2
 
 - **realtime（默认）**：第一段业务 SSE 写出后不再换账号。
 - **verified**：收齐 `message_stop` 再给客户端；不完整则继续换号。
-- 席位（预调度）：出站占位的首要身份是 device id / machine id，其次才是 session id。一个 machine（`metadata.user_id.device_id`、`device_id`、`x-kin-device-id`）先占一台 VM。同一 machine 再来的 session 优先使用这台 VM 里还空着的槽；槽满了才等这台 VM，等不到才去别的 VM。每个 session 在请求进行中独占一个槽；这一轮结束且该 session 没有排在这台 VM 上的后续请求时，槽立刻释放。粘性 TTL 只记住用过的 VM，不占 `session_slots`。没有 device / machine 时，按 session id 占槽；再没有才用 `cache_control: ephemeral` 内容哈希，然后是客户端 IP + 归一化 UA + system + 首轮 user 内容哈希。API key 从不参与。同一 session 的并发请求共用这一个席位。每台 VM 的席位数是 `session_slots`（VM 覆盖 → `inference.session_slots`，上限 20）。额度 / 凭证 / 暂停等确定失效，或换 VM 重试，才立刻释放，到新 VM 再占一个槽。开新席位要求余量 `min(limit_5h − u5, limit_7d − u7) ≥ (已占 + 1) × seat_budget_reserve_pct`。都满时进全局 FIFO。有粘性 VM 的先在该 VM 等 `sticky_wait_timeout_ms`，再转全局等 `fallback_wait_timeout_ms`。超时返回 529。一次性短探测和诊断 pin 不占席位。分配原因：`device-affinity` 是这台 machine 已有的 VM，`sticky` 是这个 session 自己的绑定，`family-affinity` 是父会话所在 VM。
-- sticky：同一会话在终态成功后记住 VM；粘性 TTL 内这台 VM 是该 session 新开席位的首选。对话结束后不占席位。不可调度 / 错误会清掉这份记忆。
-- 5h/7d 闸（`routing.quota`）：用量进入闸线下 `critical_band`（默认 5 个百分点）起为「临近闸线」，一直到闸线上 `gate_overshoot`（默认 5 个百分点）。这一段里已入座的 device 留在原 VM：同账号一次只跑一个请求（额度读数滞后于在飞请求），第二个并发在原 VM 排队，不换 VM；新 device 优先开到其他正常 VM，用量已过闸线时不再开新席位。用量达到闸线 + `gate_overshoot` 才让出席位换 VM；上游 rejected / 100% / 429 冷却始终立即换。
+- 席位（预调度）：出站占位的首要身份是 device id / machine id，其次才是 session id。一个 machine（`metadata.user_id.device_id`、`device_id`、`x-kin-device-id`）再来的 session 可在同一调度等级内优先使用原 VM 的空槽。每个 session 在请求进行中独占一个槽；这一轮结束且该 session 没有排在这台 VM 上的后续请求时，槽立刻释放。粘性 TTL 只记住用过的 VM，不占 `session_slots`。没有 device / machine 时，按 session id 占槽；再没有才用 `cache_control: ephemeral` 内容哈希，然后是客户端 IP + 归一化 UA + system + 首轮 user 内容哈希。API key 从不参与。同一 session 的并发请求共用这一个席位。每台 VM 的席位数是 `session_slots`（VM 覆盖 → `inference.session_slots`，上限 20）。额度 / 凭证 / 暂停等确定失效，或换 VM 重试，才立刻释放，到新 VM 再占一个槽。开新席位要求余量 `min(limit_5h − u5, limit_7d − u7) ≥ (已占 + 1) × seat_budget_reserve_pct`。排队使用全局 FIFO；等待粘性 VM 的席位可先等 `sticky_wait_timeout_ms`，再转全局等 `fallback_wait_timeout_ms`。超时返回 529。一次性短探测和诊断 pin 不占席位。分配原因：`device-affinity` 是这台 machine 已有的 VM，`sticky` 是这个 session 自己的绑定，`family-affinity` 是父会话所在 VM。
+- 调度等级与 sticky：已有会话绑定优先于调度等级和权重。调整等级或权重不会迁移已入座的请求、有效绑定的后续轮次，或正在原 VM 等待席位的续轮。新会话和原 VM 不再可用、粘性到期或粘性等待结束后的换槽，仍按调度等级选择。处于配额退水期的 VM 保留已经占用的席位，但不为同一会话跨等级优先重开席位。新会话的设备和父会话亲和仍在同级内比较。释放会话席位不等于解绑；`routing.pool.session_affinity_first` 仅控制槽忙实际换 VM 后，是否随本轮请求迁移绑定。
+- 5h/7d 闸（`routing.quota`）：用量进入闸线下 `critical_band`（默认 5 个百分点）起为「临近闸线」，一直到闸线上 `gate_overshoot`（默认 5 个百分点）。这一段里已入座的 device 留在原 VM：同账号一次只跑一个请求（额度读数滞后于在飞请求），第二个并发在原 VM 排队，不换 VM；同一调度等级内，新 device 优先开到其他正常 VM，用量已过闸线时不再开新席位。用量达到闸线 + `gate_overshoot` 才让出席位换 VM；上游 rejected / 100% / 429 冷却始终立即换。
 - 重试预算：每个 VM 每请求最多 3 次实际执行；准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
 - 流空闲上限：上游流连续无事件超过 `failover.stream_idle_timeout_ms`（默认 180 秒，面板「重试与切号」可调，30 秒–60 分钟）即判超时。网关、槽内 kernel 的流空闲上限和 job 看门狗（kernel 读的是不带前缀的环境变量 `JOB_IDLE_SECS`，由 kernel 启动脚本从 `kernel.json` 读取并导出；`KIN_JOB_IDLE_SECS` 不生效）共用这个值。保存后立即热写入各槽 `kernel.json`；job 看门狗只在 kernel 启动时读取，所以值变化后各运行中的 Claude 槽会在没有任务时自动重启 kernel（有任务则等它结束，另每 15 秒复查一次）。不带 `eager_input_streaming` 时，上游会把大工具入参（如长 `Write` 内容）整段缓冲，期间可能静默数分钟。未配置时用环境变量 `KIN_STREAM_IDLE_TIMEOUT`。
 - 排队保活（仅 Claude `stream: true`）：选席、同会话串行、失败重试都发生在上游尝试开始之前，这段时间原先不下发任何字节。Cloudflare 约 100 秒收不到响应会回 524。`failover.queue_keepalive_delay_ms`（默认 60 秒，上限 90 秒，也可用 `KIN_QUEUE_KEEPALIVE_DELAY`）过后开始写 SSE `event: ping`，间隔与 `stream_keepalive_ms` 相同，并一直持续到首个内容事件。延迟之内失败仍是 HTTP 429/529/503。一旦写出 ping，状态码不能再改，后续失败改为 SSE `event: error`（例如 `overloaded_error`）。同会话排队另有 `failover.session_queue_timeout_ms`（默认 15 分钟；`0` 表示不限制），超时按 529 `overloaded_error` 返回，不会和仍在跑的上一轮并发。Codex / OpenAI 路径不变。

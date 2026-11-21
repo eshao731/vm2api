@@ -109,6 +109,8 @@ export type UsageLogRow = {
   clientSessionId: string | null
   /** 入站剥离前的客户端 device id。 */
   inboundDeviceId: string | null
+  upstreamStatus?: number | null
+  upstream400Message?: string | null
   /** 最终服务的账号展示名（`final_account_id` 优先）。 */
   providerName: string | null
   accountId: string | null
@@ -297,6 +299,8 @@ export type UsageLogSessionSuggestions = string[]
 /** 近 N 分钟内有请求的出站会话（vm2api 只在请求完成时落库，没有「进行中」态）。 */
 export type ActiveSession = {
   sessionId: string
+  /** 窗口内仅 1 次请求且无工具（旁路请求），不与其它会话合并。 */
+  oneOff: boolean
   /** 该出站会话最近一行对应的客户端会话 id。 */
   clientSessionId: string | null
   userName: string | null
@@ -320,6 +324,8 @@ export type ActiveSessionsData = {
   minutes: number
   /** 窗口内去重会话数（不受 limit 截断）。 */
   total: number
+  /** total 中「单次、无工具」的会话数。 */
+  oneOffTotal: number
   sessions: ActiveSession[]
 }
 

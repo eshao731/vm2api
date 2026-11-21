@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import {
   anthropicContentIsEmpty,
   dropEmptySystemControlTurns,
+  isSmallTextTurn,
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
@@ -26,6 +27,7 @@ import {
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
+import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
@@ -112,7 +114,7 @@ const DUMMY_THINKING_SIGNATURES = new Set(['', 'skip_thought_signature_validator
 
 export function hasUsableThinkingSignature(signature) {
   const value = String(signature || '').trim()
-  // Truncated SSE signatures look present but fail Anthropic checksum (sub2api pre-filter).
+  // Truncated SSE signatures look present but fail the Anthropic checksum.
   if (!value || value.length < 24) return false
   return !DUMMY_THINKING_SIGNATURES.has(value)
 }
@@ -159,13 +161,79 @@ function thinkingModeEnabled(body) {
   return type === 'enabled' || type === 'adaptive'
 }
 
+/** Anthropic accepts temperature / top_p in [0,1]; top_k is a positive integer. */
+const SAMPLING_RANGES = { temperature: [0, 1], top_p: [0, 1] }
+
 /**
- * Anthropic: thinking enabled/adaptive only accepts temperature=1.
- * top_p / top_k are also rejected. Real Claude Code sends temperature: 1.
+ * Clean the caller's sampling values before any thinking rule looks at them:
+ * out-of-range numbers are clamped into the legal interval, numeric strings
+ * become numbers, and anything that is not a finite number is dropped so the
+ * OAuth defaults can refill it. Upstream 400s on each of those shapes.
  */
-export function alignSamplingWithThinking(body = {}) {
-  if (!thinkingModeEnabled(body)) return body
-  const out = body
+function normalizeSamplingRanges(body) {
+  for (const [key, [low, high]] of Object.entries(SAMPLING_RANGES)) {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) continue
+    const raw = body[key]
+    if (raw === null || raw === undefined || raw === '' || typeof raw === 'boolean') {
+      delete body[key]
+      continue
+    }
+    const value = Number(raw)
+    if (!Number.isFinite(value)) {
+      delete body[key]
+      continue
+    }
+    body[key] = Math.min(high, Math.max(low, value))
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'top_k')) {
+    const value = Number(body.top_k)
+    if (!Number.isFinite(value) || value < 1) delete body.top_k
+    else body.top_k = Math.floor(value)
+  }
+  return body
+}
+
+/** Thinking types upstream reads as "reasoning is on", so sampling is locked. */
+const SAMPLING_LOCKED_THINKING = new Set(['enabled', 'adaptive', 'between_tools'])
+
+/**
+ * `between_tools` is a thinking mode too: `responsesToClaude` injects it when a
+ * caller asks for effort `off`, and upstream then rejects the caller's own
+ * temperature. A `requires_adaptive` model reasons even when the body carries
+ * no thinking at all, so its sampling is locked on shape alone.
+ */
+function thinkingLocksSampling(body) {
+  const type = String(body?.thinking?.type || '').toLowerCase()
+  if (SAMPLING_LOCKED_THINKING.has(type)) return true
+  try {
+    return getCapabilities(body?.model).requires_adaptive === true
+  } catch {
+    return false
+  }
+}
+
+/** Remove every sampling field; `drop` retries send none of them at all. */
+function stripSampling(body) {
+  for (const key of ['temperature', 'top_p', 'top_k']) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) delete body[key]
+  }
+  return body
+}
+
+/**
+ * Anthropic: a thinking request only accepts temperature=1 and rejects
+ * top_p / top_k. Real Claude Code sends temperature: 1, so the value is
+ * pinned rather than omitted. Illegal values are corrected, never forwarded.
+ *
+ * `drop` is the retry after an upstream refused the sampling fields themselves
+ * rather than their values: pinning temperature=1 would be refused again, so
+ * the mimicry value gives way and the request carries no sampling at all.
+ */
+export function alignSamplingWithThinking(body = {}, { drop = false } = {}) {
+  if (!body || typeof body !== 'object') return body
+  if (drop) return stripSampling(body)
+  const out = normalizeSamplingRanges(body)
+  if (!thinkingLocksSampling(out)) return out
   if (out.temperature !== 1) out.temperature = 1
   if (Object.prototype.hasOwnProperty.call(out, 'top_p')) delete out.top_p
   if (Object.prototype.hasOwnProperty.call(out, 'top_k')) delete out.top_k
@@ -174,7 +242,7 @@ export function alignSamplingWithThinking(body = {}) {
 
 /**
  * Drop history thinking blocks Anthropic would reject.
- * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
+ * For Opus / Sonnet / Haiku 5.5, one invalid block drops the whole
  * signed chain, including later valid thinking and redacted_thinking. Turns
  * left with no content are dropped. redacted_thinking stays when it carries
  * data on 5.5, otherwise when its signature is usable. The preserve path
@@ -408,10 +476,11 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   return downgradeUngatedThinkingDisplay(out, anthropicBetaHeader)
 }
 
-/** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
-export function ensureClaudeOAuthBodyDefaults(body = {}) {
+/** Fill missing Claude OAuth body defaults for temperature and tools. */
+export function ensureClaudeOAuthBodyDefaults(body = {}, { dropSampling = false } = {}) {
   const out = body && typeof body === 'object' ? body : {}
-  if (out.temperature == null) out.temperature = 1
+  // A drop retry must not refill what the upstream just refused.
+  if (!dropSampling && out.temperature == null) out.temperature = 1
   if (!Array.isArray(out.tools)) out.tools = []
   if (out.tools.length === 0 && out.tool_choice) delete out.tool_choice
   return out
@@ -431,6 +500,7 @@ export function prepareAnthropicRequest(
     cacheTtl = DEFAULT_CACHE_TTL,
     inbound = null,
     preserveThinkingBlocks = false,
+    dropSampling = false,
   } = {},
 ) {
   let out = clone(body)
@@ -456,8 +526,8 @@ export function prepareAnthropicRequest(
   const stripped = stripInvalidThinkingBlocks(out, { preserveThinkingBlocks })
   if (stripped.messages) out.messages = stripped.messages
   out = ensureClearThinkingContextManagement(out)
-  out = alignSamplingWithThinking(out)
-  out = ensureClaudeOAuthBodyDefaults(out)
+  out = alignSamplingWithThinking(out, { drop: dropSampling })
+  out = ensureClaudeOAuthBodyDefaults(out, { dropSampling })
   if (cacheBreakpoints) {
     out = applyCacheBreakpoints(out, { ttl: cacheTtl, config: cacheBreakpoints, inbound })
   }
@@ -653,20 +723,30 @@ export function wireToolName(name, { official = false, rewriteTools = true } = {
  * product strings leave system and tool text, and tool names land on mcp__.
  * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
  */
-export function scrubUpstreamClientBody(body, { official = false, rewriteTools = true } = {}) {
+export function scrubUpstreamClientBody(
+  body,
+  { official = false, rewriteTools = true, preserveToolNames = false, shareUnchanged = false } = {},
+) {
   if (!body || typeof body !== 'object') return { body, reverse: {} }
-  const out = clone(body)
+  const out = shareUnchanged && !isSmallTextTurn(body) ? { ...body } : clone(body)
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
+  const declared = new Set(
+    !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
+  )
   const rename = (name) => {
+    if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
     let wire = wireToolName(name, { official, rewriteTools })
     if (!wire) return name
     if (wire !== name) {
       const base = wireToolName(name, { official, rewriteTools })
       let suffix = 2
-      while (used.has(wire)) wire = `${base}_${suffix++}`
+      while (used.has(wire) || declared.has(wire)) {
+        const tail = `_${suffix++}`
+        wire = `${base.slice(0, 64 - tail.length)}${tail}`
+      }
       reverse[wire] = name
     }
     used.add(wire)
@@ -685,11 +765,13 @@ export function scrubUpstreamClientBody(body, { official = false, rewriteTools =
     })
   }
   if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
-    const name = rename(out.tool_choice.name)
-    if (name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => scrubMessage(message, rename))
+    out.messages = out.messages.map((message) =>
+      preserveToolNames && message?.role !== 'system' ? message : scrubMessage(message, rename),
+    )
   }
   return { body: out, reverse }
 }
@@ -706,6 +788,14 @@ function scrubTextBlock(block) {
 
 function scrubToolReferenceFields(block, rename) {
   if (!block || typeof block !== 'object') return { block, changed: false }
+  if (
+    (block.type === 'tool_addition' || block.type === 'tool_removal') &&
+    block.tool?.type === 'tool_reference' &&
+    typeof block.tool.name === 'string'
+  ) {
+    const name = rename(block.tool.name)
+    if (name !== block.tool.name) return { block: { ...block, tool: { ...block.tool, name } }, changed: true }
+  }
   if (block.type === 'tool_result' && Array.isArray(block.content)) {
     let changed = false
     const content = block.content.map((inner) => {
@@ -785,9 +875,13 @@ export function composeToolNames(front = {}, hop = {}) {
  * blocks before persona or either hop. Caller billing is removed here unless
  * official passthrough is on; the project template writes its own.
  */
-export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
-  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
-  return scrubUpstreamClientBody(shaped, { official, rewriteTools })
+export function toStandardAnthropicBody(body, options = {}) {
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
+    reuseCanonicalHistory: options.reuseCanonicalHistory === true && !isSmallTextTurn(body),
+  })
+  if (Array.isArray(shaped.tools)) shaped.tools = normalizeToolInputSchemas(shaped.tools)
+  applyMaxTokensCap(shaped)
+  return scrubUpstreamClientBody(shaped, options)
 }
 
 function stripBillingText(text) {

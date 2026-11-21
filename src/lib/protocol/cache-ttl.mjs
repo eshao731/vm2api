@@ -43,26 +43,26 @@ export function cacheTtlFromRoutingFile(filePath) {
   }
 }
 
-/** Highest explicit inbound TTL. Mixed requests use 1h, then every marker is normalized to it. */
+/** First effective inbound TTL; TTL-less-only bodies still use the menu setting. */
 export function bodyCacheTtl(body) {
   if (!body || typeof body !== 'object') return null
-  const ttls = []
-  const collect = (control) => {
-    if (!control || typeof control !== 'object') return
-    const raw = String(control.ttl || '').trim()
-    if (raw) ttls.push(normalizeCacheTtl(raw))
+  let first = null
+  let hasExplicit = false
+  const collect = (node) => {
+    const control = node?.cache_control
+    if (control?.type !== 'ephemeral') return
+    const raw = control.ttl
+    if (raw != null && raw !== '5m' && raw !== '1h') return
+    if (first == null) first = raw ?? '5m'
+    if (raw != null) hasExplicit = true
   }
-  collect(body.cache_control)
-  if (Array.isArray(body.tools)) for (const tool of body.tools) collect(tool?.cache_control)
-  if (Array.isArray(body.system)) for (const block of body.system) collect(block?.cache_control)
-  if (Array.isArray(body.messages)) {
-    for (const message of body.messages) {
-      if (!Array.isArray(message?.content)) continue
-      for (const block of message.content) collect(block?.cache_control)
-    }
+  for (const tool of Array.isArray(body.tools) ? body.tools : []) collect(tool)
+  for (const block of Array.isArray(body.system) ? body.system : []) collect(block)
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    for (const block of Array.isArray(message?.content) ? message.content : []) collect(block)
   }
-  if (ttls.includes('1h')) return '1h'
-  return ttls.includes('5m') ? '5m' : null
+  collect(body)
+  return hasExplicit ? first : null
 }
 
 export function bodyRequestsHourCache(body) {
@@ -71,8 +71,8 @@ export function bodyRequestsHourCache(body) {
 
 /**
  * Header, then an explicit 5m/1h on any inbound marker, then the settings menu.
- * Official Claude Code is included: its ttl-less markers mean "not chosen", so
- * they take the menu value instead of Anthropic's implicit 5m.
+ * This selects the default for new markers. Existing ttl-less caller markers
+ * retain Anthropic's implicit 5m regardless of this selection.
  */
 export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {}) {
   const hdr = headers[CACHE_TTL_HEADER] || headers['X-Kin-Cache-Ttl']
@@ -113,6 +113,47 @@ export function validateCacheBreakpoints(body) {
   }
   // Automatic caching applies at the message tail, after explicit block markers.
   check(body)
+}
+
+/**
+ * Claude Code 2.1.328+ asks for automatic caching with a top-level
+ * `cache_control`. Our kernels read block markers only, so convert it to the
+ * standard shape: the same policy on the current message tail.
+ *
+ * The conversion is count neutral — the root marker becomes a block marker, it
+ * is not added alongside one — so a body that was inside the four-breakpoint
+ * budget stays inside it. Validation is the caller's business: a native
+ * passthrough validates the caller's markers first, while a hop that rewrites
+ * system blocks must not be judged on markers it is about to drop.
+ *
+ * Safe to call on any body: one without the field is returned unchanged.
+ */
+export function materializeAutomaticCache(body) {
+  if (!body || typeof body !== 'object') return body
+  if (!Object.prototype.hasOwnProperty.call(body, 'cache_control')) return body
+  const { cache_control: control, ...out } = body
+  if (!control || typeof control !== 'object') return out
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (!message || typeof message !== 'object') continue
+    // Supported mid-conversation system turns are also in the cache prefix.
+    // Skipping them could put this 5m marker before their explicit 1h marker.
+    const content = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content
+    if (!Array.isArray(content)) continue
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j]
+      if (!block || ['thinking', 'redacted_thinking'].includes(block.type)) continue
+      // An explicit tail policy already caches the entire eligible prefix.
+      if (block.cache_control != null) return out
+      const next = content.slice()
+      next[j] = { ...block, cache_control: { ...control } }
+      out.messages = messages.slice()
+      out.messages[i] = { ...message, content: next }
+      return out
+    }
+  }
+  return out
 }
 
 /**
@@ -305,16 +346,8 @@ export function ephemeralCacheTtl(control) {
   return String(control.ttl || '5m').toLowerCase() === '1h' ? '1h' : '5m'
 }
 
-function downgradePinnedHourToFive() {
-  return { type: 'ephemeral', ttl: '5m' }
-}
-
 function walkCacheNodes(body, mapFn) {
   const out = { ...body }
-  if (out.cache_control) {
-    const mapped = mapFn({ cache_control: out.cache_control })
-    out.cache_control = mapped?.cache_control
-  }
   if (Array.isArray(out.tools)) out.tools = out.tools.map(mapFn)
   if (Array.isArray(out.system)) out.system = out.system.map(mapFn)
   if (Array.isArray(out.messages)) {
@@ -324,27 +357,48 @@ function walkCacheNodes(body, mapFn) {
       return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
     })
   }
+  if (out.cache_control) {
+    const mapped = mapFn({ cache_control: out.cache_control })
+    out.cache_control = mapped?.cache_control
+  }
   return out
 }
 
 /**
- * One TTL per request. Anthropic reads a missing ttl as 5m and rejects a later
- * 1h. If any breakpoint is 5m, every 1h is rewritten to 5m. Never upgrade 5m
- * to 1h: wrap re-adds ttl-less tools after that upgrade and the 1h 400s.
+ * Anthropic accepts 1h followed by 5m, but never the reverse. Missing TTL is
+ * already a valid implicit 5m; the platform default only repairs invalid values.
+ * Evaluate automatic caching last, after tools, system and message markers.
  */
-export function enforceCacheTtlOrder(body) {
+export function enforceCacheTtlOrder(body, ttl = DEFAULT_CACHE_TTL) {
   if (!body || typeof body !== 'object') return body
-  let has5m = false
-  walkCacheNodes(body, (node) => {
-    if (node?.cache_control && ephemeralCacheTtl(node.cache_control) === '5m') has5m = true
-    return node
-  })
-  if (!has5m) return body
+  const fallback = normalizeCacheTtl(ttl)
+  let short = false
   let changed = false
   const fix = (node) => {
-    if (!node?.cache_control || ephemeralCacheTtl(node.cache_control) !== '1h') return node
+    const control = node?.cache_control
+    if (control?.type !== 'ephemeral') return node
+    let target = control.ttl
+    if (target != null && target !== '1h' && target !== '5m') target = fallback
+    if (short && target === '1h') target = '5m'
+    if (target !== '1h') short = true
+    if (target === control.ttl) return node
     changed = true
-    return { ...node, cache_control: downgradePinnedHourToFive() }
+    return { ...node, cache_control: { ...control, ttl: target } }
+  }
+  const out = walkCacheNodes(body, fix)
+  return changed ? out : body
+}
+
+/** Normalize ephemeral TTLs without discarding scope or other marker fields. */
+export function normalizeCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
+  if (!body || typeof body !== 'object') return body
+  const target = normalizeCacheTtl(ttl)
+  let changed = false
+  const fix = (node) => {
+    const control = node?.cache_control
+    if (control?.type !== 'ephemeral' || control.ttl === target) return node
+    changed = true
+    return { ...node, cache_control: { ...control, ttl: target } }
   }
   const out = walkCacheNodes(body, fix)
   return changed ? out : body
@@ -418,21 +472,17 @@ export function cacheBreakpointsFromRoutingFile(filePath) {
 }
 
 /**
- * enforceCacheTtlOrder downgrades a 1h block that lands after a 5m one, so
- * injecting 5m ahead of a caller's 1h breakpoint would silently kill the
- * caller's intent. Inject at the highest tier the body already asks for.
- *
- * Read this from the inbound body: persona rebuilds `system` from a template and
- * drops the caller's blocks, so by outbound time the 1h marker may be gone.
+ * Use the first inbound TTL in wire order. Persona or CLI assembly must not
+ * introduce a later 1h marker after a caller-selected 5m prefix.
  */
 export function highestInboundCacheTtl(body, fallback = DEFAULT_CACHE_TTL) {
-  return bodyRequestsHourCache(body) ? '1h' : normalizeCacheTtl(fallback)
+  return bodyCacheTtl(body) ?? normalizeCacheTtl(fallback)
 }
 
 /**
  * The caller's own system breakpoint, which persona drops when it rebuilds the
- * array. sub2api keeps the last original marker as the closest equivalent
- * boundary; the outbound tail block is that boundary here.
+ * array. Keep the last original marker on the outbound tail block, the closest
+ * equivalent boundary.
  */
 export function callerSystemCacheControl(body) {
   if (!body || typeof body !== 'object' || !Array.isArray(body.system)) return null
@@ -447,7 +497,7 @@ export function callerSystemCacheControl(body) {
 function politeEphemeral(control, ttl) {
   if (!control || typeof control !== 'object') return { type: 'ephemeral', ttl }
   if (control.type && control.type !== 'ephemeral') return null
-  if (String(control.ttl || '').trim()) return control
+  if (control.type === 'ephemeral') return control
   return { ...control, type: 'ephemeral', ttl }
 }
 
@@ -745,7 +795,8 @@ export function applyCacheBreakpoints(body, { ttl = DEFAULT_CACHE_TTL, config, i
       out = injectSystemTailBreakpoint(out, target)
     }
   }
-  out = applyMessageBreakpoints(out, target, cfg.messages)
+  const mode = cfg.preserve_client && hasMessageBreakpoint(out.messages) ? 'fill' : cfg.messages
+  out = applyMessageBreakpoints(out, target, mode)
   return out
 }
 
@@ -754,9 +805,8 @@ function n(v) {
 }
 
 /**
- * Put cache-creation tokens into the TTL we actually sent.
- * If Anthropic omitted the 5m/1h split, or reported 5m after we sent 1h,
- * reclassify so pricing charges the 1h difference.
+ * Preserve reported cache-write buckets, including legal mixed-TTL requests.
+ * Only an unclassified total (or a delta above the start split) needs a fallback.
  */
 export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   if (!usage || typeof usage !== 'object') return usage
@@ -771,6 +821,17 @@ export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   // message_delta can raise the total without resending the message_start split.
   const total = Math.max(five + hour, create)
   if (!total) return out
+  if (five + hour > 0) {
+    const remainder = total - five - hour
+    out.cache_creation_5m_tokens = five + (target === '5m' ? remainder : 0)
+    out.cache_creation_1h_tokens = hour + (target === '1h' ? remainder : 0)
+    out.cache_creation = {
+      ...out.cache_creation,
+      ephemeral_5m_input_tokens: out.cache_creation_5m_tokens,
+      ephemeral_1h_input_tokens: out.cache_creation_1h_tokens,
+    }
+    return out
+  }
   if (target === '1h') {
     out.cache_creation_1h_tokens = total
     out.cache_creation_5m_tokens = 0

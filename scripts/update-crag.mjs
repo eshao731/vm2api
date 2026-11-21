@@ -3,8 +3,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { execFile, execFileSync } from 'node:child_process'
-import { promisify } from 'node:util'
+import { execFileSync } from 'node:child_process'
+import { setTimeout as delay } from 'node:timers/promises'
 import { pullKernelRelease } from '../src/lib/admin/kernel-catalog.mjs'
 import { listVmRecordFiles } from '../src/lib/vm/vm-file.mjs'
 import { isCodexVm } from '../src/lib/vm/vm-kind.mjs'
@@ -12,31 +12,16 @@ import { resolveKernelDataplane, resolveCragKernelVersion } from '../src/lib/vm/
 import { cragV2PackageRoot, stageCragV2Tree, verifyCragV2Tree } from '../src/lib/vm/wrap-cli-runtime.mjs'
 import { rustKernelHealth } from '../src/lib/transport/rust-kernel-client.mjs'
 import { slotExec } from '../src/lib/vm/slot-runtime.mjs'
-import { isKvmRuntime } from '../src/lib/vm/runtime-kind.mjs'
-import { containerName } from '../src/lib/vm/vm-runtime.mjs'
+import {
+  cragSlotHealthy,
+  matchingCragTree,
+  runningCragCoreHashes,
+  waitForCragCore,
+} from '../src/lib/vm/crag-core-check.mjs'
 
-const execute = promisify(execFile)
-
-export async function runningCragHashes(vm) {
-  const command =
-    'for p in /proc/[0-9]*/exe; do case "$(readlink "$p" 2>/dev/null)" in *memfd:crag-v2-core*) sha256sum "$p" || exit 1;; esac; done'
-  const { stdout } = await execute(
-    'docker',
-    ['exec', vm.runtime?.container || containerName(vm.id), 'sh', '-c', command],
-    {
-      timeout: 10_000,
-      maxBuffer: 64 * 1024,
-    },
-  )
-  return stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      if (!/^[a-f0-9]{64}\s+\/proc\/\d+\/exe$/.test(line)) throw new Error('crag_process_hash_invalid')
-      return line.slice(0, 64)
-    })
-}
+// Kept as a named export for callers and tests; the implementation now ships
+// with the control plane under src/lib so the panel can reuse it.
+export const runningCragHashes = runningCragCoreHashes
 
 function records(root) {
   return listVmRecordFiles(path.join(root, 'vms'))
@@ -84,101 +69,102 @@ function refreshCachedPackage(src, dest) {
 
 export async function updateCrag(
   root,
-  { tag = '', api, pull = pullKernelRelease, health = rustKernelHealth, coreHashes = runningCragHashes } = {},
+  {
+    tag = '',
+    api,
+    pull = pullKernelRelease,
+    health = rustKernelHealth,
+    coreHashes = runningCragCoreHashes,
+    coreWait = {},
+  } = {},
 ) {
   const base = path.join(root, 'share/crag/kernels/v2')
   fs.mkdirSync(base, { recursive: true })
   const lock = path.join(base, '.update-lock')
   fs.mkdirSync(lock, { mode: 0o700 })
-  const reason = `crag_update_${crypto.randomUUID()}`
-  let held = false
   try {
     const routing = JSON.parse(fs.readFileSync(path.join(root, 'src/config/routing.json'), 'utf8'))
     const inventory = cragUpdateInventory(root, routing)
-    const targets = inventory.filter((row) => row.action === 'sync')
-    // Native V2 on cluster/KVM is not supported by this materializer.
-    if (targets.some(({ vm }) => vm.node_id || isKvmRuntime(vm))) throw new Error('crag_v2_unsupported_placement')
-    const pulled = await pull(root, { kernel: 'crag', tag })
+    const pulled = await pull(root, { kernel: 'crag', tag, latest: true })
     if (!pulled.ok) throw new Error(pulled.code || 'crag_pull_failed')
     const src = cragV2PackageRoot(root)
     const verified = verifyCragV2Tree(src)
     if (!verified.ok) throw new Error(verified.code)
     const manifest = fs.readFileSync(path.join(src, 'manifest.json'))
     const expectedCore = verified.manifest.payload.plaintext_sha256
-    const running = targets.filter(({ vm }) => vm.status === 'running')
-    const matches = (hashes) => hashes.length === 1 && hashes[0] === expectedCore
-    const staleRuntime = []
-    for (const { vm } of running) if (!matches(await coreHashes(vm))) staleRuntime.push(vm)
-    const ids = targets.map(({ vm }) => vm.id)
-    const check = ids.length ? await api('/api/panel/wrap-cli/sync', { ids, restart: false }) : { changed_count: 0 }
-    if (check.failed_count || check.ok === false) throw new Error('crag_check_failed')
-    const cached = inventory.filter(
-      ({ action, installed }) =>
-        action === 'cache' &&
-        (!verifyCragV2Tree(installed).ok || !fs.readFileSync(path.join(installed, 'manifest.json')).equals(manifest)),
-    )
-    if (check.changed_count || cached.length || staleRuntime.length) {
-      // Own a unique hold; cleanup must not clear another operator's hold.
-      held = true
-      const drain = await api('/api/panel/vms/schedule/hold', { reason })
-      if (drain.drained !== true || drain.inflight !== 0) throw new Error('crag_slots_not_drained')
-      for (const { vm } of running) {
-        const h = await health(slotExec(root, vm), { timeoutMs: 3000 })
-        if (
-          h?.healthy !== true ||
-          h.runtime_variant !== 'crag-v2' ||
-          h.license_valid !== true ||
-          h.active_requests !== 0 ||
-          h.continuations !== 0 ||
-          h.queued !== 0
-        )
-          throw new Error(`crag_slot_not_idle:${vm.id}`)
-      }
-      // Fail if an operator changed selections during download/drain.
-      const current = cragUpdateInventory(root, routing)
+    const matchingTree = (dir) => matchingCragTree(dir, manifest)
+    const matchingCore = (hashes) => hashes.length === 1 && hashes[0] === expectedCore
+
+    const targets = []
+    for (const { vm, action, installed } of inventory) {
+      if (action !== 'sync') continue
       if (
-        JSON.stringify(current.map(({ vm, action }) => [vm.id, action, vm.status])) !==
-        JSON.stringify(inventory.map(({ vm, action }) => [vm.id, action, vm.status]))
+        !vm.node_id &&
+        matchingTree(installed) &&
+        (vm.status === 'stopped' || (vm.status === 'running' && matchingCore(await coreHashes(vm))))
       )
-        throw new Error('crag_inventory_changed')
-      if (check.changed_count) {
-        const synced = await api('/api/panel/wrap-cli/sync', { ids, restart: true })
-        if (synced.failed_count || synced.ok === false) throw new Error('crag_sync_failed')
-        for (const { vm } of running) {
-          const h = await health(slotExec(root, vm), { timeoutMs: 3000 })
-          if (h?.healthy !== true || h.runtime_variant !== 'crag-v2' || h.license_valid !== true)
-            throw new Error(`crag_slot_not_healthy:${vm.id}`)
+        continue
+      targets.push({ id: vm.id, kernel: 'crag' })
+    }
+
+    const results = new Map()
+    if (targets.length) {
+      const { payload_tag, tag: releaseTag } = pulled.release || {}
+      if (!payload_tag && !releaseTag) throw new Error('crag_release_pin_missing')
+      const pin = payload_tag ? { payload_tag } : { expected_tag: releaseTag }
+      const receipt = await api('/api/panel/kernels/crag-update', {
+        targets: targets.map((target) => ({ ...target, ...pin })),
+        background: true,
+      })
+      if (!receipt?.job_id) throw new Error('crag_install_unconfirmed')
+      const endpoint = `/api/panel/kernels/install?${new URLSearchParams({ job_id: receipt.job_id })}`
+      const deadline = Date.now() + 15 * 60_000
+      let report
+      while (Date.now() < deadline) {
+        const job = await api(endpoint)
+        if (job.state === 'completed') {
+          report = job.report
+          break
         }
+        if (job.state !== 'running') break
+        await delay(1000)
       }
-      // File equality does not prove that the live memfd has been replaced.
-      for (const vm of staleRuntime) {
-        if (!matches(await coreHashes(vm))) await api(`/api/panel/vms/${vm.id}/reload`, {})
-      }
-      for (const { installed } of cached) refreshCachedPackage(src, installed)
+      if (!Array.isArray(report?.items) || report.items.length !== targets.length)
+        throw new Error('crag_install_unconfirmed')
+      for (const item of report.items) results.set(item.id, item)
+      const failed = targets.flatMap(({ id }) => {
+        const item = results.get(id)
+        if (item?.ok !== true) return [`${id}:${item?.code || 'crag_install_unconfirmed'}`]
+        if (payload_tag && item.payload_tag !== payload_tag) return [`${id}:crag_payload_changed`]
+        return []
+      })
+      if (failed.length || report.ok !== true) throw new Error(`crag_install_failed:${failed.join(',')}`)
     }
-    const runtime = new Map()
-    for (const { vm } of running) {
-      const hashes = await coreHashes(vm)
-      if (!matches(hashes)) throw new Error(`crag_running_core_mismatch:${vm.id}`)
-      const h = await health(slotExec(root, vm), { timeoutMs: 3000 })
-      if (h?.healthy !== true || h.runtime_variant !== 'crag-v2' || h.license_valid !== true)
-        throw new Error(`crag_slot_not_healthy:${vm.id}`)
-      runtime.set(vm.id, hashes[0])
-    }
-    const items = inventory.map(({ vm, action, installed }) => {
-      const ok =
-        action === 'skip' ||
-        (verifyCragV2Tree(installed).ok && fs.readFileSync(path.join(installed, 'manifest.json')).equals(manifest))
-      return {
-        id: vm.id,
-        action,
-        ok,
-        status: vm.status,
-        node_id: vm.node_id || null,
-        ...(runtime.has(vm.id) ? { running_core_sha256: runtime.get(vm.id) } : {}),
+
+    const items = []
+    for (const { vm, action, installed } of inventory) {
+      const result = results.get(vm.id)
+      const status = result?.status ?? vm.status
+      const item = { id: vm.id, action, status, node_id: vm.node_id || null, ok: true }
+      if (action === 'cache' && !matchingTree(installed)) refreshCachedPackage(src, installed)
+      if (action !== 'skip' && !vm.node_id && !matchingTree(installed))
+        throw new Error(`crag_installed_hash_mismatch:${vm.id}`)
+      if (action === 'sync' && vm.node_id) {
+        item.verified_by = 'panel_install'
+      } else if (action === 'sync' && status === 'running') {
+        const current = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
+        if (current.node_id) throw new Error(`crag_inventory_changed:${vm.id}`)
+        const core = await waitForCragCore(current, expectedCore, { coreHashes, sleep: delay, ...coreWait })
+        if (!core.ok) throw new Error(`${core.code}:${vm.id}`)
+        if (!(await cragSlotHealthy(slotExec(root, current), { health })))
+          throw new Error(`crag_slot_not_healthy:${vm.id}`)
+        // Cores spawn lazily. With the installed tree already hash-verified,
+        // a slot that has none up yet is pending, not inconsistent.
+        if (core.state === 'verified') item.running_core_sha256 = core.sha
+        else item.core_pending = true
       }
-    })
-    if (items.some((item) => !item.ok)) throw new Error('crag_installed_hash_mismatch')
+      items.push(item)
+    }
     return {
       ok: true,
       release: pulled.release,
@@ -186,11 +172,7 @@ export async function updateCrag(
       items,
     }
   } finally {
-    try {
-      if (held) await api('/api/panel/vms/schedule/resume', { reason })
-    } finally {
-      fs.rmdirSync(lock)
-    }
+    fs.rmdirSync(lock)
   }
 }
 
@@ -239,7 +221,7 @@ export function localPanelApi(root) {
   if (!/^\d+$/.test(port)) throw new Error('panel_port_invalid')
   return async (endpoint, body) => {
     const response = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
-      method: 'POST',
+      method: body === undefined ? 'GET' : 'POST',
       redirect: 'error',
       signal: AbortSignal.timeout(120_000),
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
@@ -247,7 +229,7 @@ export function localPanelApi(root) {
     })
     const result = await response.json()
     if (!response.ok || result.ok !== true || !result.data)
-      throw new Error(`panel_api_failed:${endpoint}:${response.status}`)
+      throw new Error(`panel_api_failed:${endpoint}:${response.status}:${result.error?.code || 'unknown'}`)
     return result.data
   }
 }
@@ -257,7 +239,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   try {
     console.log(JSON.stringify(await updateCrag(root, { tag: process.argv[3] || '', api: localPanelApi(root) })))
   } catch (error) {
-    console.error(`CRAG update failed: ${error.message}; check slot state and schedule holds before resuming traffic`)
+    console.error(`CRAG update failed: ${error.message}; check slot state before submitting another update`)
     process.exitCode = 1
   }
 }

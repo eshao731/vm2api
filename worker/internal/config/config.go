@@ -15,9 +15,9 @@ import (
 const (
 	defaultAnthropicBase = "https://api.anthropic.com"
 	defaultOAuthTokenURL = "https://platform.claude.com/v1/oauth/token"
-	// DefaultFirstByteSecs waits for Anthropic HTTP headers / first SSE event.
-	// Matches sub2api gateway.response_header_timeout (600s). 0 overall request
-	// timeout — stream length is bounded by IdleTimeout, not wall-clock Do().
+	// DefaultFirstByteSecs allows 600s for Anthropic HTTP headers / first SSE event.
+	// The overall request timeout defaults to zero: IdleTimeout bounds the
+	// stream's idle time, not a wall-clock deadline on Do().
 	DefaultFirstByteSecs      = 600
 	DefaultIdleTimeoutSecs    = 180
 	DefaultRequestTimeoutSecs = 0
@@ -136,10 +136,10 @@ func (c Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("invalid proxy_url: %w", err)
 		}
-		if u.Scheme != "socks5" && u.Scheme != "socks5h" {
-			return fmt.Errorf("proxy_url scheme must be socks5 or socks5h, got %q", u.Scheme)
+		if u.Scheme != "socks5" && u.Scheme != "socks5h" && u.Scheme != "http" {
+			return fmt.Errorf("proxy_url scheme must be socks5, socks5h or http, got %q", u.Scheme)
 		}
-		if u.Hostname() == "" || u.Port() == "" {
+		if u.Hostname() == "" || (u.Port() == "" && u.Scheme != "http") {
 			return errors.New("proxy_url requires host and port")
 		}
 	}
