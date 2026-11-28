@@ -3,11 +3,19 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
-import { cragV2PackageRoot, installedCragV2Root, matchesCragIssuer, verifyCragV2Tree } from './wrap-cli-runtime.mjs'
+import {
+  cragSlotArch,
+  cragTargetArch,
+  cragV2PackageRoot,
+  installedCragV2Root,
+  matchesCragIssuer,
+  verifyCragV2Tree,
+} from './wrap-cli-runtime.mjs'
 import { workerPaths } from '../transport/go-worker-client.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { getVm, listVms } from './vm-registry.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
+import { isCustomOsSlot, resolveHostSharedStoreDir } from './custom-os-runtime.mjs'
 import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 
@@ -394,10 +402,13 @@ function packageFingerprint(root) {
   return JSON.stringify(rows)
 }
 
-function trust(projectRoot, installedRoot, arch) {
+function trust(projectRoot, installedRoot, arch, { allowUnbundledStore = false, sharedClaudeStoreRoot = '' } = {}) {
+  const resolvedArch = arch || cragTargetArch(projectRoot)
+  const allowUnbundled = allowUnbundledStore === true
+  const storeRoot = allowUnbundled ? String(sharedClaudeStoreRoot || '') : ''
   let canonicalRoot
   try {
-    const root = installedRoot ?? cragV2PackageRoot(projectRoot, arch)
+    const root = installedRoot ?? cragV2PackageRoot(projectRoot, resolvedArch)
     if (!root || fs.lstatSync(root).isSymbolicLink()) fail('license_unconfigured')
     canonicalRoot = fs.realpathSync(root)
     // Complete membership includes manifest, public key, ciphertext, bootstrap,
@@ -405,18 +416,31 @@ function trust(projectRoot, installedRoot, arch) {
     const fingerprint = packageFingerprint(canonicalRoot)
     const cached = packageTrustCache.get(canonicalRoot)
     const useInstalled = Boolean(installedRoot)
-    if (cached?.fingerprint === fingerprint && cached.useInstalled === useInstalled) {
-      if (useInstalled && !matchesCragIssuer(projectRoot, cached.authority.issuerId, cached.pem))
+    if (
+      cached?.fingerprint === fingerprint &&
+      cached.useInstalled === useInstalled &&
+      cached.arch === resolvedArch &&
+      cached.allowUnbundled === allowUnbundled &&
+      cached.storeRoot === storeRoot
+    ) {
+      if (useInstalled && !matchesCragIssuer(projectRoot, cached.authority.issuerId, cached.pem, resolvedArch))
         fail('license_unconfigured')
       packageTrustCache.delete(canonicalRoot)
       packageTrustCache.set(canonicalRoot, cached)
       return cached.authority
     }
     packageTrustCache.delete(canonicalRoot)
-    const verified = verifyCragV2Tree(canonicalRoot, { arch, allowPreviousClaude: useInstalled })
+    const verified = verifyCragV2Tree(canonicalRoot, {
+      arch: resolvedArch,
+      allowPreviousClaude: useInstalled,
+      ...(allowUnbundled ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+    })
     if (!verified.ok) fail('license_unconfigured')
     const pem = fs.readFileSync(path.join(canonicalRoot, 'crag-license-public.pem'))
-    if (useInstalled && !matchesCragIssuer(projectRoot, verified.manifest.authorization.public_key_id, pem))
+    if (
+      useInstalled &&
+      !matchesCragIssuer(projectRoot, verified.manifest.authorization.public_key_id, pem, resolvedArch)
+    )
       fail('license_unconfigured')
     const authority = {
       publicKey: crypto.createPublicKey(pem),
@@ -425,7 +449,15 @@ function trust(projectRoot, installedRoot, arch) {
     }
     // A package changed during verification must not publish a mixed snapshot.
     if (packageFingerprint(canonicalRoot) !== fingerprint) fail('license_unconfigured')
-    packageTrustCache.set(canonicalRoot, { fingerprint, authority, useInstalled, pem })
+    packageTrustCache.set(canonicalRoot, {
+      fingerprint,
+      authority,
+      useInstalled,
+      pem,
+      arch: resolvedArch,
+      allowUnbundled,
+      storeRoot,
+    })
     if (packageTrustCache.size > MAX_TRUST_ROOTS) packageTrustCache.delete(packageTrustCache.keys().next().value)
     return authority
   } catch {
@@ -435,10 +467,12 @@ function trust(projectRoot, installedRoot, arch) {
 }
 
 function slotAuthority(projectRoot, vm, preferInstalled = true) {
+  const customOs = isCustomOsSlot(vm)
   return trust(
     projectRoot,
     preferInstalled ? installedCragV2Root(projectRoot, vm) : undefined,
-    vm?.node_id ? 'amd64' : undefined,
+    vm ? cragSlotArch(projectRoot, vm) : cragTargetArch(projectRoot),
+    customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: resolveHostSharedStoreDir(projectRoot) } : undefined,
   )
 }
 

@@ -8,7 +8,10 @@
  * may pass either name.
  */
 
-import { getDb } from '../database.mjs'
+import { DB_INSTANCE_ID, getDb, getPgPool, isDbOpen } from '../database.mjs'
+import { readAll, usagePoolEnabled } from '../sqlite-pool.mjs'
+import { sanitizePgParams, translateSqliteToPg } from '../pg/sql-compat.mjs'
+import { getCacheRuntime } from '../../cache/index.mjs'
 import { collectErrors, enrichLogRow, excludeErrorClassSql, ingressAuthSql } from '../../admin/error-class.mjs'
 import {
   costColumnsFromUsage,
@@ -59,6 +62,7 @@ function addKeyUsage(into, row) {
 }
 
 /** settings key: ISO instant before which usage_logs rows may have been pruned. Monotonic. */
+export const DB_CREATED_AT_KEY = 'usage_logs_db_created_at'
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
 const BILLING_BACKFILL_INTERVAL_MS = 60_000
@@ -164,14 +168,34 @@ const SUMMARY_COLUMNS = [
   'image_input_tokens',
   'image_output_tokens',
   'image_cost',
+  'advisor_usage',
+  'advisor_cost',
+  'upstream_type',
+  'error_details',
 ]
+
+function parseErrorDetails(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  try {
+    const parsed = JSON.parse(String(value))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
 
 function toRow(rec) {
   return SUMMARY_COLUMNS.map((c) => {
+    if (c === 'id') return rec.id ?? rec.request_id ?? globalThis.crypto.randomUUID()
     if (c === 'created_at') return rec.created_at ?? rec.ts ?? null
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
     if (c === 'has_tools') return rec.has_tools == null ? null : rec.has_tools ? 1 : 0
+    if (c === 'error_details' || c === 'advisor_usage') {
+      if (rec[c] == null || rec[c] === '') return null
+      return typeof rec[c] === 'string' ? rec[c] : JSON.stringify(rec[c])
+    }
     if (c === 'cache_creation_tokens' && rec[c] == null) return null
     if (
       c === 'input_tokens' ||
@@ -197,6 +221,8 @@ function fromRow(row) {
     ip: row.ip_address,
     stream: !!row.stream,
     has_tools: row.has_tools == null ? null : !!row.has_tools,
+    upstream_type: row.upstream_type ?? null,
+    error_details: parseErrorDetails(row.error_details),
   }
 }
 
@@ -370,6 +396,9 @@ export class UsageLogsRepo {
     this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = ?')
     this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT ?')
     this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = ?')
+    this._addDurationByRequestId = db.prepare(
+      'UPDATE usage_logs SET duration_ms = COALESCE(duration_ms, 0) + ? WHERE request_id = ?',
+    )
     // OCTET_LENGTH counts encoded bytes and lets SQLite read TEXT size from metadata without loading each body.
     this._debugBytes = db.prepare('SELECT COALESCE(SUM(OCTET_LENGTH(record_json)), 0) AS n FROM request_log_debug')
     this._debugCount = db.prepare('SELECT COUNT(*) AS n FROM request_log_debug')
@@ -429,6 +458,38 @@ export class UsageLogsRepo {
 
   insertDebugIfAbsent(requestId, ts, record) {
     return this._insertDebugIfAbsent.run(requestId, ts || new Date().toISOString(), JSON.stringify(record)).changes > 0
+  }
+
+  /**
+   * Fold a zero-token local tool-continuation drain turn into its parent
+   * token-bearing request row (adding wall time and, in debug mode, appending
+   * a compact continuation record onto `hop_meta.tool_continuations`).
+   */
+  mergeToolContinuation(parentRequestId, { durationMs = 0, continuation = null } = {}) {
+    if (!parentRequestId) return false
+    const deltaMs = Number.isFinite(Number(durationMs)) && Number(durationMs) > 0 ? Math.trunc(Number(durationMs)) : 0
+    let updated = false
+    if (deltaMs > 0) {
+      updated = this._addDurationByRequestId.run(deltaMs, parentRequestId).changes > 0
+    }
+    if (continuation && typeof continuation === 'object') {
+      const dbgRow = this._getDebug.get(parentRequestId)
+      if (dbgRow?.record_json) {
+        try {
+          const rec = JSON.parse(dbgRow.record_json)
+          if (rec && typeof rec === 'object') {
+            if (deltaMs > 0) rec.duration_ms = (Number(rec.duration_ms) || 0) + deltaMs
+            const hopMeta = rec.hop_meta && typeof rec.hop_meta === 'object' ? rec.hop_meta : {}
+            const list = Array.isArray(hopMeta.tool_continuations) ? [...hopMeta.tool_continuations] : []
+            if (list.length < 64) list.push(continuation)
+            rec.hop_meta = { ...hopMeta, tool_continuations: list }
+            this._insertDebug.run(parentRequestId, rec.ts || new Date().toISOString(), JSON.stringify(rec))
+            updated = true
+          }
+        } catch {}
+      }
+    }
+    return updated
   }
 
   getDebug(requestId) {
@@ -546,9 +607,11 @@ export class UsageLogsRepo {
       params.push(new Date(until).toISOString())
     }
     if (q) {
-      where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
-      const like = `%${String(q).slice(0, 100)}%`
-      params.push(like, like, like, like)
+      where.push(
+        '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ? OR LOWER(upstream_type) LIKE ?)',
+      )
+      const like = `%${String(q).slice(0, 100).toLowerCase()}%`
+      params.push(like, like, like, like, like)
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const cap = Math.max(1, Math.min(5000, Number(maxLimit) || 500))
@@ -629,6 +692,13 @@ export class UsageLogsRepo {
   }
 
   _usageForPrice(row) {
+    let advisor_usage = null
+    if (row.advisor_usage) {
+      try {
+        const parsed = typeof row.advisor_usage === 'string' ? JSON.parse(row.advisor_usage) : row.advisor_usage
+        if (Array.isArray(parsed) && parsed.length) advisor_usage = parsed
+      } catch {}
+    }
     return {
       input_tokens: row.input_tokens,
       output_tokens: row.output_tokens,
@@ -639,6 +709,7 @@ export class UsageLogsRepo {
       web_search_requests: row.web_search_requests,
       service_tier: row.service_tier,
       speed: row.speed,
+      ...(advisor_usage ? { advisor_usage } : {}),
     }
   }
 
@@ -659,7 +730,7 @@ export class UsageLogsRepo {
       ? this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, advisor_cost = ?, total_cost = ?,
              actual_cost = ?, pricing_model = ?, price_source = ?, price_version = ?,
              long_context = ?
        WHERE id = ?
@@ -667,7 +738,7 @@ export class UsageLogsRepo {
       : this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, advisor_cost = ?, total_cost = ?,
              pricing_model = ?, price_source = ?, price_version = ?, long_context = ?
        WHERE id = ?
     `)
@@ -678,7 +749,12 @@ export class UsageLogsRepo {
     try {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
-        const priced = costColumnsFromUsage(this._usageForPrice(r), model, this._imageForPrice(r))
+        const priced = costColumnsFromUsage(
+          this._usageForPrice(r),
+          model,
+          this._imageForPrice(r),
+          Date.parse(r.created_at),
+        )
         const same =
           (r.input_cost ?? null) === (priced.input_cost ?? null) &&
           (r.output_cost ?? null) === (priced.output_cost ?? null) &&
@@ -686,6 +762,7 @@ export class UsageLogsRepo {
           (r.cache_creation_cost ?? null) === (priced.cache_creation_cost ?? null) &&
           (r.web_search_cost ?? null) === (priced.web_search_cost ?? null) &&
           (r.image_cost ?? null) === (priced.image_cost ?? null) &&
+          (r.advisor_cost ?? null) === (priced.advisor_cost ?? null) &&
           (r.total_cost ?? null) === (priced.total_cost ?? null) &&
           (r.pricing_model ?? null) === (priced.pricing_model ?? null) &&
           (r.price_source ?? null) === (priced.price_source ?? null) &&
@@ -708,6 +785,7 @@ export class UsageLogsRepo {
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
             priced.image_cost ?? null,
+            priced.advisor_cost ?? null,
             priced.total_cost ?? null,
             actual,
             priced.pricing_model ?? UNPRICED_MODEL,
@@ -724,6 +802,7 @@ export class UsageLogsRepo {
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
             priced.image_cost ?? null,
+            priced.advisor_cost ?? null,
             priced.total_cost ?? null,
             priced.pricing_model ?? UNPRICED_MODEL,
             priced.price_source ?? null,
@@ -752,12 +831,13 @@ export class UsageLogsRepo {
   backfillMissingCosts({ limit = 4000 } = {}) {
     const rows = this.db
       .prepare(`
-      SELECT id, model, upstream_model, requested_model,
+      SELECT id, created_at, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-             input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             image_cost, total_cost, pricing_model, price_source, price_version, long_context
+             advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+             web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+             price_source, price_version, long_context
       FROM usage_logs
       WHERE pricing_model IS NULL
       LIMIT ?
@@ -769,15 +849,47 @@ export class UsageLogsRepo {
   /** Rewrite cost columns in [since, until]; never actual_cost / rate_multiplier. */
   repriceRange({ since, until } = {}) {
     const { cond, params } = timeCond(since, until)
+    const isPg = this.db?.engine === 'postgres'
+    if (isPg) {
+      const where = cond ? `${cond} AND id > ?` : 'WHERE id > ?'
+      const page = this.db.prepare(`
+        SELECT id, created_at, model, upstream_model, requested_model,
+               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+               cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
+               rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
+               advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+               web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+               price_source, price_version, long_context
+        FROM usage_logs ${where}
+        ORDER BY id
+        LIMIT 2000
+      `)
+      const out = { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
+      let after = ''
+      for (;;) {
+        const rows = page.all(...params, after)
+        if (!rows.length) break
+        const part = this._repriceRows(rows, { writeActualCost: false })
+        out.rows += part.rows
+        out.changed += part.changed
+        out.still_unpriced += part.still_unpriced
+        out.delta_usd += part.delta_usd
+        after = String(rows.at(-1).id)
+      }
+      out.delta_usd = Math.round(out.delta_usd * 1e8) / 1e8
+      if (out.changed > 0 || out.rows > 0) this.invalidateBillingCache()
+      return out
+    }
     const where = cond ? `${cond} AND rowid > ?` : 'WHERE rowid > ?'
     // Keyset pages keep a month-long range from loading every row at once.
     const page = this.db.prepare(`
-      SELECT rowid AS _rowid, id, model, upstream_model, requested_model,
+      SELECT rowid AS _rowid, id, created_at, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-             input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             image_cost, total_cost, pricing_model, price_source, price_version, long_context
+             advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+             web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+             price_source, price_version, long_context
       FROM usage_logs ${where}
       ORDER BY rowid
       LIMIT 2000
@@ -795,6 +907,7 @@ export class UsageLogsRepo {
       after = rows.at(-1)._rowid
     }
     out.delta_usd = Math.round(out.delta_usd * 1e8) / 1e8
+    if (out.changed > 0 || out.rows > 0) this.invalidateBillingCache()
     return out
   }
 
@@ -823,9 +936,8 @@ export class UsageLogsRepo {
       }))
   }
 
-  _costSelect(cond, params) {
-    const row = this.db
-      .prepare(`
+  _costSelectSql(cond) {
+    return `
       SELECT
         COUNT(*) AS requests,
         COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -840,8 +952,10 @@ export class UsageLogsRepo {
         COALESCE(SUM(total_cost), 0) AS total_cost,
         COALESCE(SUM(CASE WHEN pricing_model = '${UNPRICED_MODEL}' AND (${TOTAL_TOKENS_SQL}) > 0 THEN 1 ELSE 0 END), 0) AS unpriced
       FROM usage_logs ${cond}
-    `)
-      .get(...params)
+    `
+  }
+
+  _formatCostSelectRow(row) {
     const out = {
       requests: Number(row?.requests || 0),
       input_tokens: Number(row?.input_tokens || 0),
@@ -859,16 +973,19 @@ export class UsageLogsRepo {
     return { ...out, ...cacheHitStats(out) }
   }
 
+  _costSelect(cond, params) {
+    const row = this.db.prepare(this._costSelectSql(cond)).get(...params)
+    return this._formatCostSelectRow(row)
+  }
+
   /** Official cost of one slot / credential over a fixed span (a closed quota window). */
   costBetween({ since, until, vmId = null, accountId = null } = {}) {
     const { cond, params } = filterCond({ since, until, vmId, accountId })
     return this._costSelect(cond, params)
   }
 
-  costByAccount({ since = null, until = null, withLifetime = false } = {}) {
-    const { cond, params } = timeCond(since, until)
-    const rows = this.db
-      .prepare(`
+  _costByAccountSql({ cond, withLifetime = false }) {
+    return `
       SELECT
         COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
         vm_id,
@@ -890,9 +1007,11 @@ export class UsageLogsRepo {
       FROM usage_logs ${cond}
       GROUP BY 1, vm_id${withLifetime ? ', lifetime_account_id' : ''}
       ORDER BY total_cost DESC
-    `)
-      .all(...params)
-    return rows.map((r) => ({
+    `
+  }
+
+  _formatCostByAccountRows(rows, { withLifetime = false } = {}) {
+    return (rows || []).map((r) => ({
       account_id: r.account_id,
       vm_id: r.vm_id || null,
       ...(withLifetime ? { lifetime_account_id: r.lifetime_account_id } : {}),
@@ -911,6 +1030,12 @@ export class UsageLogsRepo {
       total_cost: Number(r.total_cost || 0),
       unpriced: Number(r.unpriced || 0),
     }))
+  }
+
+  costByAccount({ since = null, until = null, withLifetime = false } = {}) {
+    const { cond, params } = timeCond(since, until)
+    const rows = this.db.prepare(this._costByAccountSql({ cond, withLifetime })).all(...params)
+    return this._formatCostByAccountRows(rows, { withLifetime })
   }
 
   /**
@@ -1145,7 +1270,7 @@ export class UsageLogsRepo {
     const block = `(
       COALESCE(error_code, '') = 'policy_blocked'
       OR COALESCE(via, '') IN ('hard-regex', 'jev', 'distill-detect', 'refusal-guard')
-      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
+      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device', 'refusal_session')
     )`
     const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1/completions')`
     const row = this.db
@@ -1156,7 +1281,16 @@ export class UsageLogsRepo {
            SUM(CASE WHEN ${inference}
                      AND NOT ${block}
                      AND COALESCE(via, '') != 'warmup-intercept'
-                THEN 1 ELSE 0 END) AS passed
+                THEN 1 ELSE 0 END) AS passed,
+           SUM(CASE WHEN ${inference}
+                     AND NOT ${block}
+                     AND COALESCE(attempt_count, 0) > 0
+                     AND (
+                       COALESCE(error_code, '') IN ('content_filter_refusal', 'refusal_guard')
+                       OR COALESCE(stop_reason, '') = 'refusal'
+                       OR COALESCE(final_state, '') = 'content_filter'
+                     )
+                THEN 1 ELSE 0 END) AS upstream_refusals
          FROM usage_logs
          WHERE created_at >= ?`,
       )
@@ -1195,11 +1329,52 @@ export class UsageLogsRepo {
       total: Number(row?.total || 0),
       blocked: Number(row?.blocked || 0),
       passed: Number(row?.passed || 0),
+      upstreamRefusals: Number(row?.upstream_refusals || 0),
       keywords: collapseBlockKeywords(keywords),
       blocks: folded.blocks,
       passes: folded.passes,
       routes: folded.routes,
     }
+  }
+
+  /** Clear in-process billing snapshot cache and related DashboardCache namespaces. */
+  invalidateBillingCache() {
+    this._billingStatsCache.clear()
+    getCacheRuntime()
+      .dashboard.invalidateNamespaces(['panel', 'stats', 'stats-filtered', 'overview', 'logs-summary'])
+      .catch(() => {})
+  }
+
+  _cacheScope() {
+    if (isDbOpen() && this.db === getDb()) {
+      return this.db.engine === 'postgres' ? 'pg' : this.db[DB_INSTANCE_ID] || 'sqlite'
+    }
+    return this.db?.[DB_INSTANCE_ID] || 'isolated'
+  }
+
+  async _readRowsAsync(sql, params = []) {
+    if (isDbOpen() && this.db === getDb()) {
+      if (this.db?.engine === 'postgres') {
+        const pgPool = getPgPool()
+        if (pgPool) {
+          const translated = translateSqliteToPg(sql)
+          if (translated.special?.kind === 'noop') return []
+          if (translated.special?.kind === 'static') return translated.special.rows
+          const res = await pgPool.query(translated.sql, sanitizePgParams(params))
+          return res.rows
+        }
+      } else if (usagePoolEnabled()) {
+        try {
+          return await readAll(sql, params)
+        } catch {}
+      }
+    }
+    return this.db.prepare(sql).all(...params)
+  }
+
+  async _readRowAsync(sql, params = []) {
+    const rows = await this._readRowsAsync(sql, params)
+    return rows?.[0] || null
   }
 
   /** Official-standard totals: all-time + Shanghai calendar today + per account. */
@@ -1235,19 +1410,66 @@ export class UsageLogsRepo {
     return value
   }
 
-  _computeBillingStats({ accountWindows = null, now = Date.now() } = {}) {
-    const todayStart = shanghaiDayStartIso()
-    const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
-    const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
+  /**
+   * Non-blocking async billingStats with DashboardCache SWR (15s fresh / 60s hard TTL)
+   * + singleflight coalescing. Runs heavy queries natively async on `pg.Pool` in PG mode
+   * or off-main-thread via `readAll` in pooled SQLite mode.
+   */
+  async billingStatsAsync(opts = {}) {
+    const { accountWindows = null, now = Date.now(), bypass = false } = opts
+    const cacheable = !Object.hasOwn(opts, 'now')
+    const key = billingStatsCacheKey(accountWindows)
+    const load = async () => {
+      const cacheNow = Date.now()
+      if (cacheNow - this._billingBackfillAt >= BILLING_BACKFILL_INTERVAL_MS) {
+        this._billingBackfillAt = cacheNow
+        try {
+          const pending = await this._readRowAsync('SELECT 1 AS ok FROM usage_logs WHERE pricing_model IS NULL LIMIT 1')
+          if (pending) this.backfillMissingCosts()
+        } catch {}
+      }
+      const value = await this._computeBillingStatsAsync({ accountWindows, now: cacheable ? Date.now() : now })
+      if (cacheable) {
+        if (this._billingStatsCache.size > 32) {
+          const cleanNow = Date.now()
+          for (const [cacheKey, entry] of this._billingStatsCache) {
+            if (entry.expires_at <= cleanNow) this._billingStatsCache.delete(cacheKey)
+          }
+        }
+        this._billingStatsCache.set(key, { value, expires_at: Date.now() + BILLING_STATS_CACHE_TTL_MS })
+      }
+      return value
+    }
+    if (!cacheable) return load()
+    return getCacheRuntime().dashboard.getOrSetSWR(
+      'panel',
+      { ep: 'billing-stats', scope: this._cacheScope(), winKey: key },
+      load,
+      { freshTtlMs: 15_000, ttlMs: 60_000, bypass },
+    )
+  }
+
+  _assembleBillingStats({
+    accountWindows,
+    now,
+    todayStart,
+    fiveHStart,
+    sevenDStart,
+    lifetimeRows,
+    allAccountRows,
+    accountsToday,
+    events,
+    fiveById,
+    sevenById,
+    health,
+    window5hFallback,
+    window7dFallback,
+    coverage,
+  }) {
     const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const bySlot = new Map()
-    const lifetime = new Map(
-      this.db
-        .prepare('SELECT account_id, total_cost, total_tokens FROM account_lifetime_usage_archive')
-        .all()
-        .map((row) => [row.account_id, { ...row }]),
-    )
-    for (const { lifetime_account_id, ...row } of this.costByAccount({ withLifetime: true })) {
+    const lifetime = new Map((lifetimeRows || []).map((row) => [row.account_id, { ...row }]))
+    for (const { lifetime_account_id, ...row } of allAccountRows) {
       if (lifetime_account_id) {
         const previous = lifetime.get(lifetime_account_id)
         lifetime.set(lifetime_account_id, {
@@ -1270,37 +1492,13 @@ export class UsageLogsRepo {
       })
     }
     const accountsTotal = [...bySlot.values()].sort((left, right) => right.total_cost - left.total_cost)
-    const accountsToday = this.costByAccount({ since: todayStart })
-    // The per-account queries already cover every row. Re-sum them for the
-    // global buckets instead of scanning the entire usage table two more times.
-    // This matters on multi-GB databases where each synchronous full scan also
-    // blocks unrelated HTTP requests on the Node event loop.
     const totalBucket = sumCostBuckets(accountsTotal)
     const todayBucket = sumCostBuckets(accountsToday)
     const total = { ...totalBucket, ...cacheHitStats(totalBucket) }
     const today = { ...todayBucket, ...cacheHitStats(todayBucket) }
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
     const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
-    let eventsSince = sevenDStart
-    if (aligned) {
-      let earliest = Date.parse(sevenDStart)
-      for (const win of accountWindows) {
-        for (const [reset, dur] of [
-          [win.reset_5h, WINDOW_5H_MS],
-          [win.reset_7d, WINDOW_7D_MS],
-          [win.reset_7d_oi, WINDOW_7D_MS],
-        ]) {
-          const start = extraWindowSince(reset, dur, now)
-          if (start != null && start < earliest) earliest = start
-        }
-      }
-      eventsSince = new Date(earliest).toISOString()
-    }
-    const events = aligned ? this._costEventsSince(eventsSince) : null
-    const fiveById = aligned ? null : new Map(this.costByAccount({ since: fiveHStart }).map((a) => [keyOf(a), a]))
-    const sevenById = aligned ? null : new Map(this.costByAccount({ since: sevenDStart }).map((a) => [keyOf(a), a]))
     const eventsByKey = aligned ? groupCostEvents(events) : null
-    const health = this.healthBuckets({ now })
     const accounts = accountsTotal.map((a) => {
       const t = todayById.get(keyOf(a)) || emptyCostBucket()
       const win = aligned ? resolveAccountWindow(accountWindows, a) : null
@@ -1366,14 +1564,13 @@ export class UsageLogsRepo {
           ...sumCostBuckets(accounts.map((a) => a.window_5h)),
           ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_5h))),
         }
-      : this._costSelect('WHERE created_at >= ?', [fiveHStart])
+      : window5hFallback
     const window7d = aligned
       ? {
           ...sumCostBuckets(accounts.map((a) => a.window_7d)),
           ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_7d))),
         }
-      : this._costSelect('WHERE created_at >= ?', [sevenDStart])
-    const coverage = this.logCoverageStart()
+      : window7dFallback
     return {
       source: 'anthropic-official',
       currency: 'USD',
@@ -1394,28 +1591,183 @@ export class UsageLogsRepo {
     }
   }
 
+  _eventsSinceForWindows(accountWindows, sevenDStart, now) {
+    let earliest = Date.parse(sevenDStart)
+    for (const win of accountWindows || []) {
+      for (const [reset, dur] of [
+        [win.reset_5h, WINDOW_5H_MS],
+        [win.reset_7d, WINDOW_7D_MS],
+        [win.reset_7d_oi, WINDOW_7D_MS],
+      ]) {
+        const start = extraWindowSince(reset, dur, now)
+        if (start != null && start < earliest) earliest = start
+      }
+    }
+    return new Date(earliest).toISOString()
+  }
+
+  _computeBillingStats({ accountWindows = null, now = Date.now() } = {}) {
+    const todayStart = shanghaiDayStartIso()
+    const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
+    const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
+    const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
+    const lifetimeRows = this.db
+      .prepare('SELECT account_id, total_cost, total_tokens FROM account_lifetime_usage_archive')
+      .all()
+    const allAccountRows = this.costByAccount({ withLifetime: true })
+    const accountsToday = this.costByAccount({ since: todayStart })
+    const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
+    const eventsSince = aligned ? this._eventsSinceForWindows(accountWindows, sevenDStart, now) : sevenDStart
+    const events = aligned ? this._costEventsSince(eventsSince) : null
+    const fiveById = aligned ? null : new Map(this.costByAccount({ since: fiveHStart }).map((a) => [keyOf(a), a]))
+    const sevenById = aligned ? null : new Map(this.costByAccount({ since: sevenDStart }).map((a) => [keyOf(a), a]))
+    const health = this.healthBuckets({ now })
+    const window5hFallback = aligned ? null : this._costSelect('WHERE created_at >= ?', [fiveHStart])
+    const window7dFallback = aligned ? null : this._costSelect('WHERE created_at >= ?', [sevenDStart])
+    const coverage = this.logCoverageStart()
+    return this._assembleBillingStats({
+      accountWindows,
+      now,
+      todayStart,
+      fiveHStart,
+      sevenDStart,
+      lifetimeRows,
+      allAccountRows,
+      accountsToday,
+      events,
+      fiveById,
+      sevenById,
+      health,
+      window5hFallback,
+      window7dFallback,
+      coverage,
+    })
+  }
+
+  async _computeBillingStatsAsync({ accountWindows = null, now = Date.now() } = {}) {
+    const todayStart = shanghaiDayStartIso()
+    const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
+    const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
+    const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
+    const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
+    const eventsSince = aligned ? this._eventsSinceForWindows(accountWindows, sevenDStart, now) : sevenDStart
+    const todayCond = timeCond(todayStart, null)
+    const fiveCond = timeCond(fiveHStart, null)
+    const sevenCond = timeCond(sevenDStart, null)
+    const slotMs = 30 * 60_000
+    const healthStart = now - 48 * slotMs
+    const healthSinceIso = new Date(healthStart).toISOString()
+
+    const [lifetimeRows, allRawRows, todayRawRows, eventsOrWindowRows, healthRows, originRow, schemaRow, prunedRow] =
+      await Promise.all([
+        this._readRowsAsync('SELECT account_id, total_cost, total_tokens FROM account_lifetime_usage_archive'),
+        this._readRowsAsync(this._costByAccountSql({ cond: '', withLifetime: true })),
+        this._readRowsAsync(this._costByAccountSql({ cond: todayCond.cond, withLifetime: false }), todayCond.params),
+        aligned
+          ? this._readRowsAsync(this._costEventsSinceSql(), [eventsSince])
+          : Promise.all([
+              this._readRowsAsync(
+                this._costByAccountSql({ cond: fiveCond.cond, withLifetime: false }),
+                fiveCond.params,
+              ),
+              this._readRowsAsync(
+                this._costByAccountSql({ cond: sevenCond.cond, withLifetime: false }),
+                sevenCond.params,
+              ),
+              this._readRowAsync(this._costSelectSql('WHERE created_at >= ?'), [fiveHStart]),
+              this._readRowAsync(this._costSelectSql('WHERE created_at >= ?'), [sevenDStart]),
+            ]),
+        this._readRowsAsync(this._healthBucketsSql(false), [healthSinceIso]),
+        this._readRowAsync('SELECT value FROM settings WHERE key = ?', [DB_CREATED_AT_KEY]),
+        this._readRowAsync("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'"),
+        this._readRowAsync('SELECT value FROM settings WHERE key = ?', [PRUNED_THROUGH_KEY]),
+      ])
+
+    const allAccountRows = this._formatCostByAccountRows(allRawRows, { withLifetime: true })
+    const accountsToday = this._formatCostByAccountRows(todayRawRows, { withLifetime: false })
+    let events = null
+    let fiveById = null
+    let sevenById = null
+    let window5hFallback = null
+    let window7dFallback = null
+    if (aligned) {
+      events = eventsOrWindowRows
+    } else {
+      const [fiveRaw, sevenRaw, w5Row, w7Row] = eventsOrWindowRows
+      fiveById = new Map(this._formatCostByAccountRows(fiveRaw, { withLifetime: false }).map((a) => [keyOf(a), a]))
+      sevenById = new Map(this._formatCostByAccountRows(sevenRaw, { withLifetime: false }).map((a) => [keyOf(a), a]))
+      window5hFallback = this._formatCostSelectRow(w5Row)
+      window7dFallback = this._formatCostSelectRow(w7Row)
+    }
+    const health = this._formatHealthBuckets(healthRows, { now, slots: 48, slotMs, start: healthStart, vmId: null })
+    const parseSetting = (row) => {
+      try {
+        return row ? JSON.parse(row.value) : null
+      } catch {
+        return null
+      }
+    }
+    const origin = Date.parse(parseSetting(originRow) || '')
+    const schema = Date.parse(schemaRow?.t || '')
+    let created = -Infinity
+    if (Number.isFinite(origin) && Number.isFinite(schema)) created = Math.min(origin, schema)
+    else if (Number.isFinite(origin)) created = origin
+    else if (Number.isFinite(schema)) created = schema
+    const pruned = Date.parse(parseSetting(prunedRow) || '')
+    const covStart = Math.max(created, Number.isFinite(pruned) ? pruned : -Infinity)
+    const coverage = Number.isFinite(covStart) ? new Date(covStart).toISOString() : null
+
+    return this._assembleBillingStats({
+      accountWindows,
+      now,
+      todayStart,
+      fiveHStart,
+      sevenDStart,
+      lifetimeRows,
+      allAccountRows,
+      accountsToday,
+      events,
+      fiveById,
+      sevenById,
+      health,
+      window5hFallback,
+      window7dFallback,
+      coverage,
+    })
+  }
+
   /**
    * Earliest instant whose traffic is still fully in usage_logs: the later of the DB's
-   * creation (first migration) and the recorded prune boundary. Neither the oldest
-   * surviving row (a quiet hour looks like a gap) nor the current retain_days (raising
-   * it does not bring deleted rows back) can stand in for that boundary.
+   * creation (first migration, or preserved SQLite origin across PG migration) and the
+   * recorded prune boundary. Neither the oldest surviving row (a quiet hour looks like
+   * a gap) nor the current retain_days (raising it does not bring deleted rows back)
+   * can stand in for that boundary.
    */
   logCoverageStart() {
-    const created = Date.parse(
+    const origin = Date.parse(this._settingJson(DB_CREATED_AT_KEY) || '')
+    const schema = Date.parse(
       this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get()?.t || '',
     )
+    let created = -Infinity
+    if (Number.isFinite(origin) && Number.isFinite(schema)) created = Math.min(origin, schema)
+    else if (Number.isFinite(origin)) created = origin
+    else if (Number.isFinite(schema)) created = schema
     const pruned = Date.parse(this._prunedThrough() || '')
-    const start = Math.max(Number.isFinite(created) ? created : -Infinity, Number.isFinite(pruned) ? pruned : -Infinity)
+    const start = Math.max(created, Number.isFinite(pruned) ? pruned : -Infinity)
     return Number.isFinite(start) ? new Date(start).toISOString() : null
   }
 
-  _prunedThrough() {
-    const row = this.db.prepare(`SELECT value FROM settings WHERE key = '${PRUNED_THROUGH_KEY}'`).get()
+  _settingJson(key) {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
     try {
       return row ? JSON.parse(row.value) : null
     } catch {
       return null
     }
+  }
+
+  _prunedThrough() {
+    return this._settingJson(PRUNED_THROUGH_KEY)
   }
 
   /**
@@ -1425,13 +1777,8 @@ export class UsageLogsRepo {
    * skipped. Keyed like billingStats accounts (`account_id\0vm_id`), or by
    * vm_id when `vmId` is given.
    */
-  healthBuckets({ now = Date.now(), slots = 48, slotMin = 30, vmId = null } = {}) {
-    const slotMs = slotMin * 60_000
-    const start = now - slots * slotMs
-    const sinceIso = new Date(start).toISOString()
-    const rows = this.db
-      .prepare(
-        `
+  _healthBucketsSql(hasVmId = false) {
+    return `
       SELECT
         COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
         vm_id,
@@ -1439,12 +1786,13 @@ export class UsageLogsRepo {
         CASE WHEN ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END AS success,
         CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END AS errors
       FROM usage_logs
-      WHERE created_at >= ?${vmId ? ' AND vm_id = ?' : ''}
-    `,
-      )
-      .all(...(vmId ? [sinceIso, String(vmId)] : [sinceIso]))
+      WHERE created_at >= ?${hasVmId ? ' AND vm_id = ?' : ''}
+    `
+  }
+
+  _formatHealthBuckets(rows, { now, slots, slotMs, start, vmId = null }) {
     const out = new Map()
-    for (const row of rows) {
+    for (const row of rows || []) {
       if (!row.success && !row.errors) continue
       const at = Date.parse(row.created_at)
       if (!Number.isFinite(at) || at < start || at > now) continue
@@ -1459,6 +1807,16 @@ export class UsageLogsRepo {
       buckets[i][1] += row.errors ? 1 : 0
     }
     return out
+  }
+
+  healthBuckets({ now = Date.now(), slots = 48, slotMin = 30, vmId = null } = {}) {
+    const slotMs = slotMin * 60_000
+    const start = now - slots * slotMs
+    const sinceIso = new Date(start).toISOString()
+    const rows = this.db
+      .prepare(this._healthBucketsSql(Boolean(vmId)))
+      .all(...(vmId ? [sinceIso, String(vmId)] : [sinceIso]))
+    return this._formatHealthBuckets(rows, { now, slots, slotMs, start, vmId })
   }
 
   /** Failed requests for one slot since `since`, grouped by error code, most frequent first. */
@@ -1482,17 +1840,8 @@ export class UsageLogsRepo {
       }))
   }
 
-  /**
-   * Cost events for the aligned per-account windows. `fable` and `unpriced` are
-   * the two row tests the JS buckets used to run themselves; deciding them here
-   * keeps three model/pricing strings per row out of the heap, which matters at
-   * ~7 days of detail rows (#1497). `unpriced` is the same expression
-   * costByAccount already uses.
-   */
-  _costEventsSince(since) {
-    return this.db
-      .prepare(
-        `
+  _costEventsSinceSql() {
+    return `
       SELECT
         COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
         vm_id,
@@ -1516,12 +1865,21 @@ export class UsageLogsRepo {
         COALESCE(total_cost, 0) AS total_cost
       FROM usage_logs
       WHERE created_at >= ?
-    `,
-      )
-      .all(since)
+    `
   }
 
-  ownerBilling({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {
+  /**
+   * Cost events for the aligned per-account windows. `fable` and `unpriced` are
+   * the two row tests the JS buckets used to run themselves; deciding them here
+   * keeps three model/pricing strings per row out of the heap, which matters at
+   * ~7 days of detail rows (#1497). `unpriced` is the same expression
+   * costByAccount already uses.
+   */
+  _costEventsSince(since) {
+    return this.db.prepare(this._costEventsSinceSql()).all(since)
+  }
+
+  _ownerBillingQueryParts({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {
     const where = []
     const params = []
     const own = ownerPred(ownerUserId)
@@ -1529,19 +1887,20 @@ export class UsageLogsRepo {
       where.push(own.sql)
       params.push(...own.params)
     }
-    if (since) {
+    const sinceIso = since ? new Date(since).toISOString() : null
+    const untilIso = until ? new Date(until).toISOString() : null
+    if (sinceIso) {
       where.push('created_at >= ?')
-      params.push(new Date(since).toISOString())
+      params.push(sinceIso)
     }
-    if (until) {
+    if (untilIso) {
       where.push('created_at <= ?')
-      params.push(new Date(until).toISOString())
+      params.push(untilIso)
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const grouped = groupBy === 'key' ? 'key' : 'vm'
     const groupCol = grouped === 'key' ? 'api_key_id' : 'vm_id'
-    const totals = this.db
-      .prepare(`
+    const totalsSql = `
       SELECT COUNT(*) AS requests,
              SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END) AS ok,
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS fail,
@@ -1550,10 +1909,8 @@ export class UsageLogsRepo {
              COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd,
              COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS official_cost_usd
       FROM usage_logs ${cond}
-    `)
-      .get(...params)
-    const items = this.db
-      .prepare(`
+    `
+    const itemsSql = `
       SELECT ${groupCol} AS id,
              COUNT(*) AS requests,
              SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END) AS ok,
@@ -1565,13 +1922,16 @@ export class UsageLogsRepo {
       FROM usage_logs ${cond}
       GROUP BY ${groupCol}
       ORDER BY cost_usd DESC
-    `)
-      .all(...params)
+    `
+    return { grouped, sinceIso, untilIso, params, totalsSql, itemsSql }
+  }
+
+  _formatOwnerBilling({ totals, items, grouped, sinceIso, untilIso }) {
     const num = (row, key) => Number(row?.[key] || 0)
     return {
       group_by: grouped,
-      since: since ? new Date(since).toISOString() : null,
-      until: until ? new Date(until).toISOString() : null,
+      since: sinceIso,
+      until: untilIso,
       totals: {
         requests: num(totals, 'requests'),
         ok: num(totals, 'ok'),
@@ -1581,7 +1941,7 @@ export class UsageLogsRepo {
         cost_usd: num(totals, 'cost_usd'),
         official_cost_usd: num(totals, 'official_cost_usd'),
       },
-      items: items.map((row) => ({
+      items: (items || []).map((row) => ({
         vm_id: grouped === 'vm' ? row.id || null : undefined,
         api_key_id: grouped === 'key' ? row.id || null : undefined,
         requests: num(row, 'requests'),
@@ -1593,6 +1953,47 @@ export class UsageLogsRepo {
         official_cost_usd: num(row, 'official_cost_usd'),
       })),
     }
+  }
+
+  ownerBilling({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {
+    const { grouped, sinceIso, untilIso, params, totalsSql, itemsSql } = this._ownerBillingQueryParts({
+      ownerUserId,
+      since,
+      until,
+      groupBy,
+    })
+    const totals = this.db.prepare(totalsSql).get(...params)
+    const items = this.db.prepare(itemsSql).all(...params)
+    return this._formatOwnerBilling({ totals, items, grouped, sinceIso, untilIso })
+  }
+
+  async ownerBillingAsync({ ownerUserId = null, since = null, until = null, groupBy = 'vm', bypass = false } = {}) {
+    const { grouped, sinceIso, untilIso, params, totalsSql, itemsSql } = this._ownerBillingQueryParts({
+      ownerUserId,
+      since,
+      until,
+      groupBy,
+    })
+    const load = async () => {
+      const [totals, items] = await Promise.all([
+        this._readRowAsync(totalsSql, params),
+        this._readRowsAsync(itemsSql, params),
+      ])
+      return this._formatOwnerBilling({ totals, items, grouped, sinceIso, untilIso })
+    }
+    return getCacheRuntime().dashboard.getOrSetSWR(
+      'stats',
+      {
+        ep: 'owner-billing',
+        scope: this._cacheScope(),
+        ownerUserId: ownerUserId == null ? null : String(ownerUserId),
+        since: sinceIso,
+        until: untilIso,
+        groupBy: grouped,
+      },
+      load,
+      { freshTtlMs: 15_000, ttlMs: 60_000, bypass },
+    )
   }
 
   /**
@@ -1834,16 +2235,19 @@ export class UsageLogsRepo {
   cleanup(opts = {}) {
     const cfg = this._cleanupOpts(opts)
     const usage_logs = this._pruneUsage(cfg.usageCutoff)
+    if (usage_logs > 0) this.invalidateBillingCache()
     const debug_by_age = this._deleteOldDebug.run(cfg.debugCutoff).changes
     const debug_by_size = this.trimDebugToMaxBytes(cfg.maxBytes)
-    if (usage_logs + debug_by_age + debug_by_size > 0) {
+    if (this.db?.engine !== 'postgres') {
+      if (usage_logs + debug_by_age + debug_by_size > 0) {
+        try {
+          this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        } catch {}
+      }
       try {
-        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        this.db.exec('PRAGMA optimize')
       } catch {}
     }
-    try {
-      this.db.exec('PRAGMA optimize')
-    } catch {}
     return {
       usage_logs,
       request_log_debug: debug_by_age + debug_by_size,
@@ -1864,8 +2268,8 @@ export class UsageLogsRepo {
         WHERE created_at < ? AND (${LIFETIME_ACCOUNT_SQL}) IS NOT NULL
         GROUP BY 1
         ON CONFLICT(account_id) DO UPDATE SET
-          total_cost = total_cost + excluded.total_cost,
-          total_tokens = total_tokens + excluded.total_tokens
+          total_cost = account_lifetime_usage_archive.total_cost + excluded.total_cost,
+          total_tokens = account_lifetime_usage_archive.total_tokens + excluded.total_tokens
       `)
         .run(cutoff)
       const deleted = this._deleteOldUsage.run(cutoff).changes

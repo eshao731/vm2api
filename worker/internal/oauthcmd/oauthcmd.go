@@ -20,6 +20,10 @@ import (
 	"github.com/dofastted/kin-gateway/worker/internal/upstream"
 )
 
+// guardProbeOp lets the control plane ask a node's worker whether it keeps the refresh attempt
+// journal, without a config, a credential or the network. Workers without it reject the operation.
+const guardProbeOp = "guard-probe"
+
 const (
 	requestTimeout       = 30 * time.Second
 	maxBodyBytes         = 4 << 20
@@ -59,6 +63,15 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return writeAndReturn(stdout, errorEnvelope(0, "invalid_arguments", err.Error()), 2)
 	}
 
+	if op == guardProbeOp {
+		return writeAndReturn(stdout, responseEnvelope{
+			OK:      true,
+			Status:  http.StatusOK,
+			Body:    map[string]any{"attempt_guard": true},
+			Headers: map[string]string{},
+		}, 0)
+	}
+
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		code := "config_failed"
@@ -80,17 +93,17 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
 	}
 	store := credential.NewStore(cfg.CredentialPath)
-	refresher := &kinoauth.Refresher{
-		Store:     store,
-		Client:    httpClient,
-		TokenURL:  cfg.OAuthTokenURL,
-		Skew:      cfg.RefreshSkew,
-		OnAttempt: func(attempt kinoauth.Attempt) { _ = json.NewEncoder(stdout).Encode(attempt) },
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
 	if op == "refresh" {
+		refresher := &kinoauth.Refresher{
+			Store:     store,
+			Client:    httpClient,
+			TokenURL:  cfg.OAuthTokenURL,
+			Skew:      cfg.RefreshSkew,
+			OnAttempt: func(attempt kinoauth.Attempt) { _ = json.NewEncoder(stdout).Encode(attempt) },
+		}
 		result, err := refresher.Ensure(ctx, force)
 		if err != nil {
 			return writeAndReturn(stdout, errorEnvelope(refreshErrorStatus(err), classifyError(err), errorMessage(classifyError(err))), 0)
@@ -112,10 +125,12 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 	if err != nil {
 		return writeAndReturn(stdout, errorEnvelope(0, "config_failed", errorMessage("config_failed")), 0)
 	}
+	// Non-refresh operations are strictly read-only on credentials.json: the panel
+	// orchestrates refresh explicitly before probing so tokens never rotate silently.
 	client := &upstream.Client{
 		HTTP:          httpClient,
 		Store:         store,
-		Refresher:     refresher,
+		Refresher:     nil,
 		AnthropicBase: baseURL,
 	}
 	headers := requestHeaders(cfg, op)
@@ -178,6 +193,12 @@ func parseArgs(args []string) (string, string, bool, bool) {
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "", "path to worker JSON config")
 	force := fs.Bool("force", false, "force OAuth refresh")
+	// A handshake only. The attempt journal is NOT switched on by this flag: Refresher.ensureLocked
+	// consults it unconditionally, so a control plane that falls back to the flag-less call on a
+	// worker built with the journal is still protected. Accepting the flag is what tells the control
+	// plane this worker has the journal, because an older worker rejects it as invalid_arguments
+	// before touching any token. Do not turn the journal into something this flag enables.
+	_ = fs.Bool("attempt-guard", false, "handshake: this worker keeps the refresh attempt journal")
 	if err := fs.Parse(args[1:]); err != nil {
 		return "", "", false, false
 	}
@@ -189,7 +210,7 @@ func parseArgs(args []string) (string, string, bool, bool) {
 
 func validateOperation(op string) error {
 	switch op {
-	case "refresh", "usage", "profile", "models", "count-tokens", "reset-status", "reset-redeem", "session-code":
+	case "refresh", "usage", "profile", "models", "count-tokens", "reset-status", "reset-redeem", "session-code", guardProbeOp:
 		return nil
 	default:
 		return fmt.Errorf("unknown oauth operation %q", op)
@@ -356,8 +377,11 @@ func classifyError(err error) string {
 	}
 	var refreshErr *kinoauth.RefreshError
 	if errors.As(err, &refreshErr) {
-		if refreshErr.Code == "api_key_missing" {
+		switch refreshErr.Code {
+		case "api_key_missing":
 			return "credential_required"
+		case kinoauth.CodeOutcomeUnknown:
+			return kinoauth.CodeOutcomeUnknown
 		}
 		return "refresh_failed"
 	}
@@ -396,6 +420,8 @@ func errorMessage(code string) string {
 		return "slot SOCKS5 is required"
 	case "refresh_failed":
 		return "OAuth refresh failed"
+	case kinoauth.CodeOutcomeUnknown:
+		return "an earlier OAuth refresh has no recorded result; re-authorize the slot"
 	case "credential_required":
 		return "credential is required"
 	case "upstream_transport_error":

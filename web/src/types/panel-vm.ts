@@ -1,4 +1,5 @@
 import type { GeminiEnvironment } from '@/features/import/gemini-environments'
+import type { PoolBriefRef } from './panel-pools'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -73,6 +74,13 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type VmCodexCredits = {
+  has_credits?: boolean
+  unlimited?: boolean
+  balance?: string | number | null
+  fetched_at?: string | number | null
+}
+
 export type CragLicenseStatus = {
   status:
     | 'unlicensed'
@@ -123,7 +131,10 @@ export type CragTelemetryState = {
   state: 'launch_policy'
   enabled: boolean | null
   error: string | null
-  upload_confirmed: false
+  upload_confirmed: boolean
+  upload_supported?: boolean
+  last_upload_at?: string | null
+  last_error?: string | null
 }
 
 export type VmKernelHealth = {
@@ -251,9 +262,64 @@ export type SeatOccupant = {
   state: 'active' | 'held' | 'idle' | string
   inflight: number
   held_until?: number | null
+  subagents_running?: number
+  subagents_queued?: number
+  subagents_max?: number | null
 }
 
 export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
+
+export type QuotaObservation = {
+  utilization: number | null
+  status: string | null
+  reset: string | null
+  sampled_at: string | null
+  stale: boolean
+}
+
+export type ActiveUsageRetentionReason =
+  | 'settle_window'
+  | 'inflight'
+  | 'newer_headers'
+  | 'reset_boundary'
+  | 'official_leftover_limit'
+
+export type ActiveUsageRetainedWindow = {
+  window: '5h' | '7d' | '7d_oi'
+  reason: ActiveUsageRetentionReason
+  official_utilization: number | null
+  retained_utilization: number | null
+  official_updated_at: string | null
+  header_sampled_at: string | null
+  settle_remaining_ms: number
+}
+
+export type ActiveUsageQueryResult = {
+  vm_id: string
+  source: string
+  probed_at?: string | null
+  five_hour?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  seven_day?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  seven_day_oi?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  reconciled?: boolean
+  force_reconcile?: boolean
+  reconciled_windows?: Array<'5h' | '7d' | '7d_oi'>
+  retained_windows?: ActiveUsageRetainedWindow[]
+  can_force_reconcile?: boolean
+  settle_remaining_ms?: number
+}
 
 export type Vm = {
   id: string
@@ -317,15 +383,27 @@ export type Vm = {
   unschedulable_reason?: string | null
   unschedulable_text?: string | null
   unschedulable_detail?: Record<string, unknown> | null
+  /** 进入不可调度（含吊销）的时刻，ISO 字符串 */
+  unschedulable_at?: string | null
   schedule_off?: boolean
   schedule_hold?: {
     reason: string
     detail?: Record<string, unknown> | null
   } | null
-  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  /** Claude 单元熔断（Codex 为 null）。连续 400/403/5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
+  /** Mutable stored quota state: official windows may be reconciled from headers. */
+  quota_observations?: {
+    official:
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
+    passive: Record<'5h' | '7d', QuotaObservation | null>
+  } | null
   utilization_5h?: number | null
   utilization_7d?: number | null
   utilization_7d_oi?: number
@@ -339,8 +417,11 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
+      label?: string
       used_percent?: number | null
       reset_at?: string | null
+      reset_after_seconds?: number | null
+      window_minutes?: number | null
     }>
     quota?: {
       utilization_5h?: number | null
@@ -358,6 +439,7 @@ export type Vm = {
     credits?: Array<{ expires_at?: string }>
     fetched_at?: string
   } | null
+  codex_credits?: VmCodexCredits | null
   /** 限额重置按钮。setup-token 标签但 scope 含 user:profile 时也为 true。 */
   can_claude_reset?: boolean
   claude_reset_credits?: {
@@ -408,8 +490,6 @@ export type Vm = {
   resolved_inference_engine?: 'go' | 'rust' | null
   persona_preset?: string | null
   resolved_persona_preset?: string | null
-  /** CRAG v2 print only: official_full appends the caller tail; zero replaces. */
-  resolved_crag_print_persona?: 'official_full' | 'zero' | null
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
   crag_kernel_version?: 'legacy' | 'v2' | null
@@ -441,6 +521,12 @@ export type Vm = {
   /** Claude CLI native 执行位热准入上限，也是预调度的席位上限；内核固定预开 20。 */
   session_slots?: number | null
   session_slots_override?: boolean
+  /** Claude family mode root-session cap. */
+  max_primary_sessions?: number | null
+  max_primary_sessions_override?: boolean
+  /** null = family mode disabled, children keep their own seats. */
+  max_subagents_per_session?: number | null
+  max_subagents_per_session_override?: boolean
   /** 去掉本槽覆盖（PATCH 字段传 null）后会落回的值。 */
   scheduling_inherited?: VmSchedulingInherited | null
   /** 单槽位配额覆盖；缺字段 = 跟随全局 `settings/quota`。GPT 槽位恒为 null。 */
@@ -463,6 +549,8 @@ export type Vm = {
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** 所属统一分组池列表（前端聚合或后端附带）。 */
+  pools?: PoolBriefRef[]
   /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
   active_hours?: VmActiveHours | null
   /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */
@@ -839,6 +927,8 @@ export type VmSchedulingInherited = {
   max_sessions?: number | null
   /** Codex 行为 null。 */
   session_slots: number | null
+  max_primary_sessions?: number | null
+  max_subagents_per_session?: number | null
 }
 
 export type OpenAIQuotaPolicy = {

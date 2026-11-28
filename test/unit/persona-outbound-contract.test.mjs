@@ -8,16 +8,21 @@ import { DEFAULT_PERSONA_TEMPLATES } from '../../src/lib/identity/persona-templa
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import {
   clearConversationCacheTtls,
+  fillMissingCacheTtl,
   listCacheMarkers,
   validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
-import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
+import { createFailoverMockSchedulerRuntime, createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
+import { OFFICIAL_CLAUDE_CLI_UA, OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { computeClaudeCodeFingerprintUtf16 } from '../../src/lib/identity/official-cc-verifier.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 
 const unixTest = process.platform === 'win32' ? test.skip : test
 const control = (ttl) => ({ type: 'ephemeral', ...(ttl ? { ttl } : {}) })
 const text = (value, ttl) => ({ type: 'text', text: value, ...(ttl === null ? {} : { cache_control: control(ttl) }) })
+// Rewritten inbound markers without a TTL resolve to the Web/session default (1h here); explicit TTLs stay.
+const sent = (blocks) => fillMissingCacheTtl({ system: blocks }, '1h').system
 
 const model = 'claude-opus-5-5'
 
@@ -81,16 +86,25 @@ async function outbound(
     t.after(() => new Promise((resolve) => kernel.close(resolve)))
   }
   const vm = { id: 'fixture-slot', persona_preset: preset, official_cc_inference: 'cli-hop' }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
     },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: { max_same_account_retries: 0 },
+  })
+  const apiRt = createMockSchedulerRuntime()
+  const pickApi = () => ({
+    ok: true,
+    endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
+    upstream_model: incoming.model,
+    key: { id: 'fixture', api_key: 'fixture-not-secret' },
   })
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const handler = createHandleProtocol({
@@ -113,13 +127,31 @@ async function outbound(
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
+    ...(backend === 'api' ? { schedulerRuntime: apiRt } : {}),
     apiScheduler: {
-      pick: () => ({
-        ok: true,
-        endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
-        upstream_model: incoming.model,
-        key: { id: 'fixture', api_key: 'fixture-not-secret' },
-      }),
+      pick: pickApi,
+      async acquire(requestedModel, opts = {}) {
+        const picked = pickApi()
+        const acquired = await (opts.schedulerRuntime || apiRt).acquireNode({
+          ...opts,
+          nodeTypes: ['api_endpoint'],
+          allowedNodeKeys: [`api_endpoint:${picked.endpoint.id}`],
+          model: requestedModel,
+        })
+        return {
+          ...picked,
+          leaseId: acquired.lease_id,
+          leaseTtlMs: acquired.lease_ttl_ms,
+          nodeKey: acquired.selected_node.node_key,
+          resolvedPoolId: acquired.resolved_pool_id,
+        }
+      },
+      async commitLease(leaseId, opts = {}) {
+        return (opts.schedulerRuntime || apiRt).commitLease(leaseId)
+      },
+      async releaseLease(leaseId, payload = {}, opts = {}) {
+        return (opts.schedulerRuntime || apiRt).releaseLease(leaseId, payload)
+      },
     },
     apiEndpointStore: {},
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -246,13 +278,10 @@ for (const backend of ['cli', 'api']) {
             })
             assert.deepEqual(
               listCacheMarkers(out).map((marker) => marker.ttl),
-              ['1h', shortTtl ?? null],
+              ['1h', shortTtl ?? '1h'],
             )
             for (const source of system) assert.equal(JSON.stringify(out).split(source.text).length - 1, 1)
-            if (backend === 'cli') {
-              // Relocated in caller order, so the template placements do not apply.
-              assert.deepEqual(leadingUserBlocks(out, system.length), system)
-            } else if (placement === 'agent-first') {
+            if (placement === 'agent-first') {
               assert.ok(
                 out.system.findIndex((block) => block.text === system[1].text) <
                   out.system.findIndex((block) => block.text === system[0].text),
@@ -289,7 +318,7 @@ test('zero caller system markers interpolated into messages survive history opti
     assert.equal(listCacheMarkers(out).length, 2)
     assert.deepEqual(
       out.messages[0].content.filter((block) => block.cache_control),
-      system,
+      sent(system),
     )
     if (before) assert.deepEqual(out.messages[0], before)
     before = out.messages[0]
@@ -314,7 +343,7 @@ for (const backend of ['cli', 'api']) {
           ],
         },
       })
-      assert.deepEqual(out.messages[1].content, content)
+      assert.deepEqual(out.messages[1].content, sent(content))
       assert.equal(listCacheMarkers(out).length, 2)
     })
     for (const id of ['instructions', 'caller_system']) {
@@ -339,12 +368,12 @@ for (const backend of ['cli', 'api']) {
           assert.equal(JSON.stringify(out).split(original.text).length - 1, 1)
           assert.deepEqual(
             blocks.find((block) => block.text === original.text),
-            original,
+            sent([original])[0],
           )
         }
         assert.deepEqual(
           listCacheMarkers(out).map((marker) => marker.ttl),
-          ['1h', ttl ?? null],
+          ['1h', ttl ?? '1h'],
         )
       })
     }
@@ -358,8 +387,8 @@ for (const backend of ['cli', 'api']) {
       })
       const markers = listCacheMarkers(out)
       assert.equal(markers.length, 1)
-      assert.equal(markers[0].section, backend === 'cli' ? 'messages' : 'system')
-      assert.equal(markers[0].ttl, ttl ?? null)
+      assert.equal(markers[0].section, 'system')
+      assert.equal(markers[0].ttl, ttl ?? '1h')
       assert.ok(JSON.stringify(out).includes('BUSINESS_RULE'))
     })
   }
@@ -384,11 +413,11 @@ for (const backend of ['cli', 'api']) {
             input: { messages },
           })
           assert.deepEqual(
-            backend === 'cli' ? leadingUserBlocks(out, 1)[0] : out.system.find((item) => item.text === block.text),
-            block,
+            out.system.find((item) => item.text === block.text),
+            sent([block])[0],
           )
           assert.equal(listCacheMarkers(out).length, 1)
-          assert.equal(messageMarkers(out).length, backend === 'cli' ? 1 : 0)
+          assert.equal(messageMarkers(out).length, 0)
         })
       }
     }
@@ -397,16 +426,21 @@ for (const backend of ['cli', 'api']) {
 
 for (const preset of ['zero', 'official', 'official_full', 'custom']) {
   test(`CLI ${preset} lifts unsupported mid-system text while retaining its cache boundary`, async (t) => {
+    const messages = [
+      { role: 'user', content: [text('Hello', '1h')] },
+      { role: 'system', content: [text('MID_SYSTEM_CACHE_RULE', '5m')] },
+      { role: 'user', content: 'Continue' },
+    ]
     const out = await outbound(t, {
       preset,
-      headers: { 'x-kin-cache-ttl': '1h' },
+      headers: { ...officialHeaders, 'x-kin-cache-ttl': '1h' },
       input: {
-        model: 'claude-sonnet-5',
-        messages: [
-          { role: 'user', content: [text('Hello', '1h')] },
-          { role: 'system', content: [text('MID_SYSTEM_CACHE_RULE', '5m')] },
-          { role: 'user', content: 'Continue' },
+        ...officialInput(messages),
+        system: [
+          text(officialBilling(messages), null),
+          text("You are Claude Code, Anthropic's official CLI for Claude.", null),
         ],
+        model: 'claude-sonnet-5',
       },
     })
     assert.ok(out.system.some((block) => block.text === 'MID_SYSTEM_CACHE_RULE' && !block.cache_control))
@@ -420,9 +454,9 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
 }
 
 for (const preset of ['zero', 'official', 'official_full', 'custom']) {
-  // zero keeps Environment at the tail, so caller indexes stay put. Other presets
-  // insert it after the first user and shift every later message by one.
-  const shift = preset === 'zero' ? 0 : 1
+  // zero and Mode 1 (official, env off by default) do not insert an Environment message;
+  // official_full and custom (falls back to official_full/env on) insert it after the first user.
+  const shift = preset === 'zero' || preset === 'official' ? 0 : 1
   for (const ttl of [undefined, '5m']) {
     test(`CLI ${preset} retains caller 1h and ${ttl ?? 'missing TTL'} through session history edits`, async (t) => {
       clearCachePrefixSessions()
@@ -433,13 +467,13 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
       for (const edited of [false, true, true]) {
         if (edited) messages[6].content[0].text = 'edited m6'
         const out = await outbound(t, { preset, headers, input: { messages, system: rule } })
-        const expected = { messages }
+        const expected = fillMissingCacheTtl({ messages }, '1h').messages
         assert.deepEqual(
           messageMarkers(out),
-          messageMarkers(expected).map((marker) => ({ ...marker, index: marker.index + shift })),
+          messageMarkers({ messages: expected }).map((marker) => ({ ...marker, index: marker.index + shift })),
         )
-        assert.deepEqual(out.messages[2 + shift], expected.messages[2])
-        assert.deepEqual(out.messages[8 + shift], expected.messages[8])
+        assert.deepEqual(out.messages[2 + shift], expected[2])
+        assert.deepEqual(out.messages[8 + shift], expected[8])
         assert.equal(JSON.stringify(out).split(rule).length - 1, 1)
       }
     })
@@ -476,7 +510,7 @@ test('CLI zero retains only the automatic tail marker after a session history ed
     })
     assert.equal(messageMarkers(out).length, 1)
     assert.equal(messageMarkers(out)[0].index, 8)
-    assert.deepEqual(out.messages[8].content[0].cache_control, control())
+    assert.deepEqual(out.messages[8].content[0].cache_control, control('1h'))
   }
 })
 
@@ -542,11 +576,13 @@ for (const preset of ['official', 'official_full', 'custom']) {
   for (const ttl of [undefined, '5m', '1h']) {
     unixTest(`API ${preset} respects preceding tool TTL ${ttl ?? 'missing TTL'}`, async (t) => {
       const tool = { name: 'Read', input_schema: { type: 'object' }, cache_control: control(ttl) }
-      const out = await outbound(t, { preset, backend: 'api', input: { tools: [tool] } })
-      assert.deepEqual(out.tools[0].cache_control, control(ttl))
+      const compatibility =
+        preset === 'official' ? { persona_block_presets: { official: { harness: true } } } : undefined
+      const out = await outbound(t, { preset, backend: 'api', compatibility, input: { tools: [tool] } })
+      assert.deepEqual(out.tools[0].cache_control, control(ttl ?? '1h'))
       const markers = listCacheMarkers(out).filter((marker) => marker.section === 'system')
       assert.ok(markers.length > 0)
-      assert.ok(markers.every((marker) => marker.ttl === (ttl === '1h' ? '1h' : '5m')))
+      assert.ok(markers.every((marker) => marker.ttl === (ttl === '5m' ? '5m' : '1h')))
     })
   }
 }
@@ -695,7 +731,7 @@ for (const [name, compatibility] of billingCases) {
       input: { system },
       compatibility: { persona_preset: 'official', ...compatibility },
     })
-    assert.deepEqual(leadingUserBlocks(out, system.length), system)
+    assert.deepEqual(out.system.slice(-system.length), system)
     assert.equal(listCacheMarkers(out).length, 2)
     assert.equal(JSON.stringify(out).split('CALLER_RULE_MUST_SURVIVE').length - 1, 1)
   })
@@ -705,7 +741,7 @@ for (const [name, compatibility] of billingCases) {
       input: { system: 'CALLER_RULE_MUST_SURVIVE' },
       compatibility: { persona_preset: 'official', cache_ttl: '5m', ...compatibility },
     })
-    assert.equal(leadingUserBlocks(out, 1)[0].text, 'CALLER_RULE_MUST_SURVIVE')
+    assert.equal(out.system.at(-1).text, 'CALLER_RULE_MUST_SURVIVE')
     const markers = listCacheMarkers(out)
     assert.equal(markers.length, 1)
     assert.equal(markers[0].section, 'messages')
@@ -719,7 +755,7 @@ for (const [name, compatibility] of billingCases) {
   })
 }
 
-test('zero without billing preserves caller boundary text and the omitted tool TTL', async (t) => {
+test('zero without billing preserves caller boundary text and fills omitted tool TTL', async (t) => {
   const system = [text('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__', null), text('CALLER_RULE', null)]
   const tool = { name: 'Read', input_schema: { type: 'object' }, cache_control: control() }
   const out = await outbound(t, {
@@ -727,8 +763,8 @@ test('zero without billing preserves caller boundary text and the omitted tool T
     input: { system, tools: [tool] },
     compatibility: { persona_block_presets: { zero: { billing: false } } },
   })
-  assert.deepEqual(leadingUserBlocks(out, system.length), system)
-  assert.deepEqual(out.tools[0].cache_control, control())
+  assert.deepEqual(out.system.slice(-system.length), system)
+  assert.deepEqual(out.tools[0].cache_control, control('1h'))
   assert.equal(listCacheMarkers(out).length, 1)
 })
 
@@ -831,9 +867,9 @@ for (const ttl of [undefined, '5m', '1h']) {
       const system = [text('Caller hour prefix', '1h')]
       const out = await outbound(t, { preset: 'zero', input: { system, messages, cache_control: control(ttl) } })
       assert.equal(out.cache_control, undefined)
-      assert.deepEqual(leadingUserBlocks(out, system.length), system)
+      assert.deepEqual(out.system.slice(1), system)
       const message = out.messages.findLast((message) => message.role === tail)
-      assert.deepEqual(message.content.at(-1).cache_control, control(ttl))
+      assert.deepEqual(message.content.at(-1).cache_control, control(ttl ?? '1h'))
       assert.equal(listCacheMarkers(out).length, 2)
     })
   }
@@ -847,7 +883,7 @@ test('CLI zero translates automatic cache within a full caller budget', async (t
     compatibility: { persona_templates: { zero: [...DEFAULT_PERSONA_TEMPLATES.zero, text('Template rule', '1h')] } },
   })
   assert.deepEqual(out.system[1], text('Template rule', null))
-  assert.deepEqual(leadingUserBlocks(out, system.length), system)
+  assert.deepEqual(out.system.slice(2), system)
   assert.equal(listCacheMarkers(out).length, 4)
   assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
 })
@@ -860,14 +896,14 @@ test('CLI zero advances an automatic breakpoint as conversation history grows', 
       preset: 'zero',
       input: { system: [text('Stable caller prefix', '1h')], messages, cache_control: control('5m') },
     })
-    const markers = listCacheMarkers(out).filter((marker) => marker.section === 'messages')
-    // The relocated caller prefix keeps its own marker at the head of the first user turn.
-    assert.deepEqual(leadingUserBlocks(out, 1), [text('Stable caller prefix', '1h')])
+    const markers = listCacheMarkers(out)
+    // Mode 3 (zero) preserves caller system prefix in system[] (never relocated into messages[0]).
+    assert.deepEqual(out.system.slice(1), [text('Stable caller prefix', '1h')])
     assert.deepEqual(
-      markers.map((marker) => [marker.index, marker.blockIndex]),
+      markers.map((marker) => [marker.section, marker.index]),
       [
-        [0, 0],
-        [messages.length - 1, out.messages[messages.length - 1].content.length - 1],
+        ['system', 1],
+        ['messages', messages.length - 1],
       ],
     )
     assert.deepEqual(out.messages.at(-1).content.at(-1), text(`Question ${turn}`, '5m'))
@@ -930,14 +966,32 @@ for (const backend of ['cli', 'api']) {
 
 // Recognized Claude Code with official_cc_passthrough off is rewritten. Its
 // ttl-less markers mean "not chosen" and must not reach the wire as implicit 5m.
-const officialHeaders = { 'user-agent': OFFICIAL_CLAUDE_CLI_UA, 'anthropic-beta': 'claude-code-20250219' }
+const OFFICIAL_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+const officialHeaders = {
+  'user-agent': OFFICIAL_CLAUDE_CLI_UA,
+  'x-app': 'cli',
+  'anthropic-version': '2023-06-01',
+  'anthropic-beta': 'claude-code-20250219',
+  'anthropic-dangerous-direct-browser-access': 'true',
+  'x-claude-code-session-id': OFFICIAL_SESSION_ID,
+  'x-stainless-lang': 'js',
+  'x-stainless-package-version': '0.128.0',
+  'x-stainless-os': 'Linux',
+  'x-stainless-arch': 'x64',
+  'x-stainless-runtime': 'node',
+  'x-stainless-runtime-version': 'v26.12.1',
+  'x-stainless-retry-count': '0',
+  'x-stainless-timeout': '600',
+}
+const officialBilling = (messages) =>
+  `x-anthropic-billing-header: cc_version=${OFFICIAL_CLI_VERSION}.${computeClaudeCodeFingerprintUtf16(messages, OFFICIAL_CLI_VERSION)}; cc_entrypoint=sdk-cli; cch=0f0f0;`
 const officialInput = (messages, tools) => ({
   system: [
-    text('x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=0f0f0;', null),
+    text(officialBilling(messages), null),
     text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
   ],
   metadata: {
-    user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: '11111111-2222-4333-8444-555555555555' }),
+    user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: OFFICIAL_SESSION_ID }),
   },
   messages,
   ...(tools ? { tools } : {}),
@@ -953,13 +1007,13 @@ const officialHistory = (tailTtl, { markPrevious = false } = {}) =>
 for (const backend of ['cli', 'api']) {
   const run = backend === 'api' ? unixTest : test
   for (const [tailTtl, menu, expected] of [
-    [undefined, '1h', undefined],
-    [undefined, '5m', undefined],
+    [undefined, '1h', '1h'],
+    [undefined, '5m', '5m'],
     ['5m', '1h', '5m'],
-    ['1h', '5m', '5m'],
+    ['1h', '5m', '1h'],
   ]) {
     run(
-      `${backend} rewritten official tail ${tailTtl ?? 'without TTL'} under menu ${menu} goes out as ${expected ?? 'missing TTL'}`,
+      `${backend} rewritten official tail ${tailTtl ?? 'without TTL'} under menu ${menu} goes out as ${expected}`,
       async (t) => {
         const out = await outbound(t, {
           preset: 'official_full',
@@ -970,10 +1024,11 @@ for (const backend of ['cli', 'api']) {
         })
         assert.ok(!JSON.stringify(out).includes('cch=0f0f0'))
         assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control(expected))
+        assert.ok(listCacheMarkers(out).every((marker) => marker.ttl != null))
       },
     )
   }
-  run(`${backend} rewritten official keeps four ordered breakpoints without filling caller TTLs`, async (t) => {
+  run(`${backend} rewritten official keeps four ordered breakpoints after filling omitted TTLs`, async (t) => {
     const tools = [{ name: 'Read', input_schema: { type: 'object' }, cache_control: control() }]
     const out = await outbound(t, {
       preset: 'official_full',
@@ -982,8 +1037,8 @@ for (const backend of ['cli', 'api']) {
       input: officialInput(officialHistory(undefined, { markPrevious: true }), tools),
     })
     assert.ok(listCacheMarkers(out).length <= 4)
-    assert.ok(messageMarkers(out).every((marker) => marker.ttl === null))
-    assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control())
+    assert.ok(messageMarkers(out).every((marker) => marker.ttl === '1h'))
+    assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control('1h'))
   })
 }
 
@@ -999,36 +1054,55 @@ unixTest('API official passthrough keeps the caller marker without a TTL', async
   assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control())
 })
 
-// Third-party callers retain both explicit TTLs and implicit 5m omissions.
+test('CLI official passthrough with dynamic boundary keeps omitted caller TTLs intact', async (t) => {
+  const boundaryMessages = officialHistory(undefined)
+  const input = {
+    ...officialInput(boundaryMessages),
+    system: [
+      text(officialBilling(boundaryMessages), null),
+      text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
+      text('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__', null),
+    ],
+  }
+  const out = await outbound(t, {
+    preset: 'official_full',
+    backend: 'cli',
+    headers: officialHeaders,
+    compatibility: { official_cc_passthrough: true, cache_ttl: '1h' },
+    input,
+  })
+  assert.ok(JSON.stringify(out).includes('cch=0f0f0'))
+  assert.deepEqual(out.system[1].cache_control, control())
+  assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control())
+})
+
+// Third-party callers retain explicit TTLs and resolve omitted TTLs from Web config.
 for (const backend of ['cli', 'api']) {
   const run = backend === 'api' ? unixTest : test
   for (const [tailTtl, expected] of [
-    [undefined, undefined],
+    [undefined, '1h'],
     ['5m', '5m'],
   ]) {
-    run(
-      `${backend} third-party message marker ${tailTtl ?? 'without TTL'} goes out as ${expected ?? 'missing TTL'}`,
-      async (t) => {
-        const out = await outbound(t, {
-          preset: 'official_full',
-          backend,
-          headers: { 'user-agent': 'omp/1.0' },
-          input: {
-            messages: [
-              { role: 'user', content: [text('FIRST_REMINDER', null)] },
-              { role: 'user', content: [text('SECOND_REMINDER', tailTtl)] },
-            ],
-          },
-        })
-        const block = out.messages.flatMap((message) => message.content).find((item) => item.text === 'SECOND_REMINDER')
-        assert.deepEqual(block.cache_control, control(expected))
-        assert.ok(
-          listCacheMarkers(out)
-            .filter((marker) => marker.section === 'system')
-            .every((marker) => marker.ttl != null),
-        )
-      },
-    )
+    run(`${backend} third-party message marker ${tailTtl ?? 'without TTL'} goes out as ${expected}`, async (t) => {
+      const out = await outbound(t, {
+        preset: 'official_full',
+        backend,
+        headers: { 'user-agent': 'omp/1.0' },
+        input: {
+          messages: [
+            { role: 'user', content: [text('FIRST_REMINDER', null)] },
+            { role: 'user', content: [text('SECOND_REMINDER', tailTtl)] },
+          ],
+        },
+      })
+      const block = out.messages.flatMap((message) => message.content).find((item) => item.text === 'SECOND_REMINDER')
+      assert.deepEqual(block.cache_control, control(expected))
+      assert.ok(
+        listCacheMarkers(out)
+          .filter((marker) => marker.section === 'system')
+          .every((marker) => marker.ttl != null),
+      )
+    })
   }
   for (const ttl of ['1h', '5m']) {
     run(`${backend} preserves a legal official caller ${ttl} despite the opposite header and menu`, async (t) => {

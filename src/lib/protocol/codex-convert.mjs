@@ -7,6 +7,7 @@ import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFro
 import { resolveGptFastAlias } from './gpt-model-policy.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 import { claudeStopReasonToOpenAIFinish } from './convert.mjs'
+import { firstNonEmptyEffort } from './log-fields.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -101,8 +102,15 @@ function toolArguments(call) {
   return typeof raw === 'string' ? raw : JSON.stringify(raw ?? {})
 }
 
-/** Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text. */
-function chatMessageToItems(message) {
+/**
+ * Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text.
+ *
+ * Two consumers: the Codex path (`chatToCodexResponses` below) and the
+ * api-endpoints path (`claudeToOpenAIResponsesRequest` in ../pool/api-openai.mjs,
+ * which reaches here after claude→chat normalization). Changes to the
+ * `call_id` fallbacks or the empty-content drop affect both.
+ */
+export function chatMessageToItems(message) {
   if (!message || typeof message !== 'object') return []
   if (message.role === 'tool') {
     const output = typeof message.content === 'string' ? message.content : textParts(message.content)
@@ -207,6 +215,7 @@ function toolsToCodex(tools) {
         name: tool.function.name,
         description: tool.function.description || '',
         parameters: tool.function.parameters || { type: 'object', properties: {} },
+        ...(typeof tool.function.strict === 'boolean' && { strict: tool.function.strict }),
       }
     }
     if (tool?.name) {
@@ -215,10 +224,26 @@ function toolsToCodex(tools) {
         name: tool.name,
         description: tool.description || '',
         parameters: tool.input_schema || tool.parameters || { type: 'object', properties: {} },
+        ...(typeof tool.strict === 'boolean' && { strict: tool.strict }),
       }
     }
     return tool
   })
+}
+
+export function codexCompatibleFunctionTools(tools) {
+  if (!Array.isArray(tools)) return null
+  let changed = false
+  const compatible = tools.map((tool) => {
+    if (tool?.type !== 'function' || tool.strict !== undefined) return tool
+    const { function: nested, ...flat } = tool
+    const definition = nested || tool
+    if (definition.strict !== undefined || typeof definition.name !== 'string' || !definition.parameters) return tool
+    changed = true
+    // Codex honors strict only on the flat Responses function definition.
+    return { ...flat, ...nested, type: 'function', strict: false }
+  })
+  return changed ? compatible : null
 }
 
 export function chatToCodexResponses(body = {}) {
@@ -293,7 +318,7 @@ function stripUnsupportedCodexFields(body = {}) {
   delete next.max_tokens
   delete next.temperature
   delete next.prompt_cache_retention
-  const effort = normalizeCodexReasoningEffort(next.reasoning?.effort || next.reasoning_effort)
+  const effort = normalizeCodexReasoningEffort(firstNonEmptyEffort(next.reasoning?.effort, next.reasoning_effort))
   delete next.reasoning_effort
   if (effort) {
     next.reasoning = {

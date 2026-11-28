@@ -18,6 +18,7 @@ import {
 import {
   ensureRustKernel,
   dataplaneUsesCcNode,
+  kernelCapacityOptions,
   kernelSlotsConverge,
   requestedCragSessionSlots,
   wrapSlotCount,
@@ -27,7 +28,7 @@ import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
-import { vmTimeoutTracker } from '../pool/failover-runner.mjs'
+import { TIMEOUT_FAULT_PREFIX, vmTimeoutTracker } from '../pool/failover-runner.mjs'
 import { clearStaleRuntimeMaintenanceHold, clearUnschedulable } from '../vm/vm-registry.mjs'
 import path from 'node:path'
 import { checkCragLicense } from '../vm/crag-license.mjs'
@@ -149,11 +150,12 @@ export function watchdogProbeVm(vm, { relayPaths = clusterRelayPaths, exists = f
   }
 }
 
-function kernelSlotMismatch(exec, health, routing) {
+export function kernelSlotMismatch(exec, health, routing) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
   const requested = routing?.inference ? requestedCragSessionSlots(exec.vm, routing) : undefined
-  return kernelSlotsConverge(configPath, health, wrapSlotCount(exec.vm), requested)
+  const capacityOptions = kernelCapacityOptions(exec, exec.vm, health)
+  return kernelSlotsConverge(configPath, health, wrapSlotCount(exec.vm, routing, capacityOptions), requested)
 }
 
 export function createKernelWatchdog({
@@ -333,7 +335,12 @@ export function createKernelWatchdog({
       }
       // Healthy again after a fault means someone fixed it: start a fresh budget.
       // Plain recovery keeps past attempts so a crash loop stays bounded by the window.
-      if (kernelFaults.delete(vm.id)) {
+      // A healthy process says nothing about inference that keeps hanging: a
+      // repeat timeout trip stays faulted until its hold runs out.
+      const timeoutHeld =
+        String(kernelFaults.get(vm.id) || '').startsWith(TIMEOUT_FAULT_PREFIX) &&
+        (vmTimeoutTracker?.faultHoldUntil?.(vm.id, now()) || 0) > now()
+      if (!timeoutHeld && kernelFaults.delete(vm.id)) {
         restarts.delete(vm.id)
         faultRetryAt.delete(vm.id)
         vmTimeoutTracker?.reset?.(vm.id)

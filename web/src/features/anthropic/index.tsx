@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
+import type {
+  ApiEndpoint,
+  ApiEndpointsPayload,
+} from '@/types/panel-api-endpoints'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { randomUUID } from '@/lib/random-uuid'
@@ -35,12 +39,15 @@ import {
   type AuthScheme,
   API_DEFAULTS,
   type ApiProtocol,
+  type BodyPolicy,
   DIRECT,
   type EndpointDraft,
+  asBodyPolicy,
   draftFromStored,
+  endpointBodyPolicyRequest,
   endpointModelRequest,
   endpointSaveRequest,
-  asBodyPolicy,
+  patchCachedApiEndpoint,
 } from './endpoint-save'
 
 type ModelList = {
@@ -53,7 +60,7 @@ function freshEndpoint(protocol: ApiProtocol = 'anthropic'): EndpointDraft {
     id: randomUUID(),
     protocol,
     riskReviewEnabled: false,
-    bodyPolicy: 'persona',
+    bodyPolicy: 'caller',
     ...API_DEFAULTS[protocol],
     apiKey: '',
     proxyId: DIRECT,
@@ -70,6 +77,7 @@ export function AnthropicConsolePage() {
   const [allEndpoints, setEndpoints] = useState<EndpointDraft[]>([
     freshEndpoint('anthropic'),
     freshEndpoint('openai'),
+    freshEndpoint('gemini'),
   ])
   const endpoints = useMemo(
     () => allEndpoints.filter((item) => item.protocol === protocol),
@@ -101,7 +109,7 @@ export function AnthropicConsolePage() {
   useEffect(() => {
     if (loaded || !stored.data) return
     const rows = (stored.data.items || []).map(draftFromStored)
-    for (const kind of ['anthropic', 'openai'] as const) {
+    for (const kind of ['anthropic', 'openai', 'gemini'] as const) {
       if (!rows.some((item) => item.protocol === kind))
         rows.push(freshEndpoint(kind))
     }
@@ -226,13 +234,7 @@ export function AnthropicConsolePage() {
   const save = useMutation({
     mutationFn: async (item: EndpointDraft) => {
       const request = endpointSaveRequest(item, model)
-      return api<{
-        item?: {
-          id?: string
-          api_key_entries?: { id?: string }[]
-          models?: { name: string; alias: string }[]
-        }
-      }>(request.path, {
+      return api<{ item?: ApiEndpoint }>(request.path, {
         method: request.method,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(request.body),
@@ -241,6 +243,9 @@ export function AnthropicConsolePage() {
     onSuccess: async (data, item) => {
       const saved = data.item
       if (saved?.id) {
+        const savedBodyPolicy = asBodyPolicy(
+          saved.body_policy ?? item.bodyPolicy
+        )
         setEndpoints((current) =>
           current.map((row) =>
             row.id === item.id
@@ -250,13 +255,14 @@ export function AnthropicConsolePage() {
                   keyId: saved.api_key_entries?.[0]?.id || row.keyId,
                   apiKey: '',
                   fetchedModels: undefined,
+                  bodyPolicy: savedBodyPolicy,
                   savedModels: (saved.models || []).map(
                     (m) => m.alias || m.name
                   ),
                   stored: {
                     protocol: item.protocol,
                     riskReviewEnabled: item.riskReviewEnabled === true,
-                    bodyPolicy: asBodyPolicy(item.bodyPolicy),
+                    bodyPolicy: savedBodyPolicy,
                     baseUrl: item.baseUrl.trim() || defaultUrl,
                     authScheme: item.authScheme,
                     headers: row.stored?.headers,
@@ -266,6 +272,10 @@ export function AnthropicConsolePage() {
               : row
           )
         )
+        qc.setQueryData<ApiEndpointsPayload>(
+          apiEndpointsQueryOptions().queryKey,
+          (prev) => patchCachedApiEndpoint(prev, saved)
+        )
       }
       toast.success('已接入 API 密钥路径')
       await qc.invalidateQueries({
@@ -273,6 +283,72 @@ export function AnthropicConsolePage() {
       })
     },
     onError: (error: Error) => toast.error(error.message),
+  })
+
+  const saveBodyPolicy = useMutation({
+    mutationFn: async (vars: {
+      id: string
+      storedId: string
+      next: BodyPolicy
+      prev: BodyPolicy
+    }) => {
+      const request = endpointBodyPolicyRequest(vars.storedId, vars.next)
+      return api<{ item?: ApiEndpoint }>(request.path, {
+        method: request.method,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request.body),
+      })
+    },
+    onSuccess: async (data, vars) => {
+      const persisted = asBodyPolicy(data.item?.body_policy ?? vars.next)
+      setEndpoints((current) =>
+        current.map((row) =>
+          row.id === vars.id
+            ? {
+                ...row,
+                bodyPolicy: persisted,
+                stored: row.stored
+                  ? { ...row.stored, bodyPolicy: persisted }
+                  : row.stored,
+              }
+            : row
+        )
+      )
+      qc.setQueryData<ApiEndpointsPayload>(
+        apiEndpointsQueryOptions().queryKey,
+        (prev) =>
+          data.item
+            ? patchCachedApiEndpoint(prev, data.item)
+            : prev
+              ? {
+                  ...prev,
+                  items: prev.items?.map((entry) =>
+                    entry.id === vars.storedId
+                      ? { ...entry, body_policy: persisted }
+                      : entry
+                  ),
+                }
+              : prev
+      )
+      toast.success(
+        persisted === 'caller'
+          ? '已开启转发调用方原始正文'
+          : '已关闭转发原始正文，改用项目人设注入'
+      )
+      await qc.invalidateQueries({
+        queryKey: apiEndpointsQueryOptions().queryKey,
+      })
+    },
+    onError: (error: Error, vars) => {
+      setEndpoints((current) =>
+        current.map((row) =>
+          row.id === vars.id && asBodyPolicy(row.bodyPolicy) === vars.next
+            ? { ...row, bodyPolicy: vars.prev }
+            : row
+        )
+      )
+      toast.error(error.message)
+    },
   })
 
   return (
@@ -286,7 +362,7 @@ export function AnthropicConsolePage() {
           role='group'
           aria-label='API 协议'
         >
-          {(['anthropic', 'openai'] as const).map((kind) => (
+          {(['anthropic', 'openai', 'gemini'] as const).map((kind) => (
             <Button
               key={kind}
               variant={protocol === kind ? 'secondary' : 'outline'}
@@ -345,6 +421,11 @@ export function AnthropicConsolePage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
+                        {protocol === 'gemini' ? (
+                          <SelectItem value='x_goog_api_key'>
+                            x-goog-api-key
+                          </SelectItem>
+                        ) : null}
                         <SelectItem value='x_api_key'>x-api-key</SelectItem>
                         <SelectItem value='authorization_bearer'>
                           Bearer
@@ -358,7 +439,13 @@ export function AnthropicConsolePage() {
                       onChange={(event) =>
                         patchEndpoint(item.id, { apiKey: event.target.value })
                       }
-                      placeholder={protocol === 'openai' ? 'sk-…' : 'sk-ant-…'}
+                      placeholder={
+                        protocol === 'gemini'
+                          ? 'AIza… / sk-vm-…'
+                          : protocol === 'openai'
+                            ? 'sk-…'
+                            : 'sk-ant-…'
+                      }
                       aria-label={`密钥 ${index + 1}`}
                     />
                     <Popover
@@ -504,12 +591,26 @@ export function AnthropicConsolePage() {
                         id={`body-policy-${item.id}`}
                         aria-describedby={`body-policy-help-${item.id}`}
                         checked={asBodyPolicy(item.bodyPolicy) === 'caller'}
-                        disabled={save.isPending}
-                        onCheckedChange={(checked) =>
-                          patchEndpoint(item.id, {
-                            bodyPolicy: checked ? 'caller' : 'persona',
-                          })
+                        disabled={
+                          save.isPending ||
+                          (saveBodyPolicy.isPending &&
+                            saveBodyPolicy.variables?.id === item.id)
                         }
+                        onCheckedChange={(checked) => {
+                          const next: BodyPolicy = checked
+                            ? 'caller'
+                            : 'persona'
+                          const prev = asBodyPolicy(item.bodyPolicy)
+                          patchEndpoint(item.id, { bodyPolicy: next })
+                          if (item.storedId) {
+                            saveBodyPolicy.mutate({
+                              id: item.id,
+                              storedId: item.storedId,
+                              next,
+                              prev,
+                            })
+                          }
+                        }}
                       />
                       <div className='grid gap-1 text-sm'>
                         <label htmlFor={`body-policy-${item.id}`}>
@@ -519,15 +620,16 @@ export function AnthropicConsolePage() {
                           id={`body-policy-help-${item.id}`}
                           className='text-xs text-muted-foreground'
                         >
-                          默认关闭，修改后需保存。关闭时按
+                          默认开启，已保存地址点击切换即保存（新地址随保存生效）。开启时直接转发调用方原始正文，保留自带的
+                          system、计费标记与工具身份；关闭时按
                           <a
                             href='#/settings/protocol'
                             className='underline underline-offset-4'
                           >
                             协议
                           </a>
-                          里配置的人设改写身份与计费块；开启后保留调用方自带的
-                          system、计费标记与工具身份，适用于上游自行读取这些内容的地址。只影响人设注入，不改变风控、配额、模型映射与预算下限。
+                          里配置的人设与 system
+                          注入改写请求。只影响人设注入，不改变风控、配额、模型映射与预算下限。
                         </p>
                       </div>
                     </div>

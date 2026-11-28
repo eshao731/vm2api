@@ -79,6 +79,156 @@ export function isSuccessStatus(statusCode: number | null): boolean {
   return statusCode != null && statusCode >= 200 && statusCode < 300
 }
 
+// ---------- 在飞态（In-Flight）与稳定行键 ----------
+
+const LIVE_PHASE_LABELS: Record<string, string> = {
+  routing: '路由中',
+  queued: '排队中',
+  retrying: '重试中',
+  streaming: '输出中',
+  finalizing: '收尾中',
+}
+
+const LIVE_PHASE_BADGE_STYLES: Record<string, string> = {
+  routing:
+    'bg-blue-100 text-blue-700 border-blue-300 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-700',
+  queued:
+    'bg-slate-100 text-slate-700 border-slate-300 dark:bg-slate-900/40 dark:text-slate-300 dark:border-slate-700',
+  retrying:
+    'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-700',
+  streaming:
+    'bg-sky-100 text-sky-700 border-sky-300 dark:bg-sky-900/30 dark:text-sky-300 dark:border-sky-700',
+  finalizing:
+    'bg-indigo-100 text-indigo-700 border-indigo-300 dark:bg-indigo-900/30 dark:text-indigo-300 dark:border-indigo-700',
+}
+
+const DEFAULT_LIVE_PHASE_STYLE = LIVE_PHASE_BADGE_STYLES.routing
+
+export type ResolvedLiveMeta = {
+  phase: string | null
+  attemptCount: number | null
+  startedAtMs: number | null
+  ttftMs: number | null
+  vmId: string | null
+  accountId: string | null
+  activeProvider: string | null
+}
+
+/**
+ * 虚拟列表与行组件共用的稳定键：优先 `requestId`（含兼容蛇形 `request_id`），
+ * 防止同一请求从 Redis 在飞临时态切换为 PG 正式记录时因 `id` 变化导致整行卸载闪烁。
+ */
+export function logRowKey(
+  row: Pick<UsageLogRow, 'id' | 'requestId'> & { request_id?: string | null }
+): string {
+  const reqId = row.requestId || row.request_id
+  if (reqId) return `req:${reqId}`
+  if (row.id != null && String(row.id) !== '') return `id:${String(row.id)}`
+  return ''
+}
+
+/** 列表展平后按稳定键去重（保留首次/最新出现项）。 */
+export function dedupeUsageLogs(rows: readonly UsageLogRow[]): UsageLogRow[] {
+  if (rows.length <= 1) return [...rows]
+  const seen = new Set<string>()
+  const out: UsageLogRow[] = []
+  for (const row of rows) {
+    const key = logRowKey(row)
+    if (key) {
+      if (seen.has(key)) continue
+      seen.add(key)
+    }
+    out.push(row)
+  }
+  return out
+}
+
+/** 判定是否为进行中（在飞）请求行。 */
+export function isInFlightLog(
+  row: Pick<UsageLogRow, 'in_flight' | 'inFlight' | 'statusCode' | '_live'>
+): boolean {
+  if (row.in_flight === true || row.inFlight === true) return true
+  if (row.in_flight === false || row.inFlight === false) return false
+  return row.statusCode == null && row._live != null
+}
+
+function finiteNumberOrNull(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return value
+}
+
+/** 解析在飞请求的实时元数据（兼容蛇形与驼峰字段）。 */
+export function resolveLiveMeta(
+  row: Pick<
+    UsageLogRow,
+    'createdAt' | 'attemptCount' | 'ttftMs' | 'vmId' | 'accountId' | '_live'
+  >
+): ResolvedLiveMeta {
+  const live = row._live
+  const rawPhase = typeof live?.phase === 'string' ? live.phase.trim() : ''
+  const attemptCount =
+    finiteNumberOrNull(live?.attempt_count) ??
+    finiteNumberOrNull(live?.attemptCount) ??
+    finiteNumberOrNull(row.attemptCount)
+  const rawStarted = live?.started_at ?? live?.startedAt
+  let startedAtMs: number | null = null
+  if (typeof rawStarted === 'number' && Number.isFinite(rawStarted) && rawStarted > 0) {
+    startedAtMs = rawStarted < 1e12 ? rawStarted * 1000 : rawStarted
+  } else if (typeof rawStarted === 'string' && rawStarted) {
+    const parsed = Date.parse(rawStarted)
+    if (Number.isFinite(parsed)) startedAtMs = parsed
+  } else if (row.createdAt) {
+    const parsed = Date.parse(row.createdAt)
+    if (Number.isFinite(parsed)) startedAtMs = parsed
+  }
+  const ttftMs =
+    finiteNumberOrNull(row.ttftMs) ??
+    finiteNumberOrNull(live?.ttft_ms) ??
+    finiteNumberOrNull(live?.ttftMs)
+  const vmId = live?.vm_id ?? live?.vmId ?? row.vmId ?? null
+  const accountId = live?.account_id ?? live?.accountId ?? row.accountId ?? null
+  const activeProvider =
+    live?.active_provider ?? live?.activeProvider ?? null
+  return {
+    phase: rawPhase || null,
+    attemptCount,
+    startedAtMs,
+    ttftMs,
+    vmId,
+    accountId,
+    activeProvider,
+  }
+}
+
+export function livePhaseLabel(phase: string | null | undefined): string {
+  if (!phase) return '进行中'
+  const key = phase.trim().toLowerCase()
+  return LIVE_PHASE_LABELS[key] ?? phase
+}
+
+export function livePhaseBadgeClass(phase: string | null | undefined): string {
+  if (!phase) return DEFAULT_LIVE_PHASE_STYLE
+  return (
+    LIVE_PHASE_BADGE_STYLES[phase.trim().toLowerCase()] ??
+    DEFAULT_LIVE_PHASE_STYLE
+  )
+}
+
+/** 在飞请求当前尝试节点展示名。 */
+export function liveProviderName(row: UsageLogRow): string {
+  const live = resolveLiveMeta(row)
+  if (live.activeProvider) return live.activeProvider
+  if (live.vmId && live.vmId === row.vmId && row.vmName) return row.vmName
+  if (live.vmId) return live.vmId
+  if (row.vmName || row.vmId || row.providerName) {
+    return row.vmName || row.vmId || row.providerName || '调度中...'
+  }
+  if (live.accountId) return live.accountId
+  const last = finalChainItem(row.providerChain ?? [])
+  if (last) return chainItemName(last)
+  return '调度中...'
+}
+
 // ---------- 相对时间 ----------
 
 /** hub `common.relativeTimeShort`：刚刚 / N秒前 / N分前 / … / N年前。 */
@@ -186,6 +336,92 @@ export function multiplierBadgeClass(multiplier: number): string {
 
 // ---------- 模型 ----------
 
+const GEMINI_MODEL_PREFIX_RE = /^gemini-/i
+const GEMINI_PAREN_EFFORT_RE = /\(([^()]+)\)$/
+const GEMINI_TIER_SUFFIX_RE =
+  /-(minimal|low|medium|high|xhigh|extra-high|max)$/i
+
+function normalizeGeminiTierToken(raw: string): string | null {
+  const s = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^thinking_level_/, '')
+  if (!s) return null
+  if (s === 'none' || s === 'off' || s === 'disabled' || s === '0')
+    return 'none'
+  if (s === 'minimal' || s === 'min') return 'minimal'
+  if (s === 'low') return 'low'
+  if (s === 'medium' || s === 'med' || s === 'auto' || s === 'adaptive')
+    return 'medium'
+  if (s === 'high') return 'high'
+  if (s === 'xhigh' || s === 'extra_high' || s === 'extra-high' || s === 'max')
+    return 'xhigh'
+  if (/^\d+$/.test(s)) {
+    const n = Number(s)
+    if (n === 0) return 'none'
+    if (n <= 1024) return 'minimal'
+    if (n <= 4096) return 'low'
+    if (n <= 12288) return 'medium'
+    if (n <= 24576) return 'high'
+    return 'xhigh'
+  }
+  return null
+}
+
+function parseGeminiModelForAudit(
+  raw: string
+): { base: string; effort: string | null } | null {
+  let work = raw.trim().split('/').filter(Boolean).pop() ?? ''
+  if (!work) return null
+  work = work.replace(/\[1m\]$/i, '').toLowerCase()
+  if (!GEMINI_MODEL_PREFIX_RE.test(work)) return null
+  let effort: string | null = null
+  const paren = GEMINI_PAREN_EFFORT_RE.exec(work)
+  if (paren && paren.index > 0) {
+    const parsed = normalizeGeminiTierToken(paren[1])
+    if (parsed) {
+      effort = parsed
+      work = work.slice(0, paren.index)
+    }
+  }
+  work = work.replace(/-thinking$/i, '')
+  const suffix = GEMINI_TIER_SUFFIX_RE.exec(work)
+  if (suffix && suffix.index > 0) {
+    if (!effort) effort = normalizeGeminiTierToken(suffix[1])
+    work = work.slice(0, suffix.index)
+  }
+  work = work.replace(/-thinking$/i, '')
+  return { base: work, effort }
+}
+
+/**
+ * Gemini 请求通常带思考档位后缀（如 `gemini-4-neon-high` / `gemini-4-neon(high)`），
+ * 上游 `modelVersion` 只回显基础模型名（`gemini-4-neon`）。基础模型一致且未出现显式
+ * 档位冲突（如 `high` 降成 `low`）时视为同一模型，不作为响应模型不一致告警。
+ */
+export function isGeminiTierEquivalentModel(
+  requested: string | null | undefined,
+  actual: string | null | undefined
+): boolean {
+  if (!requested || !actual) return false
+  const norm = (m: string) =>
+    (m.trim().split('/').filter(Boolean).pop() ?? '')
+      .replace(/\[1m\]$/i, '')
+      .toLowerCase()
+  const normReq = norm(requested)
+  const normAct = norm(actual)
+  if (normReq === normAct) return true
+  const reqGemini = parseGeminiModelForAudit(normReq)
+  const actGemini = parseGeminiModelForAudit(normAct)
+  if (!reqGemini || !actGemini || reqGemini.base !== actGemini.base)
+    return false
+  return (
+    !reqGemini.effort ||
+    !actGemini.effort ||
+    reqGemini.effort === actGemini.effort
+  )
+}
+
 export type ModelAuditDisplay = {
   /** 列表主显示 / 计费模型。 */
   primaryBillingModel: string | null
@@ -208,12 +444,16 @@ export function resolveModelAuditDisplay(row: {
   const hasActualMismatch = Boolean(
     row.actualResponseModel &&
     effectiveRequestModel &&
-    row.actualResponseModel !== effectiveRequestModel
+    row.actualResponseModel !== effectiveRequestModel &&
+    !isGeminiTierEquivalentModel(effectiveRequestModel, row.actualResponseModel)
   )
   return {
     primaryBillingModel: effectiveRequestModel,
     hasRedirect: Boolean(
-      row.originalModel && row.model && row.originalModel !== row.model
+      row.originalModel &&
+      row.model &&
+      row.originalModel !== row.model &&
+      !isGeminiTierEquivalentModel(row.originalModel, row.model)
     ),
     hasActualMismatch,
     secondaryActualModel: hasActualMismatch ? row.actualResponseModel : null,
@@ -322,7 +562,7 @@ export function finalChainItem(
 
 /** 行级供应商名：最终尝试 → 行上的槽位 / 账号 → 未知。 */
 export function finalProviderName(row: UsageLogRow): string {
-  const last = finalChainItem(row.providerChain)
+  const last = finalChainItem(row.providerChain ?? [])
   if (last) return chainItemName(last)
   return row.vmName || row.vmId || row.providerName || '未知'
 }

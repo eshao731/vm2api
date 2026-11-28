@@ -13,7 +13,8 @@ import {
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
 } from './anthropic-policy.mjs'
-import { liftMidConversationSystemMessages, promoteContentToBlocks } from './sanitize.mjs'
+import { liftMidConversationSystemMessages, mergeConsecutiveAnthropicMessages } from './sanitize.mjs'
+import { extractThirdPartySystemMessages } from './third-party-system.mjs'
 import { applyThinkingDisplay, thinkingDisplayMode } from './thinking.mjs'
 import { ensureOutputConfigSchema } from './request-rectifier.mjs'
 import {
@@ -46,12 +47,11 @@ import {
 import {
   applyMessageBreakpoints,
   DEFAULT_CACHE_TTL,
-  enforceCacheTtlOrder,
+  fillMissingCacheTtl,
   normalizeCacheTtl,
   listCacheMarkers,
   materializeAutomaticCache,
-  stripIllegalCacheControlFields,
-  validateCacheBreakpoints,
+  repairCacheBreakpoints,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 
@@ -273,6 +273,38 @@ export function prepareCliPersonaInput(body, preset) {
 }
 
 /**
+ * Relocate third-party `messages[].role === 'system'` (or `developer`) text turns into
+ * the first user turn so CRAG V4 never forwards raw third-party system prose and
+ * cli-hop never lifts them back into top-level `system[]`.
+ *
+ * Non-text protocol blocks (`tool_addition`, `tool_removal`, `tool_reference`, etc.) and
+ * turn controls (`output_config`, `clear_at`, `cache_control`) MUST stay in place on their
+ * `role: "system"` message — Anthropic 400s if `tool_addition`/`tool_removal` land in `user`.
+ */
+export function foldThirdPartyRoleSystemMessages(body) {
+  if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || !body.messages.length) return body
+  const { moved: extracted, messages: kept, changed } = extractThirdPartySystemMessages(body.messages)
+  if (!changed) return body
+  const merged = mergeConsecutiveAnthropicMessages(kept, { preserveConsecutiveSystem: true })
+  if (extracted.length) {
+    const firstUser = merged.findIndex((m) => m?.role === 'user')
+    if (firstUser >= 0) {
+      const target = merged[firstUser]
+      const content =
+        typeof target.content === 'string'
+          ? [...extracted, { type: 'text', text: target.content }]
+          : Array.isArray(target.content)
+            ? [...extracted, ...target.content]
+            : extracted
+      merged[firstUser] = { ...target, content }
+    } else {
+      merged.unshift({ role: 'user', content: extracted })
+    }
+  }
+  return { ...body, messages: merged }
+}
+
+/**
  * Caller fields plus Node-owned message breakpoints.
  * CLI owns persona layout and system/tools markers; kernel only forwards.
  *
@@ -292,16 +324,44 @@ export function prepareCliHopBody(
     cacheTtl = DEFAULT_CACHE_TTL,
     requestContext = null,
     preserveSystem = false,
+    preserveCacheTtl = false,
     preserveThinkingBlocks = false,
     preserveCallerEnvironment = false,
     autoCompactWindow = null,
     routing = null,
     personaPreset = null,
+    officialTraffic = null,
   } = {},
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
   validateBetweenToolsThinking(canonicalBody)
-  if (preserveSystem) validateCacheBreakpoints(canonicalBody)
+  // Third-party caller role=system turns (leading or mid-conversation) must fold into
+  // messages[0] BEFORE officialMessagesBody or liftMidConversationSystemMessages can lift
+  // them into system[] (V9). Skip when already gateway-shaped by applyCrsUnofficialPersona
+  // (handler already folded caller role=system beforehand; remaining role=system turns are
+  // gateway-rendered Environment/reminder blocks).
+  const prePreparedZero =
+    personaPreset === 'zero' ||
+    (personaPreset == null &&
+      Array.isArray(canonicalBody.system) &&
+      canonicalBody.system.some(
+        (block) => /^x-anthropic-billing-header/i.test(textOf(block)) && /prompt_version=</.test(textOf(block)),
+      ))
+  const preShaped =
+    !prePreparedZero &&
+    (personaPreset != null ||
+      (Array.isArray(canonicalBody.system) &&
+        canonicalBody.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')))
+  if (officialTraffic === false && !preserveSystem && !preShaped && !prePreparedZero) {
+    canonicalBody = foldThirdPartyRoleSystemMessages(canonicalBody)
+  }
+  if (preserveSystem) {
+    canonicalBody = repairCacheBreakpoints(canonicalBody, {
+      limit: 4,
+      fallbackTtl: cacheTtl,
+      fillMissing: false,
+    })
+  }
   let body = officialMessagesBody(canonicalBody, { stream, preserveContentShape: true })
   const windowTokens = Number(autoCompactWindow)
   if (Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000) {
@@ -320,11 +380,16 @@ export function prepareCliHopBody(
       ))
   // Zero may forward a caller's boundary literal; it must keep zero's fallback
   // policy rather than trigger the official template/tool-marker policy.
+  // Mode 1 (`official`, default) omits dynamic_boundary when harness/guidance are off,
+  // so recognize its gateway-rendered [billing, CLI_IDENTITY] prefix too.
   const shaped =
     !preparedZero &&
     (personaPreset != null ||
       (Array.isArray(body.system) &&
-        body.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')))
+        (body.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') ||
+          (body.system.length === 2 &&
+            /^x-anthropic-billing-header:/i.test(textOf(body.system[0])) &&
+            textOf(body.system[1]).trim() === CRS_OFFICIAL_CLI_SYSTEM))))
   if (!preserveSystem) {
     if (!shaped && !preparedZero) {
       const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })
@@ -346,8 +411,8 @@ export function prepareCliHopBody(
   body = ensureOutputConfigSchema(body)
 
   if (preparedZero && !preserveSystem && !requestContext && body.cache_control != null) {
-    // Native passthrough judges the caller's markers before rewriting them.
-    validateCacheBreakpoints(body)
+    // Auto-repair non-conforming caller markers before materializing automatic cache.
+    body = repairCacheBreakpoints(body, { limit: 4, fallbackTtl: cacheTtl, fillMissing: false })
     body = materializeAutomaticCache(body)
   } else if (Object.prototype.hasOwnProperty.call(body, 'cache_control')) {
     delete body.cache_control
@@ -375,6 +440,9 @@ export function prepareCliHopBody(
     if (Array.isArray(body.tools)) {
       body = { ...body, tools: stripToolCacheControl(body.tools, { preserveCacheControl: zeroFallback }) }
     }
+    // Rewritten hops fill omitted TTLs from the configured default so an
+    // unmarked ttl does not fall back to implicit 5m and shorten later anchors.
+    if (!preserveSystem && !preserveCacheTtl) body = fillMissingCacheTtl(body, cacheTtl)
     // Assembled official templates own their system markers, not the growing
     // conversation. Fill missing message anchors without moving caller markers.
     const shapedFallback = shaped && !preserveSystem
@@ -411,7 +479,9 @@ export function prepareCliHopBody(
     }
   }
   const prepared = applyEagerToolStreaming(body, routing)
-  return preserveSystem ? prepared : enforceCacheTtlOrder(prepared, cacheTtl)
+  return preserveSystem
+    ? prepared
+    : repairCacheBreakpoints(prepared, { limit: 4, fallbackTtl: cacheTtl, fillMissing: false })
 }
 
 export function prepareOutboundAttempt({
@@ -501,8 +571,12 @@ export function prepareOutboundAttempt({
     preserveThinkingBlocks,
     dropSampling,
   })
-  cleaned = stripIllegalCacheControlFields(cleaned)
-  cleaned = enforceCacheTtlOrder(cleaned, cacheTtl || DEFAULT_CACHE_TTL)
+  cleaned = repairCacheBreakpoints(cleaned, {
+    limit: cacheControlLimit,
+    fallbackTtl: cacheTtl || DEFAULT_CACHE_TTL,
+    fillMissing: !keepCallerSession,
+    stripExtraFields: true,
+  })
   const scrubbed = scrubUpstreamClientBody(cleaned, {
     official: !unofficial,
     rewriteTools: toolNameRewrite !== false,
@@ -516,7 +590,13 @@ export function prepareOutboundAttempt({
   return { body: tools.body, toolNames }
 }
 
-export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m, routing } = {}) {
+export function prepareOutboundHeaders(
+  reqHeaders,
+  homeDir,
+  identity,
+  model,
+  { credentialMode, want1m, routing, officialTraffic = false } = {},
+) {
   if (isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)) {
     return {
       'user-agent': INFERENCE_UA,
@@ -524,7 +604,10 @@ export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { c
       'anthropic-beta': isApiKeyMode(credentialMode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(model),
     }
   }
-  const headers = resolveCrsHeaders(reqHeaders, homeDir, identity, model, { want1m: want1m === true })
+  const headers = resolveCrsHeaders(reqHeaders, homeDir, identity, model, {
+    want1m: want1m === true,
+    officialTraffic: officialTraffic === true,
+  })
   // Slot identity supplies the version; the saved protocol setting owns the entrypoint.
   headers['user-agent'] = officialClaudeCliUa(headers['user-agent'], ccEntrypointFromRouting(routing))
   return headers
@@ -547,6 +630,7 @@ export function prepareOutboundEnvelope({
   reqHeaders = {},
   homeDir = '',
   officialClient,
+  officialTraffic,
   sessionId,
   accountId = '',
   boundSessionId = '',
@@ -567,6 +651,12 @@ export function prepareOutboundEnvelope({
   want1m,
   dropSampling = false,
 } = {}) {
+  const verifiedOfficial =
+    typeof officialTraffic === 'boolean'
+      ? officialTraffic
+      : typeof officialClient === 'boolean'
+        ? officialClient
+        : unofficial === false
   const prepared = prepareOutboundAttempt({
     requestContext,
     canonicalBody,
@@ -611,6 +701,7 @@ export function prepareOutboundEnvelope({
         credentialMode,
         routing,
         want1m: want1m === true || hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(canonicalBody?.model),
+        officialTraffic: verifiedOfficial,
       },
     ),
   }

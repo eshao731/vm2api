@@ -3,6 +3,7 @@ package oauthcmd
 import (
 	"bytes"
 	"encoding/json"
+	kinoauth "github.com/dofastted/kin-gateway/worker/internal/oauth"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,7 +15,7 @@ import (
 	"github.com/dofastted/kin-gateway/worker/internal/credential"
 )
 
-func TestExpiredCredentialRefreshesBeforeProfileAndPersists(t *testing.T) {
+func TestNonRefreshOpsAreReadOnlyAndNeverRefresh(t *testing.T) {
 	var refreshCalls, profileCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -24,7 +25,7 @@ func TestExpiredCredentialRefreshesBeforeProfileAndPersists(t *testing.T) {
 			_, _ = writer.Write([]byte(`{"access_token":"access-new","refresh_token":"refresh-new","expires_in":28800}`))
 		case "/api/oauth/profile":
 			profileCalls++
-			if request.Header.Get("Authorization") != "Bearer access-new" {
+			if request.Header.Get("Authorization") != "Bearer access-old" {
 				t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
 			}
 			writer.Header().Set("Content-Type", "application/json")
@@ -52,8 +53,46 @@ func TestExpiredCredentialRefreshesBeforeProfileAndPersists(t *testing.T) {
 	if !envelope.OK {
 		t.Fatalf("envelope = %+v", envelope)
 	}
-	if refreshCalls != 1 || profileCalls != 1 {
-		t.Fatalf("refresh calls=%d profile calls=%d", refreshCalls, profileCalls)
+	if refreshCalls != 0 || profileCalls != 1 {
+		t.Fatalf("refresh calls=%d profile calls=%d (want 0, 1)", refreshCalls, profileCalls)
+	}
+	current, err := credential.NewStore(credPath).Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.AccessToken != "access-old" || current.RefreshToken != "refresh-old" {
+		t.Fatalf("non-refresh op mutated credential: %+v", current)
+	}
+}
+
+func TestRefreshOpRotatesAndPersistsCredential(t *testing.T) {
+	var refreshCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/oauth/token" {
+			t.Fatalf("unexpected path %s", request.URL.Path)
+		}
+		refreshCalls++
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"access_token":"access-new","refresh_token":"refresh-new","expires_in":28800}`))
+	}))
+	defer server.Close()
+
+	configPath, _ := testConfig(t, server.URL, server.URL+"/oauth/token", nil)
+	credPath := filepath.Join(filepath.Dir(configPath), "credentials.json")
+	saveCredential(t, credPath, credential.Credential{
+		AccessToken:  "access-old",
+		RefreshToken: "refresh-old",
+		ExpiresAt:    time.Now().Add(-time.Minute).UnixMilli(),
+	})
+
+	var output bytes.Buffer
+	if code := Run([]string{"refresh", "--config", configPath, "--attempt-guard"}, nil, &output); code != 0 {
+		t.Fatalf("exit code = %d, output = %s", code, output.String())
+	}
+	var envelope responseEnvelope
+	decodeOutput(t, &output, &envelope)
+	if !envelope.OK || refreshCalls != 1 {
+		t.Fatalf("envelope=%+v refreshCalls=%d", envelope, refreshCalls)
 	}
 	current, err := credential.NewStore(credPath).Status()
 	if err != nil {
@@ -308,5 +347,41 @@ func decodeOutput(t *testing.T, output *bytes.Buffer, envelope *responseEnvelope
 	lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n"))
 	if err := json.Unmarshal(lines[len(lines)-1], envelope); err != nil {
 		t.Fatalf("decode output: %v; output=%s", err, output.String())
+	}
+}
+
+func TestAttemptGuardFlagAndUnknownOutcome(t *testing.T) {
+	op, configPath, force, ok := parseArgs([]string{"refresh", "--config", "/run/kin/worker.json", "--attempt-guard"})
+	if !ok || op != "refresh" || configPath != "/run/kin/worker.json" || force {
+		t.Fatalf("--attempt-guard must be accepted: %q %q %v %v", op, configPath, force, ok)
+	}
+	unknown := &kinoauth.RefreshError{Code: kinoauth.CodeOutcomeUnknown, Message: "lost"}
+	if got := classifyError(unknown); got != kinoauth.CodeOutcomeUnknown {
+		t.Fatalf("unknown outcome must reach the control plane as itself, got %q", got)
+	}
+	if got := classifyError(&kinoauth.RefreshError{Status: 400, Code: "invalid_grant"}); got != "refresh_failed" {
+		t.Fatalf("an upstream rejection keeps its existing code, got %q", got)
+	}
+}
+
+// The control plane uses this to learn, without touching any token or the network, whether a
+// node's worker keeps the refresh-attempt journal. An older worker has no such operation (and
+// rejects --attempt-guard) so it answers invalid_arguments instead.
+func TestGuardProbeReportsJournalSupportWithoutConfigOrNetwork(t *testing.T) {
+	var out bytes.Buffer
+	code := Run([]string{"guard-probe", "--config", "/definitely/not/there.json"}, strings.NewReader(""), &out)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out.String())
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Status int            `json:"status"`
+		Body   map[string]any `json:"body"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatalf("decode %q: %v", out.String(), err)
+	}
+	if !response.OK || response.Status != 200 || response.Body["attempt_guard"] != true {
+		t.Fatalf("unexpected probe answer: %s", out.String())
 	}
 }

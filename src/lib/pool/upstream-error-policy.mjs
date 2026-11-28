@@ -1,4 +1,5 @@
-import { normalizeThinkingForModel } from '../protocol/thinking.mjs'
+import { canRepairAdaptiveThinking, normalizeThinkingForModel } from '../protocol/thinking.mjs'
+import { removeCacheControlFields } from '../protocol/cache-ttl.mjs'
 import { flattenSearchResultHistory, rectifyUnofficialRequestForRetry } from '../protocol/request-rectifier.mjs'
 import {
   assistantStopReason,
@@ -71,6 +72,41 @@ const ORGANIZATION_DISABLED_PATTERNS = [
   /oauth authentication is currently not allowed/i,
   /organization.*(?:blocked|banned|disabled)/i,
 ]
+
+// Static Pydantic / request-schema validation 400s fail the same way on every
+// healthy slot and must not open the unit circuit breaker.
+const DETERMINISTIC_REQUEST_SCHEMA_400_PATTERNS = [
+  /\b(?:tools|messages|system)\.\d+[^:]*:\s*(?:extra inputs are not permitted|input tag\b.+\bdoes not match|field required|input should be|string should have|list should have)/i,
+  /\b(?:input_schema|tool_choice|output_config|thinking|max_tokens)\b[^:]*:\s*(?:extra inputs are not permitted|field required|input should be|greater than|less than)/i,
+]
+
+function isDeterministicRequestSchema400(message) {
+  const text = String(message || '')
+  if (!text) return false
+  return DETERMINISTIC_REQUEST_SCHEMA_400_PATTERNS.some((pattern) => pattern.test(text))
+}
+
+/**
+ * The org refuses this seat. Shared by the runtime 400/401/403 classifier and
+ * the official /usage probe pipeline so both park the slot on the same
+ * wording — a probe hit parks without waiting for real traffic to trip it.
+ * `usage_error` may be a structured object (crs-usage-probe falls back to the
+ * whole error body), so extract the human text before matching.
+ */
+export function isOrganizationDisabledText(text) {
+  const blob = typeof text === 'string' ? text : String(text?.message || text?.error || '')
+  if (!blob) return false
+  return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(blob))
+}
+
+/** A usage-probe result carries the org refusal: park it like the runtime does (400/401/403). */
+export function isOrganizationDisabledUsageResult(result = {}) {
+  if (result?.ok === true || result?.usage_scope_missing) return false
+  const status = Number(result?.usage_status || result?.status || 0)
+  if (status !== 400 && status !== 401 && status !== 403) return false
+  const text = result?.usage_error || result?.error || result?.fable?.error || result?.message || ''
+  return isOrganizationDisabledText(text)
+}
 
 function bodyMessage(body) {
   if (typeof body === 'string') return body
@@ -225,7 +261,7 @@ export function isUnconfirmedAuthFailure(result = {}) {
   const hay = `${code} ${message} ${workerCode}`
   const authish =
     Number(result.status) === 401 ||
-    /token has been revoked|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
+    /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
       hay,
     )
   if (!authish) return false
@@ -236,6 +272,14 @@ export function isUnconfirmedAuthFailure(result = {}) {
 }
 
 const TIMEOUT_PATTERNS = /timeout|deadline|response header|timed out/i
+const PROXY_PATTERNS =
+  /proxy|socks|dial|dns|tls|connect|splice_rst|reset by peer|econnrefused|ehostunreach|enetunreach/i
+const PRE_FIRST_FRAME_TRANSPORT_CODES = new Set([
+  'upstream_network_error',
+  'transport_error',
+  'upstream_transport_error',
+  'upstream_transport',
+])
 
 function isTimeoutFailure(workerCode, message) {
   return TIMEOUT_PATTERNS.test(`${workerCode} ${message}`)
@@ -244,7 +288,46 @@ function isTimeoutFailure(workerCode, message) {
 function isProxyFailure(workerCode, message) {
   const hay = `${workerCode} ${message}`
   if (isTimeoutFailure(workerCode, message)) return false
-  return /proxy|socks|dial|dns|tls|connect/i.test(hay)
+  return PROXY_PATTERNS.test(hay)
+}
+
+function proxyTransportFailure(now) {
+  return {
+    scope: 'proxy',
+    action: 'continue-and-cooldown',
+    reason: 'proxy_transport_failure',
+    cooldownUntil: now + 60_000,
+    retrySameAccount: false,
+  }
+}
+
+/** Pre-first-frame non-timeout transport/proxy failure (before downstream commit or any upstream event). */
+export function isPreFirstFrameTransportFailure(
+  result,
+  workerCode = resultErrorCode(result),
+  message = bodyMessage(result?.body),
+) {
+  if (result?.committed || result?.firstByteAt != null || result?.cragPolicyBlock === true) return false
+  const facts = result?.providerResult
+  if (facts?.observation?.policy_blocked === true) return false
+  const combinedMessage = `${message || ''} ${facts?.error?.message || ''}`.trim()
+  if (isTimeoutFailure(workerCode, combinedMessage)) return false
+  if (isNativeProcessExit(workerCode, combinedMessage) || facts?.error?.type === 'process_error') return false
+  if (
+    [
+      workerCode,
+      facts?.error?.type,
+      facts?.error?.code,
+      result?.body?.error?.type,
+      result?.body?.error?.code,
+      facts?.observation?.kind,
+      result?.observation?.kind,
+    ].some((value) => PRE_FIRST_FRAME_TRANSPORT_CODES.has(String(value || '')))
+  ) {
+    return true
+  }
+  if (isProxyFailure(workerCode, combinedMessage)) return true
+  return facts?.schema_version === 2 && facts.provider_complete === false && facts.http_status == null
 }
 
 function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}) {
@@ -299,7 +382,10 @@ export function clampOauth401CooldownMs(ms) {
   return Math.min(MAX_OAUTH_401_COOLDOWN_MS, Math.max(5_000, n))
 }
 
-const GRANT_DEAD = /token has been revoked|oauth_revoked|invalid_grant/i
+// OpenAI/codex revocations come as `error.code = "token_revoked"` with the message
+// "Encountered invalidated oauth token for user" — same grant death as Anthropic's
+// "token has been revoked", just spelled differently.
+const GRANT_DEAD = /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant/i
 
 function classifyOAuth401(hasRefresh, hay) {
   if (hasRefresh === false) {
@@ -344,6 +430,7 @@ function classifyUpstreamResultRaw(
   result = {},
   {
     model = null,
+    requestBody = null,
     now = Date.now(),
     repaired = false,
     hasRefresh = null,
@@ -351,6 +438,7 @@ function classifyUpstreamResultRaw(
     credentialGeneration = null,
     priorAuth401Generation = null,
     signatureRepair = false,
+    disableRequestRepair = false,
     usage = null,
   } = {},
 ) {
@@ -364,6 +452,15 @@ function classifyUpstreamResultRaw(
     }
   }
   if (result.cragPolicyBlock === true && !result.committed) {
+    if (result.cragCacheControlBlocked === true && !repaired && !disableRequestRepair) {
+      return {
+        scope: 'request',
+        action: 'repair-and-retry',
+        reason: 'cache_control_repairable',
+        cooldownUntil: null,
+        retrySameAccount: true,
+      }
+    }
     return {
       scope: 'request',
       action: 'stop',
@@ -481,10 +578,7 @@ function classifyUpstreamResultRaw(
   // The org refuses this seat. Not a token death and not a timed cooldown:
   // pause the slot until an operator resumes it, and give the request to
   // another unit instead of returning the 403.
-  if (
-    (status === 400 || status === 401 || status === 403) &&
-    ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(message))
-  ) {
+  if ((status === 400 || status === 401 || status === 403) && isOrganizationDisabledText(message)) {
     return {
       scope: 'account',
       action: result.committed ? 'stop' : 'continue',
@@ -492,10 +586,16 @@ function classifyUpstreamResultRaw(
       cooldownUntil: null,
       retrySameAccount: false,
       pauseSchedule: true,
+      ...(status === 400 || status === 403 ? { circuit: true } : {}),
       detail: { status, message: message.slice(0, 500) },
     }
   }
-  if (/token has been revoked|oauth_revoked|invalid_grant|authentication_error/i.test(hay) || status === 401) {
+  if (
+    /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|authentication_error/i.test(
+      hay,
+    ) ||
+    status === 401
+  ) {
     if (isUnconfirmedAuthFailure(result)) {
       return {
         scope: 'account',
@@ -524,6 +624,7 @@ function classifyUpstreamResultRaw(
       reason: 'credential_refresh_failed',
       cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
       retrySameAccount: false,
+      circuit: true,
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
@@ -548,14 +649,7 @@ function classifyUpstreamResultRaw(
   }
   // Kernel / cli-node named the cause; none of these is the account's fault.
   if (workerCode === ErrorCode.UPSTREAM_NETWORK) {
-    if (isProxyFailure('', message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
-    }
+    if (isProxyFailure('', message)) return proxyTransportFailure(now)
     return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: false })
   }
   if (workerCode === ErrorCode.UPSTREAM_STREAM_INTERRUPTED) {
@@ -575,30 +669,46 @@ function classifyUpstreamResultRaw(
       retrySameAccount: true,
     })
   }
+  if (code === 'crag_prompt_replace_empty_unsupported' || workerCode === 'crag_prompt_replace_empty_unsupported') {
+    return continueWithoutCooldown({
+      scope: 'worker',
+      reason: 'crag_prompt_replace_empty_unsupported',
+      retrySameAccount: false,
+    })
+  }
   if (result.transportError || status === 0) {
-    if (isProxyFailure(workerCode, message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
-    }
+    if (isProxyFailure(workerCode, message)) return proxyTransportFailure(now)
     return continueWithoutCooldown({
       scope: 'worker',
       reason: isTimeoutFailure(workerCode, message) ? 'worker_timeout' : 'worker_transport_failure',
     })
   }
   if (status === 400) {
-    if (code === 'invalid_kernel_request') {
-      return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    if (code === 'invalid_kernel_request' || code === 'unsupported_capability' || code === 'thinking_incompatible') {
+      return {
+        scope: 'request',
+        action: 'stop',
+        reason:
+          code === 'thinking_incompatible'
+            ? 'thinking_incompatible'
+            : code === 'unsupported_capability'
+              ? 'unsupported_capability'
+              : 'invalid_request',
+        cooldownUntil: null,
+      }
     }
     const hay = `${code} ${message}`
     // Default off. Turning this on drops thinking history and retries, so the
     // client sees 200 and never learns the upstream rejected the signature.
     // Probe / forged signatures need the 400. Search / prefill / tool-pair
-    // / schema / adaptive repairs are independent of this switch.
-    if (!repaired && signatureRepair && SIGNATURE_PATTERNS.some((pattern) => pattern.test(hay))) {
+    // / schema / adaptive repairs are independent of this switch, except when
+    // `disableRequestRepair` (crag_strict_passthrough) turns all silent 400 repairs off.
+    if (
+      !repaired &&
+      !disableRequestRepair &&
+      signatureRepair &&
+      SIGNATURE_PATTERNS.some((pattern) => pattern.test(hay))
+    ) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -606,7 +716,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && SEARCH_HISTORY_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && SEARCH_HISTORY_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -614,7 +724,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && PREFILL_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && PREFILL_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -622,7 +732,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && TOOL_PAIR_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && TOOL_PAIR_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -630,7 +740,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && SCHEMA_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && SCHEMA_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -638,7 +748,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && SAMPLING_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && SAMPLING_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -646,7 +756,15 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
+      if (requestBody && !canRepairAdaptiveThinking(requestBody, model)) {
+        return {
+          scope: 'request',
+          action: 'stop',
+          reason: 'thinking_incompatible',
+          cooldownUntil: null,
+        }
+      }
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -654,7 +772,17 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    // Deterministic Pydantic / request-schema validation 400s fail identically on
+    // every healthy slot, so they must not trip the unit circuit breaker.
+    if (isDeterministicRequestSchema400(message)) {
+      return {
+        scope: 'request',
+        action: 'stop',
+        reason: 'invalid_request_schema',
+        cooldownUntil: null,
+      }
+    }
+    return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null, circuit: true }
   }
   if (status === 401) return classifyOAuth401(hasRefresh, hay)
   if (status === 403) {
@@ -664,6 +792,7 @@ function classifyUpstreamResultRaw(
         action: 'continue-and-cooldown',
         reason: 'proxy_or_edge_forbidden',
         cooldownUntil: now + 60_000,
+        circuit: true,
       }
     }
     if (isFableModel(model)) {
@@ -674,6 +803,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
         retrySameAccount: false,
         mark_tier: 'pro',
+        circuit: true,
       }
     }
     return {
@@ -681,6 +811,7 @@ function classifyUpstreamResultRaw(
       action: 'continue-and-cooldown',
       reason: 'permission_denied',
       cooldownUntil: now + clampOauth401CooldownMs(oauth401CooldownMs),
+      circuit: true,
     }
   }
   if (status === 429) {
@@ -762,9 +893,12 @@ function classifyUpstreamResultRaw(
     }
     return {
       scope: 'account',
-      action: reset > now ? 'continue-and-cooldown' : 'continue',
+      action: 'continue',
       reason: 'rate_limited_unknown',
-      cooldownUntil: reset > now ? reset : null,
+      // Retry-After says when to retry this request, not which models are
+      // exhausted. The usage probe resolves the window without parking
+      // unrelated models on the account.
+      cooldownUntil: null,
       retrySameAccount: false,
     }
   }
@@ -786,14 +920,29 @@ function classifyUpstreamResultRaw(
         retrySameAccount: false,
       })
     }
+    const providerMessage = String(result?.providerResult?.error?.message || '')
+    const combinedMessage = providerMessage ? `${message} ${providerMessage}`.trim() : message
+    const combinedHay = providerMessage
+      ? `${hay} ${result?.providerResult?.error?.type || ''} ${result?.providerResult?.error?.code || ''} ${providerMessage}`
+      : hay
     // The VM's native Claude process died before answering (cgroup OOM or pids
     // limit, crash). The account is fine: try another unit, open no circuit.
-    if (isNativeProcessExit(workerCode, hay)) {
+    if (isNativeProcessExit(workerCode, combinedHay) || result?.providerResult?.error?.type === 'process_error') {
       return continueWithoutCooldown({
         scope: 'worker',
         reason: 'worker_process_exit',
         retrySameAccount: false,
       })
+    }
+    const preFirstFrame = !result.committed && result.firstByteAt == null
+    // #1562: Pre-first-frame 502 timeout naming SOCKS/proxy is egress dial failure, not provider_timeout.
+    if (
+      status === 502 &&
+      preFirstFrame &&
+      isTimeoutFailure(workerCode, combinedMessage) &&
+      /socks|proxy/i.test(combinedHay)
+    ) {
+      return proxyTransportFailure(now)
     }
     if (isFableModel(model) && (status === 408 || status === 504 || /timeout/i.test(message))) {
       return {
@@ -804,15 +953,26 @@ function classifyUpstreamResultRaw(
         cooldownUntil: now + 30_000,
       }
     }
-    if (status === 408 || isTimeoutFailure(workerCode, message)) {
+    if (status === 408 || isTimeoutFailure(workerCode, combinedMessage)) {
       return continueWithoutCooldown({
         scope: 'provider',
         reason: 'provider_timeout',
       })
     }
+    // #1562: Pre-first-frame 502 transport failure cools proxy on proxy markers, else switches unit via circuit.
+    if (status === 502 && isPreFirstFrameTransportFailure(result, workerCode, message)) {
+      if (isProxyFailure(workerCode, combinedMessage)) return proxyTransportFailure(now)
+      return {
+        scope: 'worker',
+        action: 'continue',
+        reason: 'upstream_network_error',
+        cooldownUntil: null,
+        retrySameAccount: false,
+        circuit: true,
+      }
+    }
 
-    // A 2xx stream that died before visible output used to be rewritten to 502.
-    // Kernel may also send that 502 with terminal incomplete. Neither is overload.
+    // Remaining uncommitted incomplete 502 (post-first-frame stream drop or generic incomplete hop, not overload).
     if (result.terminalState === 'incomplete' && !result.committed && !/overload/i.test(message)) {
       return continueWithoutCooldown({
         scope: 'stream',
@@ -884,6 +1044,9 @@ export function repairAnthropicRequest(body = {}, policy = {}) {
   }
   if (reason === 'search_repairable') {
     return flattenSearchResultHistory(body)
+  }
+  if (reason === 'cache_control_repairable') {
+    return removeCacheControlFields(body)
   }
   if (reason === 'thinking_repairable') {
     const next = structuredClone(body)

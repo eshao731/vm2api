@@ -26,7 +26,13 @@ import {
 } from 'lucide-react'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
-import { fmtNum, fmtUsd } from '@/lib/format'
+import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
+import {
+  geminiAccountStatus,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
+  geminiInferenceErrorLabel,
+} from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import {
@@ -37,7 +43,7 @@ import {
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
-import { clipLabel } from '@/lib/vm-kind'
+import { clipLabel, formatSlotEmail, slotRawEmail } from '@/lib/vm-kind'
 import {
   claudeTier,
   poolStatus,
@@ -49,6 +55,8 @@ import {
 import { vmCostLedger, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
+import { StatusMark } from '@/components/status-mark'
+import { NodePoolBadges } from '@/features/pools/node-pool-badges'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import {
   SchedulableSwitch,
@@ -58,8 +66,9 @@ import { riskFg, RISK_SOLID, riskLevel } from '@/features/vm/usage-meter'
 import { PlatformMark } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
-import { GeminiSlotStatus } from '@/features/vm/vm-rack-blade'
 import {
+  emptyZoneCounts,
+  GEMINI_EVIDENCE_ZONES,
   vmWindows,
   type WindowKey,
   type WindowReadout,
@@ -105,8 +114,65 @@ const STATE_ICON_FG: Partial<Record<ScheduleStateLabel, string>> = {
   开: 'text-[color:var(--status-ok)]',
 }
 
+function geminiSchedSummary(vm: Vm): {
+  text: string | null
+  title: string
+  warn: boolean
+} | null {
+  const environment = vm.gemini
+  if (!environment) return null
+  const status = geminiAccountStatus(environment, vm.unschedulable_text)
+  const { authorization, blocker, inference, lastInference, modelsLabel } =
+    status
+  const notice = geminiEligibilityNotice(environment.account, lastInference)
+  const failed =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorLabel(lastInference.error_code)
+      : null
+  const failureAction =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorAction(lastInference.error_code)
+      : null
+  const at = lastInference?.finished_at ?? lastInference?.started_at
+  const age = at ? fmtAgo(at) || at : ''
+  const run = lastInference
+    ? [lastInference.model, age].filter(Boolean).join(' · ')
+    : null
+  const warnText = notice?.label ?? failed
+  const aside = blocker ? authorization.text : modelsLabel
+  const title = [
+    status.tone.text,
+    authorization.text,
+    modelsLabel,
+    blocker ??
+      (environment.auth_state === 'authorized' ? '候选条件已满足' : null),
+    environment.schedulable === false ? '已手动关闭调度' : null,
+    environment.restriction?.text
+      ? `当前受限：${environment.restriction.text}`
+      : null,
+    notice ? `${notice.label}：${notice.action}` : null,
+    [inference.text, run, failed].filter(Boolean).join(' · '),
+    failureAction,
+    '仅显示最近一次宿主推理，不代表公共 API 端到端验证',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const text =
+    vm.restriction_text ||
+    blocker ||
+    (environment.auth_state === 'disabled'
+      ? '已停用'
+      : environment.schedulable === false
+        ? '手动关闭'
+        : warnText || run || aside)
+  return {
+    text,
+    title,
+    warn: Boolean(warnText && text === warnText),
+  }
+}
+
 function SchedCell({ vm }: { vm: Vm }) {
-  if (vm.gemini) return <GeminiSlotStatus vm={vm} />
   const level = Number(vm.schedule_level)
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
   const manual = vm.schedule_level_mode === 'manual'
@@ -115,12 +181,15 @@ function SchedCell({ vm }: { vm: Vm }) {
   const breaker = label === '受限' && tone.key === 'circuit'
   const style = STATE_STYLE[label]
   const Icon = breaker ? Zap : style.icon
-  const reason =
-    label === '受限' || label === '不可调度'
+  const geminiSummary = geminiSchedSummary(vm)
+  const reason = geminiSummary
+    ? geminiSummary.text
+    : label === '受限' || label === '不可调度'
       ? vm.restriction_text || vm.unschedulable_text || tone.text
       : label === '关'
         ? '手动关闭'
         : null
+  const reasonTitle = geminiSummary?.title ?? reason ?? undefined
   return (
     <>
       <SchedulableSwitch {...vmSchedulableProps(vm)} />
@@ -148,13 +217,15 @@ function SchedCell({ vm }: { vm: Vm }) {
         )}
         title={
           levelOk
-            ? `${manual ? '手动指定' : '自动分配'}的优先级，数字越大越优先`
+            ? `${manual ? '手动（manual）' : '自动（auto）'} · 有效值 ${level}（1–10，数字越大越优先）`
             : '没有调度优先级'
         }
       >
         P{levelOk ? level : '—'}
-        {levelOk && manual ? (
-          <small className='ml-0.5 font-sans font-semibold'>手</small>
+        {levelOk ? (
+          <small className='ml-0.5 font-sans font-semibold'>
+            {manual ? '手' : '自'}
+          </small>
         ) : null}
       </span>
       {reason ? (
@@ -163,11 +234,13 @@ function SchedCell({ vm }: { vm: Vm }) {
             'min-w-0 flex-1 truncate',
             label === '关'
               ? TERT
-              : breaker
+              : breaker || geminiSummary?.warn
                 ? 'text-[color:var(--status-caution)]'
-                : style.cls
+                : label === '开' && geminiSummary
+                  ? 'text-muted-foreground'
+                  : style.cls
           )}
-          title={reason}
+          title={reasonTitle}
         >
           {reason}
         </span>
@@ -185,6 +258,9 @@ const SLOT_HEIGHT: Record<SlotState, string> = {
 }
 
 function HealthCell({ vm }: { vm: Vm }) {
+  if (vm.gemini && !vm.gemini.billing_ready && !vm.health_24h) {
+    return <span className={TERT}>—</span>
+  }
   const h = healthSummary(vm.health_24h)
   return (
     <>
@@ -296,13 +372,9 @@ function QuotaCell({
             backgroundColor: RISK_SOLID[riskLevel(w.pct)],
           }}
         />
-        {t.elapsedPct != null ? (
-          <b
-            aria-hidden
-            className='absolute -top-[3px] -bottom-[3px] w-0.5 rounded-[1px] bg-foreground'
-            style={{ left: `calc(${t.elapsedPct}% - 1px)` }}
-          />
-        ) : null}
+        {/* 时间进度只放 title 提示，不在轨道上画刻线——
+            进度条内任何竖线（无论形态/透明度）都会被读成「用量游标」，
+            降透明刻线两轮实测仍稳定被误读。 */}
       </span>
     </div>
   )
@@ -422,7 +494,7 @@ const COLS: Col[] = [
     cell: (r) => (r.today ? fmtNum(r.today) : <span className={TERT}>0</span>),
   },
   {
-    label: '席位',
+    label: '执行位',
     sort: 'seats',
     num: true,
     cell: (r) =>
@@ -490,21 +562,21 @@ const COLS: Col[] = [
 
 function ProdCell({ vm }: { vm: Vm }) {
   const tier = claudeTier(vm)
-  const plan = vm.gemini ? vm.gemini.account?.plan : tier.label
-  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
+  const plan = vm.gemini ? vm.gemini.account?.plan || 'Gemini' : tier.label
+  const crag =
+    (vm.resolved_dataplane ?? vm.dataplane) === 'crag' ||
+    vm.gemini?.auth_method === 'oauth'
   const registration = credentialRegistrationOf(vm)
   const node = vm.node_name || vm.node_id || 'local'
+  const email = slotRawEmail(vm)
   return (
     <>
       <PlatformMark vm={vm} />
       <span
-        className={cn(
-          'font-mono font-semibold',
-          vm.gemini ? 'min-w-0 truncate' : 'shrink-0'
-        )}
-        title={vm.name || vm.id}
+        className='min-w-0 truncate font-mono font-semibold'
+        title={vm.name ? `${vm.name} · ${vm.id}` : vm.id}
       >
-        {clipLabel(vm.gemini ? vm.name || vm.id : vm.id)}
+        {clipLabel(vm.name || vm.id, 16)}
       </span>
       {plan && plan !== '—' ? (
         <span
@@ -527,14 +599,20 @@ function ProdCell({ vm }: { vm: Vm }) {
       >
         {vm.gemini ? 'CRAGAnti' : crag ? 'crag' : '默认'}
       </span>
+      <NodePoolBadges
+        pools={vm.pools}
+        maxVisible={1}
+        compact
+        className='shrink-0'
+      />
       <span
         className={cn(
           'min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground',
           SEC
         )}
-        title={vm.email || ''}
+        title={email}
       >
-        {vm.email ? clipLabel(vm.email) : '未绑定邮箱'}
+        {email ? formatSlotEmail(email) : '未绑定邮箱'}
       </span>
       <span
         className={cn(
@@ -561,6 +639,7 @@ function ProdCell({ vm }: { vm: Vm }) {
 
 type Agg = {
   n: number
+  gemini: number
   ok: number
   req: number
   today: number
@@ -576,6 +655,7 @@ type Agg = {
 function aggregate(rows: RowData[]): Agg {
   const a: Agg = {
     n: rows.length,
+    gemini: 0,
     ok: 0,
     req: 0,
     today: 0,
@@ -584,10 +664,11 @@ function aggregate(rows: RowData[]): Agg {
     cap: 0,
     queue: 0,
     queued: 0,
-    by: { pool: 0, restricted: 0, off: 0, none: 0, dead: 0 },
+    by: emptyZoneCounts(),
     top: null,
   }
   for (const r of rows) {
+    if (r.vm.gemini) a.gemini++
     a.ok += r.hOk
     a.req += r.hReq
     a.today += r.today
@@ -648,20 +729,31 @@ function Kpi({
 
 function SummaryBar({ a }: { a: Agg }) {
   const pct = aggPct(a)
+  const geminiZones = GEMINI_EVIDENCE_ZONES.filter((z) => a.by[z.key] > 0)
   return (
     <section
       aria-label='全局汇总'
       className='flex flex-wrap gap-y-2 rounded-lg border border-border/60 bg-card py-2'
     >
       <Kpi
-        k='在池'
+        k={a.gemini ? '账号总数' : '在池'}
         v={
-          <>
-            {a.by.pool}
-            <span className='text-muted-foreground'>/{a.n}</span>
-          </>
+          a.gemini ? (
+            a.n
+          ) : (
+            <>
+              {a.by.pool}
+              <span className='text-muted-foreground'>/{a.n}</span>
+            </>
+          )
         }
-        x={`受限 ${a.by.restricted} · 关闭 ${a.by.off} · 未使用 ${a.by.none} · 不可调度 ${a.by.dead}`}
+        x={
+          a.gemini
+            ? a.n === a.gemini
+              ? `Gemini ${a.gemini}`
+              : `Gemini ${a.gemini} · 普通槽 ${a.n - a.gemini}`
+            : `受限 ${a.by.restricted} · 关闭 ${a.by.off} · 未使用 ${a.by.none} · 不可调度 ${a.by.dead}`
+        }
       />
       <Kpi
         k='24h 成功率'
@@ -680,7 +772,7 @@ function SummaryBar({ a }: { a: Agg }) {
         x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
       />
       <Kpi
-        k='席位占用'
+        k='执行位占用'
         v={
           <>
             {a.used}
@@ -695,6 +787,20 @@ function SummaryBar({ a }: { a: Agg }) {
         x={a.queued ? `${a.queued} 台有排队` : '无排队'}
         tone={a.queue ? 'text-[color:var(--status-warn)]' : undefined}
       />
+      {geminiZones.length > 0 ? (
+        <div className='flex w-full flex-wrap items-center gap-x-3 gap-y-1 border-t px-3 pt-2 text-xs'>
+          {geminiZones.map(({ key, label, tone, hint }) => (
+            <span
+              key={key}
+              title={hint}
+              className='inline-flex items-center gap-1.5'
+            >
+              <StatusMark tone={{ key, text: label, cls: tone }} />
+              <b className='font-mono tabular-nums'>{a.by[key]}</b>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </section>
   )
 }
@@ -863,7 +969,7 @@ export function VmTable({
             >
               槽位
             </div>
-            {COLS.map((c) => {
+            {COLS.map((c, i) => {
               const active = sort && c.sort === sort.key
               return (
                 <div
@@ -898,6 +1004,12 @@ export function VmTable({
                         )
                       ) : null}
                     </button>
+                  ) : i === 0 && total.gemini > 0 ? (
+                    total.gemini === total.n ? (
+                      'Gemini 状态'
+                    ) : (
+                      '调度 · 优先级 / Gemini 状态'
+                    )
                   ) : (
                     c.label
                   )}
@@ -952,7 +1064,7 @@ export function VmTable({
                         </b>
                       </span>
                       <span>
-                        席位{' '}
+                        执行位{' '}
                         <b className='font-mono text-foreground'>
                           {sec.agg.used}/{sec.agg.cap}
                         </b>
@@ -970,8 +1082,12 @@ export function VmTable({
                   : sec.rows.map((r) => {
                       const vm = r.vm
                       const open = expanded.has(vm.id)
-                      const label = scheduleStateLabel(vm)
-                      const dim = label === '关'
+                      const label = vm.gemini
+                        ? poolStatus(vm).text
+                        : scheduleStateLabel(vm)
+                      const dim = vm.gemini
+                        ? vm.gemini.auth_state === 'disabled'
+                        : label === '关'
                       const detailId = `vm-row-detail-${vm.id}`
                       const max = claudeTier(vm).key === 'max'
                       return (
@@ -997,7 +1113,9 @@ export function VmTable({
                                 stickyLeft,
                                 'left-0 flex items-center justify-center',
                                 max &&
-                                  'shadow-[inset_2px_0_0_var(--tier-max-border)]'
+                                  'shadow-[inset_2px_0_0_var(--tier-max-border)]',
+                                vm.gemini &&
+                                  'shadow-[inset_2px_0_0_var(--tier-gemini-border)]'
                               )}
                             >
                               <Button
@@ -1034,11 +1152,7 @@ export function VmTable({
                                   dim && i > 0 && 'opacity-50'
                                 )}
                               >
-                                {vm.gemini && i > 0 ? (
-                                  <span className={TERT}>—</span>
-                                ) : (
-                                  c.cell(r, now)
-                                )}
+                                {c.cell(r, now)}
                               </div>
                             ))}
                             <div
@@ -1068,26 +1182,7 @@ export function VmTable({
                               </span>
                             </div>
                           </div>
-                          {open && vm.gemini ? (
-                            <div
-                              id={detailId}
-                              className='flex items-center gap-3 border-b px-4 py-2 text-xs text-muted-foreground'
-                            >
-                              <span>{vm.email || '未提供邮箱'}</span>
-                              <span>
-                                {vm.gemini.account?.plan || '未提供订阅'}
-                              </span>
-                              <ProxyChip vm={vm} compact />
-                              <Button
-                                type='button'
-                                size='sm'
-                                variant='ghost'
-                                onClick={() => actions.openDetail(vm)}
-                              >
-                                管理 Gemini 凭证
-                              </Button>
-                            </div>
-                          ) : open ? (
+                          {open ? (
                             <VmRowDetail
                               id={detailId}
                               vm={vm}

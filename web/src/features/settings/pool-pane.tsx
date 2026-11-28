@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Link } from '@tanstack/react-router'
 import {
   ArrowRightLeft,
   Armchair,
@@ -25,7 +26,17 @@ import { Switch } from '@/components/ui/switch'
 import { SEAT_CAP_MAX, SeatCells } from '@/components/scheduler-viz'
 import { SEAT_CAP_STEPS, withCurrent } from '@/features/vm/scheduling-steps'
 import { PoolLivePanel } from './pool-live-panel'
-import { ChipGroup, SliderSetting, StepperSetting } from './scheduler-controls'
+import {
+  FAILOVER_DEFAULTS,
+  POOL_DEFAULTS,
+  effectiveSeatCap,
+} from './routing-draft'
+import {
+  ChipGroup,
+  FamilyLimitSelect,
+  SliderSetting,
+  StepperSetting,
+} from './scheduler-controls'
 
 type Obj = Record<string, unknown>
 type PoolDialog = 'strategy' | 'seats' | 'queue' | 'retry' | 'circuit'
@@ -39,30 +50,7 @@ type PoolPaneProps = {
   onInferenceChange: (patch: Obj) => void
   saving?: boolean
   pending?: boolean
-}
-
-/** 与后端 DEFAULT_POOL_ROUTING / failover-runner 默认值一致。 */
-const POOL_DEFAULTS = {
-  queue_max: 50,
-  seat_grace_ms: 30000,
-  seat_budget_reserve_pct: 0.02,
-  sticky_wait_timeout_ms: 45000,
-  fallback_wait_timeout_ms: 30000,
-  circuit_failure_threshold: 3,
-  circuit_open_ms: 30000,
-}
-
-const FAILOVER_DEFAULTS = {
-  max_same_account_retries: 1,
-  same_account_retry_delay_ms: 500,
-  max_account_switches: 10,
-  max_total_attempts: 12,
-  total_retry_deadline_ms: 120000,
-  oauth_401_cooldown_ms: 120000,
-  same_account_retry_max_hop_ms: 10000,
-  signature_repair: false,
-  stream_idle_timeout_ms: 180000,
-  eager_tool_streaming: true,
+  pendingCards?: Partial<Record<'strategy' | 'seats' | 'queue', boolean>>
 }
 
 function numOf(source: Obj, key: string, fallback: number): number {
@@ -167,57 +155,6 @@ function StrategyCards({
   )
 }
 
-/** 第 k 个席位要求的余量阶梯：(已开 + 1) × 预留，超过 100% 的席位永远开不出。 */
-function BudgetStairs({
-  reservePct,
-  cap,
-}: {
-  reservePct: number
-  cap: number
-}) {
-  const reachable =
-    reservePct > 0 ? Math.min(cap, Math.floor(100 / reservePct)) : cap
-  return (
-    <div className='space-y-1.5 rounded-md border bg-muted/30 p-2.5'>
-      <div className='flex h-14 items-end gap-[3px]' aria-hidden>
-        {Array.from({ length: cap }, (_, index) => {
-          const need = (index + 1) * reservePct
-          return (
-            <div
-              key={index}
-              title={`第 ${index + 1} 席需余量 ≥ ${need.toFixed(1)}%`}
-              className={cn(
-                'flex-1 rounded-t-[2px]',
-                need > 100
-                  ? 'bg-[color:var(--status-bad-solid)]/70'
-                  : 'bg-primary/60'
-              )}
-              style={{ height: `${Math.max(4, Math.min(100, need))}%` }}
-            />
-          )
-        })}
-      </div>
-      <p className='text-[11px] leading-4 text-muted-foreground'>
-        {reservePct > 0 ? (
-          <>
-            开第 1 席需 5h/7d 余量 ≥ {reservePct.toFixed(1)}%，开满 {cap} 席需 ≥{' '}
-            {(cap * reservePct).toFixed(1)}%
-            {reachable < cap ? (
-              <span className='text-[color:var(--status-bad)]'>
-                {' '}
-                · 第 {reachable + 1} 席起永远开不出
-              </span>
-            ) : null}
-            。余量未知（还没读到 /usage）时放行。
-          </>
-        ) : (
-          '0% = 不看余量，只要席位没满就开。'
-        )}
-      </p>
-    </div>
-  )
-}
-
 function Segment({
   label,
   ms,
@@ -245,31 +182,18 @@ function Segment({
   )
 }
 
-/** 一次请求最长能排多久：有家设备先守原 VM，再进全局；整体被总重试时限截断。 */
+/** 一次请求最长能排多久：家 VM 忙时立即溢出到全局排队；整体被总重试时限截断。 */
 function QueueTimeline({
-  sticky,
   fallback,
   deadline,
 }: {
-  sticky: number
   fallback: number
   deadline: number
 }) {
-  const total = Math.max(sticky + fallback, deadline, 1)
+  const total = Math.max(fallback, deadline, 1)
   const lanes: { title: string; segments: [string, number, string][] }[] = [
     {
-      title: '回头设备（已有家 VM）',
-      segments: [
-        ['守原 VM', sticky, 'bg-primary/80 text-primary-foreground'],
-        [
-          '全局排队',
-          fallback,
-          'bg-[color:var(--status-caution-solid)] text-white',
-        ],
-      ],
-    },
-    {
-      title: '新设备',
+      title: '排队请求',
       segments: [
         [
           '全局排队',
@@ -349,7 +273,7 @@ function CircuitFlow({
             <span className='text-[10px]'>+{threshold - 10}</span>
           ) : null}
         </span>,
-        `连续 ${threshold} 次 5xx`,
+        `连续 ${threshold} 次 400/403/5xx`,
         '529 / 401 不计'
       )}
       {arrow}
@@ -426,27 +350,16 @@ export function PoolPane({
   onInferenceChange,
   saving = false,
   pending = false,
+  pendingCards,
 }: PoolPaneProps) {
   const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
   const resetPriority = pool.reset_priority !== false
-  const seatCap = Math.min(
+  const physicalSlots = Math.min(
     SEAT_CAP_MAX,
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
   )
+  const seatCap = effectiveSeatCap(pool, inference)
   const queueMax = numOf(pool, 'queue_max', POOL_DEFAULTS.queue_max)
-  const reservePct =
-    Math.round(
-      numOf(
-        pool,
-        'seat_budget_reserve_pct',
-        POOL_DEFAULTS.seat_budget_reserve_pct
-      ) * 1000
-    ) / 10
-  const sticky = numOf(
-    pool,
-    'sticky_wait_timeout_ms',
-    POOL_DEFAULTS.sticky_wait_timeout_ms
-  )
   const fallbackWait = numOf(
     pool,
     'fallback_wait_timeout_ms',
@@ -508,13 +421,12 @@ export function PoolPane({
         prewarm_enabled: inferenceDraft.prewarm_enabled === true,
       })
       onPoolChange({
-        seat_grace_ms: poolDraft.seat_grace_ms,
-        seat_budget_reserve_pct: poolDraft.seat_budget_reserve_pct,
+        max_primary_sessions: poolDraft.max_primary_sessions ?? null,
+        max_subagents_per_session: poolDraft.max_subagents_per_session ?? null,
       })
     } else if (open === 'queue') {
       onPoolChange({
         queue_max: poolDraft.queue_max,
-        sticky_wait_timeout_ms: poolDraft.sticky_wait_timeout_ms,
         fallback_wait_timeout_ms: poolDraft.fallback_wait_timeout_ms,
       })
     } else if (open === 'retry') {
@@ -564,7 +476,7 @@ export function PoolPane({
           title='分配策略'
           value={`${strategy === 'fill' ? '填充' : '平衡'}${resetPriority ? ' · 临近重置优先' : ''}`}
           desc='Claude 新 session 开席的优先顺序'
-          pending={pending}
+          pending={pendingCards ? !!pendingCards.strategy : pending}
           disabled={saving}
           buttonRef={(node) => {
             triggerRefs.current.strategy = node
@@ -575,8 +487,8 @@ export function PoolPane({
           icon={Armchair}
           title='席位容量'
           value={`${seatCap} 席 / VM`}
-          desc={`对话结束即释放 · 预算预留 ${reservePct}%`}
-          pending={pending}
+          desc='对话结束即释放'
+          pending={pendingCards ? !!pendingCards.seats : pending}
           disabled={saving}
           buttonRef={(node) => {
             triggerRefs.current.seats = node
@@ -586,9 +498,9 @@ export function PoolPane({
         <SummaryButton
           icon={Hourglass}
           title='排队等待'
-          value={`${queueMax} 个 · ${fmtDuration(Math.max(sticky, fallbackWait))}`}
-          desc={`粘性 ${fmtDuration(sticky)} · 全局 ${fmtDuration(fallbackWait)}`}
-          pending={pending}
+          value={`${queueMax} 个 · ${fmtDuration(fallbackWait)}`}
+          desc={`全局 ${fmtDuration(fallbackWait)}`}
+          pending={pendingCards ? !!pendingCards.queue : pending}
           disabled={saving}
           buttonRef={(node) => {
             triggerRefs.current.queue = node
@@ -620,18 +532,19 @@ export function PoolPane({
         >
           <ShieldAlert className='size-3.5' aria-hidden /> 故障保护
         </button>
-        <a
+        <Link
           className='inline-flex min-h-11 items-center gap-1 text-primary hover:underline'
-          href='/console/#/vm'
+          to='/vm'
         >
           <Link2 className='size-3.5' aria-hidden /> 账号优先级 · VM 调度
-        </a>
-        <a
+        </Link>
+        <Link
           className='inline-flex min-h-11 items-center gap-1 text-primary hover:underline'
-          href='/console/#/settings/sticky'
+          to='/settings/$tab'
+          params={{ tab: 'sticky' }}
         >
           <Link2 className='size-3.5' aria-hidden /> 粘性设置
-        </a>
+        </Link>
       </div>
       <Dialog
         open={open !== null}
@@ -694,7 +607,7 @@ export function PoolPane({
                         value,
                         String(value),
                       ]),
-                      seatCap
+                      physicalSlots
                     )}
                     onChange={(value) =>
                       updateDraft('inference', { session_slots: value })
@@ -709,6 +622,38 @@ export function PoolPane({
                         numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
                       )
                     )}
+                  />
+                </div>
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <Label>主会话上限</Label>
+                  <FamilyLimitSelect
+                    label='主会话上限'
+                    min={1}
+                    emptyText='跟随 VM 物理席位上限'
+                    value={
+                      typeof poolDraft.max_primary_sessions === 'number'
+                        ? poolDraft.max_primary_sessions
+                        : null
+                    }
+                    onChange={(value) =>
+                      updateDraft('pool', { max_primary_sessions: value })
+                    }
+                  />
+                </div>
+                <div className='flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2.5'>
+                  <Label>每会话子代理上限</Label>
+                  <FamilyLimitSelect
+                    label='每会话子代理上限'
+                    min={0}
+                    emptyText='关闭(子代理各占一个执行位)'
+                    value={
+                      typeof poolDraft.max_subagents_per_session === 'number'
+                        ? poolDraft.max_subagents_per_session
+                        : null
+                    }
+                    onChange={(value) =>
+                      updateDraft('pool', { max_subagents_per_session: value })
+                    }
                   />
                 </div>
                 <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
@@ -727,60 +672,6 @@ export function PoolPane({
                     }
                   />
                 </div>
-                <SliderSetting
-                  id='pool-seat-grace'
-                  label='旧席位宽限（不再释放槽位）'
-                  value={numOf(
-                    poolDraft,
-                    'seat_grace_ms',
-                    POOL_DEFAULTS.seat_grace_ms
-                  )}
-                  min={0}
-                  max={120000}
-                  step={5000}
-                  format={(ms) => (ms ? fmtDuration(ms) : '不保留')}
-                  fallback={POOL_DEFAULTS.seat_grace_ms}
-                  presets={[0, 10000, 30000, 60000, 120000]}
-                  onChange={(ms) => updateDraft('pool', { seat_grace_ms: ms })}
-                />
-                <SliderSetting
-                  id='pool-seat-reserve'
-                  label='每席位预算预留'
-                  value={
-                    numOf(
-                      poolDraft,
-                      'seat_budget_reserve_pct',
-                      POOL_DEFAULTS.seat_budget_reserve_pct
-                    ) * 100
-                  }
-                  min={0}
-                  max={50}
-                  step={0.5}
-                  format={(value) => `${value}%`}
-                  fallback={POOL_DEFAULTS.seat_budget_reserve_pct * 100}
-                  presets={[0, 1, 2, 5, 10]}
-                  onChange={(value) =>
-                    updateDraft('pool', {
-                      seat_budget_reserve_pct: Math.round(value * 10) / 1000,
-                    })
-                  }
-                />
-                <BudgetStairs
-                  reservePct={
-                    numOf(
-                      poolDraft,
-                      'seat_budget_reserve_pct',
-                      POOL_DEFAULTS.seat_budget_reserve_pct
-                    ) * 100
-                  }
-                  cap={Math.min(
-                    SEAT_CAP_MAX,
-                    Math.max(
-                      1,
-                      numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
-                    )
-                  )}
-                />
               </>
             ) : null}
             {open === 'queue' ? (
@@ -796,26 +687,6 @@ export function PoolPane({
                   presets={[10, 20, 50, 100, 200, 500]}
                   onChange={(value) =>
                     updateDraft('pool', { queue_max: value })
-                  }
-                />
-                <SliderSetting
-                  id='pool-sticky-wait'
-                  label='粘性等待'
-                  value={numOf(
-                    poolDraft,
-                    'sticky_wait_timeout_ms',
-                    POOL_DEFAULTS.sticky_wait_timeout_ms
-                  )}
-                  min={1000}
-                  max={120000}
-                  step={1000}
-                  format={fmtDuration}
-                  fallback={POOL_DEFAULTS.sticky_wait_timeout_ms}
-                  presets={[15000, 30000, 45000, 60000, 120000]}
-                  onChange={(value) =>
-                    updateDraft('pool', {
-                      sticky_wait_timeout_ms: value,
-                    })
                   }
                 />
                 <SliderSetting
@@ -839,11 +710,6 @@ export function PoolPane({
                   }
                 />
                 <QueueTimeline
-                  sticky={numOf(
-                    poolDraft,
-                    'sticky_wait_timeout_ms',
-                    POOL_DEFAULTS.sticky_wait_timeout_ms
-                  )}
                   fallback={numOf(
                     poolDraft,
                     'fallback_wait_timeout_ms',

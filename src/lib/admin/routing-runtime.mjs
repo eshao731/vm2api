@@ -24,8 +24,9 @@ import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
+import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
-import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
+import { PoolScheduler, normalizePoolRouting, validateQuotaRoutingPatch } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
@@ -34,10 +35,11 @@ import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
 import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
+import { normalizeWarmupConfig } from '../pool/account-warmup.mjs'
 import { mergeNotifyConfig, validateNotifyRoutingPatch } from './notify.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { ensureRedaction } from '../redaction/runtime.mjs'
-import { normalizeLoggingConfig } from './request-log.mjs'
+import { normalizeLoggingConfig, validateLoggingRoutingPatch } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
 import {
@@ -45,6 +47,8 @@ import {
   normalizeInferenceWebsocket,
   validateInferenceWebsocketPatch,
 } from '../protocol/codex-route.mjs'
+import { mergeGeminiRouting, normalizeGeminiRouting, validateGeminiRoutingPatch } from '../gemini/routing-config.mjs'
+import { callGeminiHost } from '../gemini/routes.mjs'
 import {
   validateOpenAIQuotaPatch,
   mergeOpenAIQuotaPolicy,
@@ -60,8 +64,15 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { normalizeCragZombieGuardConfig } from '../vm/crag-zombie-guard.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
-import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  telemetryUploadInterval,
+} from '../vm/native-telemetry.mjs'
+
+const GEMINI_UNIT_PREFIX = 'gemini:'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -76,6 +87,8 @@ export function createRoutingRuntime(ctx) {
   }
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
+  const getWarmup = () => ctx.warmupMonitor
+  const getCragZombieGuard = () => ctx.cragZombieGuard
   const getNotify = () => ctx.notifyMonitor
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
@@ -365,13 +378,69 @@ export function createRoutingRuntime(ctx) {
 
   function applyHealthProbeRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.health_probe == null) return
-    const prev = previous && typeof previous === 'object' ? previous : {}
+    const prev = normalizeHealthProbeConfig(previous && typeof previous === 'object' ? previous : {})
     const next = body.health_probe && typeof body.health_probe === 'object' ? body.health_probe : {}
     const routingConfig = getRouting()
+
+    const hasNextAnthropic = next.anthropic && typeof next.anthropic === 'object'
+    const hasNextOpenai = next.openai && typeof next.openai === 'object'
+    const hasNextGoogle = next.google && typeof next.google === 'object'
+    const hasNextReal = next.real && typeof next.real === 'object'
+    const hasNextGemini = next.gemini && typeof next.gemini === 'object'
+
+    const nextAnthropic = { ...prev.anthropic, ...(hasNextAnthropic ? next.anthropic : {}) }
+    const nextOpenai = { ...prev.openai, ...(hasNextOpenai ? next.openai : {}) }
+    const nextGoogle = { ...prev.google, ...(hasNextGoogle ? next.google : {}) }
+
+    if (!hasNextAnthropic) {
+      if (Object.prototype.hasOwnProperty.call(next, 'interval_sec')) nextAnthropic.interval_sec = next.interval_sec
+      if (Object.prototype.hasOwnProperty.call(next, 'cache_ttl_sec')) nextAnthropic.cache_ttl_sec = next.cache_ttl_sec
+      else if (Object.prototype.hasOwnProperty.call(next, 'max_stale_sec'))
+        nextAnthropic.cache_ttl_sec = next.max_stale_sec
+      if (Object.prototype.hasOwnProperty.call(next, 'probe_all_slots'))
+        nextAnthropic.probe_all_slots = next.probe_all_slots
+      if (hasNextReal) {
+        if (Object.prototype.hasOwnProperty.call(next.real, 'model')) {
+          nextAnthropic.models = next.real.model ? [next.real.model] : []
+        }
+        for (const k of ['prompt', 'max_tokens', 'timeout_ms', 'outbound_mode', 'vm_ids']) {
+          if (Object.prototype.hasOwnProperty.call(next.real, k)) nextAnthropic[k] = next.real[k]
+        }
+      }
+      if (!hasNextOpenai && !hasNextGoogle && Object.prototype.hasOwnProperty.call(next, 'enabled')) {
+        nextAnthropic.enabled = next.enabled
+      }
+    }
+
+    if (!hasNextOpenai && hasNextReal) {
+      if (Object.prototype.hasOwnProperty.call(next.real, 'openai_model')) {
+        nextOpenai.models = next.real.openai_model ? [next.real.openai_model] : []
+        if (!hasNextAnthropic && !hasNextGoogle && nextAnthropic.enabled) {
+          nextOpenai.enabled = nextOpenai.models.length > 0
+        }
+      }
+      for (const k of ['prompt', 'max_tokens', 'timeout_ms', 'vm_ids']) {
+        if (Object.prototype.hasOwnProperty.call(next.real, k)) nextOpenai[k] = next.real[k]
+      }
+    }
+
+    if (!hasNextGoogle && hasNextGemini) {
+      for (const k of ['enabled', 'interval_sec', 'cache_ttl_sec', 'all_models', 'prompt', 'timeout_ms']) {
+        if (Object.prototype.hasOwnProperty.call(next.gemini, k)) nextGoogle[k] = next.gemini[k]
+      }
+      if (Object.prototype.hasOwnProperty.call(next.gemini, 'models')) {
+        nextGoogle.models = next.gemini.models
+      } else if (Object.prototype.hasOwnProperty.call(next.gemini, 'model')) {
+        nextGoogle.models = next.gemini.model ? [next.gemini.model] : []
+      }
+    }
+
     routingConfig.health_probe = normalizeHealthProbeConfig({
       ...prev,
       ...next,
-      real: { ...(prev.real || {}), ...(next.real || {}) },
+      anthropic: nextAnthropic,
+      openai: nextOpenai,
+      google: nextGoogle,
       match: { ...(prev.match || {}), ...(next.match || {}) },
     })
     getHealth()?.setConfig(routingConfig.health_probe)
@@ -387,6 +456,26 @@ export function createRoutingRuntime(ctx) {
     getUsage()?.setConfig(routingConfig.usage_probe)
   }
 
+  function applyWarmupRoutingBody(body, previous = null) {
+    if (!body || typeof body !== 'object' || body.warmup == null) return
+    const routingConfig = getRouting()
+    routingConfig.warmup = normalizeWarmupConfig({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...(body.warmup && typeof body.warmup === 'object' ? body.warmup : {}),
+    })
+    getWarmup()?.setConfig(routingConfig.warmup)
+  }
+
+  function applyCragZombieGuardRoutingBody(body, previous = null) {
+    if (!body || typeof body !== 'object' || body.crag_zombie_guard == null) return
+    const routingConfig = getRouting()
+    routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...(body.crag_zombie_guard && typeof body.crag_zombie_guard === 'object' ? body.crag_zombie_guard : {}),
+    })
+    getCragZombieGuard()?.setConfig(routingConfig.crag_zombie_guard)
+  }
+
   function applyNotifyRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.notify == null) return
     const routingConfig = getRouting()
@@ -399,6 +488,7 @@ export function createRoutingRuntime(ctx) {
     return (
       Object.prototype.hasOwnProperty.call(compatibility, 'cache_ttl') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'persona_preset') ||
+      Object.prototype.hasOwnProperty.call(compatibility, 'crag_persona_preset') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'cch_enabled') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'cc_entrypoint')
     )
@@ -444,11 +534,12 @@ export function createRoutingRuntime(ctx) {
   // Native slots hot-read kernel.json; publication must be acknowledged per VM.
   async function syncTelemetryUploadInterval(
     routingConfig,
-    { defaultEnabled = false, prevDefaultEnabled = false } = {},
+    { defaultEnabled = false, prevDefaultEnabled = false, disableNonessentialChanged = false } = {},
   ) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
     const optIn = defaultEnabled === true && prevDefaultEnabled !== true
+    let optedIn = 0
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
@@ -458,8 +549,9 @@ export function createRoutingRuntime(ctx) {
         fresh.seed_policy = { ...(fresh.seed_policy || {}), telemetry_disabled: false }
         fresh.updated_at = new Date().toISOString()
         atomicWriteJson(vmPath, fresh, { mode: 0o600 })
+        optedIn += 1
       }
-      if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn) {
+      if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn && !disableNonessentialChanged) {
         applied.skipped += 1
         continue
       }
@@ -484,6 +576,7 @@ export function createRoutingRuntime(ctx) {
         applied.failed.push(vm.id)
       }
     }
+    if (optIn) applied.opted_in = optedIn
     return applied
   }
 
@@ -492,29 +585,44 @@ export function createRoutingRuntime(ctx) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    validateGeminiRoutingPatch(body)
+    validateQuotaRoutingPatch(body, getRouting()?.quota)
+    validateLoggingRoutingPatch(body, getRouting()?.logging)
     let nextRedaction = null
     if (body.redaction !== undefined) {
-      nextRedaction = normalizeRedaction(body.redaction)
-      if (nextRedaction.enabled) {
-        await ensureRedaction({ ...getRouting(), redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+      nextRedaction = normalizeRedaction(body.redaction, { strict: true })
+      const effectiveRouting = {
+        ...getRouting(),
+        ...(body.failover ? { failover: { ...(getRouting()?.failover || {}), ...body.failover } } : {}),
+        redaction: nextRedaction,
       }
+      await ensureRedaction(effectiveRouting, { projectRoot: ctx.cfg.paths.project })
     }
     let routingConfig = getRouting()
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
     const prevUsageProbe = routingConfig.usage_probe
+    const prevWarmup = routingConfig.warmup
+    const prevCragZombieGuard = routingConfig.crag_zombie_guard
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
     const prevRequestBytes = maxRequestBytes(routingConfig)
     const prevUploadInterval = telemetryUploadInterval(routingConfig)
     const prevDefaultEnabled = telemetryDefaultEnabled(routingConfig)
+    const prevDisableNonessential = telemetryDisableNonessentialTraffic(routingConfig)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
       routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
+    }
+    if (body.batch_group && typeof body.batch_group === 'object' && !Array.isArray(body.batch_group)) {
+      routingConfig.batch_group = mergeBatchGroupConfig({
+        ...(routingConfig.batch_group || {}),
+        ...body.batch_group,
+      })
     }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
     if (body.inference) {
@@ -528,6 +636,20 @@ export function createRoutingRuntime(ctx) {
       routingConfig.compatibility = { ...(routingConfig.compatibility || {}), ...body.compatibility }
       delete routingConfig.compatibility.persona_rules
       delete routingConfig.compatibility.persona_leak_append
+      // Unified SSOT: saving persona_preset retires stale crag_persona_preset drift.
+      if (
+        Object.prototype.hasOwnProperty.call(body.compatibility, 'persona_preset') &&
+        !Object.prototype.hasOwnProperty.call(body.compatibility, 'crag_persona_preset')
+      ) {
+        delete routingConfig.compatibility.crag_persona_preset
+      } else if (
+        !Object.prototype.hasOwnProperty.call(body.compatibility, 'persona_preset') &&
+        Object.prototype.hasOwnProperty.call(body.compatibility, 'crag_persona_preset') &&
+        String(body.compatibility.crag_persona_preset || '').trim() !== ''
+      ) {
+        routingConfig.compatibility.persona_preset = body.compatibility.crag_persona_preset
+        delete routingConfig.compatibility.crag_persona_preset
+      }
       if (
         Object.prototype.hasOwnProperty.call(body.compatibility, 'cch_enabled') ||
         routingConfig.compatibility.cch_enabled == null
@@ -548,6 +670,9 @@ export function createRoutingRuntime(ctx) {
       }
       routingConfig.codex = normalizeCodexRouting(nextCodex)
     }
+    if (body.gemini) {
+      routingConfig.gemini = mergeGeminiRouting(routingConfig.gemini, body.gemini)
+    }
     if (body.vm) {
       const prev = routingConfig.vm && typeof routingConfig.vm === 'object' ? routingConfig.vm : {}
       const next = { ...prev, ...body.vm }
@@ -564,11 +689,16 @@ export function createRoutingRuntime(ctx) {
       if (Object.hasOwn(body.telemetry, 'default_enabled')) {
         nextTelemetry.default_enabled = body.telemetry.default_enabled === true
       }
+      if (Object.hasOwn(body.telemetry, 'disable_nonessential_traffic')) {
+        nextTelemetry.disable_nonessential_traffic = body.telemetry.disable_nonessential_traffic === true
+      }
       routingConfig.telemetry = nextTelemetry
     }
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
+    applyWarmupRoutingBody(body, prevWarmup)
+    applyCragZombieGuardRoutingBody(body, prevCragZombieGuard)
     applyNotifyRoutingBody(body, prevNotify)
     routingConfig.tiers = normalizeTiers(
       body.tiers ? mergeTierMaps(prevTiers, body.tiers) : prevTiers,
@@ -611,16 +741,41 @@ export function createRoutingRuntime(ctx) {
         ? reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly: !requestBytesChanged })
         : 0
     const defaultEnabled = telemetryDefaultEnabled(routingConfig)
+    const disableNonessential = telemetryDisableNonessentialTraffic(routingConfig)
+    const disableNonessentialChanged = disableNonessential !== prevDisableNonessential
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval || defaultEnabled !== prevDefaultEnabled
-        ? await syncTelemetryUploadInterval(routingConfig, { defaultEnabled, prevDefaultEnabled })
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval ||
+      defaultEnabled !== prevDefaultEnabled ||
+      disableNonessentialChanged
+        ? await syncTelemetryUploadInterval(routingConfig, {
+            defaultEnabled,
+            prevDefaultEnabled,
+            disableNonessentialChanged,
+          })
         : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).
-    if (body.pool) configureUnitCircuit(routingConfig)
+    if (body.pool || body.gemini) configureUnitCircuit(routingConfig)
     if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
     const kernelReload = await reloadNeeded
+    let geminiSync = null
+    if (body.gemini) {
+      const hostCaller = ctx.callGeminiHost || callGeminiHost
+      try {
+        const res = await hostCaller('apply-policy', { policy: routingConfig.gemini })
+        geminiSync = {
+          ok: true,
+          shards_updated: Number(res?.shards_updated || 0),
+          shards_total: Number(res?.shards_total || 0),
+        }
+      } catch (error) {
+        geminiSync = {
+          ok: false,
+          code: error?.code || 'gemini_host_unavailable',
+        }
+      }
+    }
     try {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
@@ -632,6 +787,7 @@ export function createRoutingRuntime(ctx) {
         kernel_persona: kernelPersona,
         kernel_reload: kernelReload,
         telemetry_sync: telemetrySync,
+        gemini_sync: geminiSync,
       }
     } catch (err) {
       console.error(
@@ -646,6 +802,7 @@ export function createRoutingRuntime(ctx) {
         kernel_persona: kernelPersona,
         kernel_reload: kernelReload,
         telemetry_sync: telemetrySync,
+        gemini_sync: geminiSync,
       }
     }
   }
@@ -666,9 +823,11 @@ export function createRoutingRuntime(ctx) {
       const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.websocket = normalizeInferenceWebsocket(doc.websocket)
       doc.codex = normalizeCodexRouting(doc.codex)
+      doc.gemini = normalizeGeminiRouting(doc.gemini)
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.batch_group != null) doc.batch_group = mergeBatchGroupConfig(doc.batch_group)
       if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {
@@ -758,6 +917,13 @@ export function createRoutingRuntime(ctx) {
     unitCircuit.configure({
       failureThreshold: routingConfig.pool?.circuit_failure_threshold,
       openMs: routingConfig.pool?.circuit_open_ms,
+    })
+    // Gemini environments share the singleton under `gemini:<id>` but follow
+    // gemini.pool.circuit_*, the same values the host hands the CRAGGemini kernel.
+    const geminiPool = normalizeGeminiRouting(routingConfig.gemini).pool
+    unitCircuit.configureScope(GEMINI_UNIT_PREFIX, {
+      failureThreshold: geminiPool.circuit_failure_threshold,
+      openMs: geminiPool.circuit_open_ms,
     })
   }
 
@@ -868,6 +1034,7 @@ export function createRoutingRuntime(ctx) {
     applyOfficialCcRoutingBody,
     applyHealthProbeRoutingBody,
     applyUsageProbeRoutingBody,
+    applyWarmupRoutingBody,
     applyNotifyRoutingBody,
     applyRoutingConcurrency,
     applyRoutingTierConcurrency,

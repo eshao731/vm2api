@@ -5,7 +5,8 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { withVmLock } from '../vm/vm-file.mjs'
+import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
+import { normalizeWarmupConfig, startWarmup } from '../pool/account-warmup.mjs'
 import {
   adoptVmProxyBinding,
   bindVmProxy,
@@ -115,12 +116,22 @@ export function createImportCommit(ctx) {
   }
 
   function officialCcStatsHandler(vmId, accountUuid = null) {
+    const startedAt = Date.now()
+    const initialAccountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
+    const resetGenerations = ctx.accountQuota?.resetGenerations?.(initialAccountId) || null
     return (stats) => {
       if (stats?.subscription_type) persistVmSubscription(ctx.cfg.paths.project, vmId, stats, { accountUuid })
       const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {
-          ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
+          ctx.accountQuota.ingestOAuthUsage(
+            accountId,
+            { usage_status: 200, ok: true, ...stats },
+            {
+              startedAt,
+              ...(accountId === initialAccountId && resetGenerations ? { resetGenerations } : {}),
+            },
+          )
         } catch {}
       }
       if (
@@ -225,6 +236,8 @@ export function createImportCommit(ctx) {
         },
       }
     }
+    let warmupStarted = false
+    const prevUuid = existing.claude?.account_uuid || null
     await withVmLock(vmPath, () => {
       const mode = importedCredential.mode || credentialModeFromOauth(oauth)
       const setupRegistration =
@@ -250,6 +263,24 @@ export function createImportCommit(ctx) {
       try {
         rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
       } catch {}
+      // Warm-up onboarding: a fresh or swapped Claude account starts (or restarts)
+      // the rpm ramp when routing.warmup.enabled is true. Same-account credential
+      // refreshes (nextUuid === prevUuid) leave an in-flight warm-up untouched.
+      try {
+        const warmupCfg = normalizeWarmupConfig(routing()?.warmup)
+        const nextUuid = importedCredential.account_uuid || null
+        if (warmupCfg.enabled && nextUuid && nextUuid !== prevUuid && !isCodexVm(existing)) {
+          const vmRecord = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          startWarmup(vmRecord, { targetRpm: warmupCfg.target_rpm, config: warmupCfg })
+          atomicWriteJson(vmPath, vmRecord, { mode: 0o600 })
+          if (typeof ctx.accountQuota?.setMaxRpm === 'function') {
+            ctx.accountQuota.setMaxRpm(nextUuid, warmupCfg.target_rpm, { override: true })
+          } else {
+            ctx.accountQuota?.setMaxRpmForVm?.(vmId, warmupCfg.target_rpm, { override: true })
+          }
+          warmupStarted = true
+        }
+      } catch {}
       const refreshed = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
       if (name && refreshed.name !== name) {
         const written = patchVmRecord(ctx.cfg.paths.project, vmId, { name })
@@ -258,6 +289,12 @@ export function createImportCommit(ctx) {
         Object.assign(existing, refreshed)
       }
     })
+    if (warmupStarted) {
+      try {
+        const rt = typeof ctx.getSchedulerRuntime === 'function' ? ctx.getSchedulerRuntime() : ctx.schedulerRuntime
+        await rt?.syncConfigNow?.('warmup_start')
+      } catch {}
+    }
     const clientSync = await syncClaudeClientCredentials(workerExec)
     if (!clientSync.ok) return clientSync
     const mode = importedCredential.mode || credentialModeFromOauth(oauth)

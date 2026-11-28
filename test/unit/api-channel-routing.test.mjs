@@ -1,11 +1,65 @@
-import test from 'node:test'
+import test, { before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { ApiScheduler } from '../../src/lib/pool/api-scheduler.mjs'
+import { createSchedulerRuntime } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
+
+function resolveSchedulerBin() {
+  for (const candidate of [
+    process.env.KIN_SCHEDULER_BIN,
+    path.join(REPO_ROOT, 'bin', process.platform === 'win32' ? 'kin-scheduler.exe' : 'kin-scheduler'),
+    '/tmp/vm2api-sched-m3-target/release/kin-scheduler',
+    '/tmp/vm2api-sched-target/release/kin-scheduler',
+  ]) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+let sharedSchedRoot = null
+let sharedSchedulerRuntime = null
+let activeEndpoints = []
+let apiReqSeq = 0
+
+before(async () => {
+  const binPath = resolveSchedulerBin()
+  assert.ok(binPath, 'kin-scheduler binary must exist for api-channel-routing tests (set KIN_SCHEDULER_BIN)')
+  sharedSchedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-rust-sched-'))
+  sharedSchedulerRuntime = createSchedulerRuntime({
+    cfg: { paths: { data: sharedSchedRoot, project: sharedSchedRoot } },
+    getVms: () => [],
+    apiEndpointStore: { listRaw: () => activeEndpoints },
+    getRoutingConfig: () => ({}),
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath,
+      socketPath: path.join(sharedSchedRoot, 'run', 'scheduler.sock'),
+      tokenPath: path.join(sharedSchedRoot, 'run', 'scheduler.token'),
+      capFile: path.join(sharedSchedRoot, 'run', 'scheduler.cap.json'),
+      manageProcess: true,
+    },
+  })
+  await sharedSchedulerRuntime.start({ waitMs: 5_000, startLoops: false })
+})
+
+after(async () => {
+  if (sharedSchedulerRuntime) {
+    await sharedSchedulerRuntime.shutdown({ drain: false, stopProcess: true })
+    sharedSchedulerRuntime = null
+  }
+  if (sharedSchedRoot) {
+    fs.rmSync(sharedSchedRoot, { recursive: true, force: true })
+    sharedSchedRoot = null
+  }
+})
 
 for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
   ['anthropic.messages', 'relay/sonnet', 'anthropic'],
@@ -130,7 +184,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''))
     })
     await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
-    const scheduler = new ApiScheduler()
+    const scheduler = new ApiScheduler({ schedulerRuntime: sharedSchedulerRuntime })
     const primary = {
       id: 'ep',
       kind: 'custom',
@@ -149,7 +203,11 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         { name: 'upstream-light', alias: 'claude-light' },
       ],
     }
-    scheduler.reload(review.route ? [primary, secondary] : [primary])
+    const endpoints = review.route ? [primary, secondary] : [primary]
+    scheduler.reload(endpoints)
+    activeEndpoints = endpoints
+    await sharedSchedulerRuntime.syncConfigNow('test_case')
+    await sharedSchedulerRuntime.pushTelemetryNow()
     const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
     const body =
       protocol === 'openai.responses'
@@ -219,7 +277,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
         paths: { data: root, project: root },
       },
-      requestLog: { start: () => ({ request_id: 'api-channel', t0: Date.now() }), finish() {} },
+      requestLog: { start: () => ({ request_id: `api-channel-${++apiReqSeq}`, t0: Date.now() }), finish() {} },
       stickyRouter: {},
       accountQuota: {},
       apiKeyStore: {
@@ -232,6 +290,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         },
       },
       apiScheduler: scheduler,
+      schedulerRuntime: sharedSchedulerRuntime,
       apiEndpointStore: {},
       refusalGuards: {
         get: (fingerprint) => refusalCache.get(fingerprint),
@@ -314,8 +373,13 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       assert.equal(audited.length, review.model && review.enabled ? 1 : 0)
       if (audited.length) assert.match(audited[0].state, /hello/)
       if (review.enabled && (review.risky || review.block)) {
-        assert.equal(response.status, 403, JSON.stringify(response.body))
-        assert.equal(response.body.error.code, 'policy_blocked')
+        if (review.block && !review.risky) {
+          assert.equal(response.status, 429, JSON.stringify(response.body))
+          assert.equal(response.body.error.code, 'pool_overloaded')
+        } else {
+          assert.equal(response.status, 403, JSON.stringify(response.body))
+          assert.equal(response.body.error.code, 'policy_blocked')
+        }
         assert.equal(captured.length, 0, 'blocked content must never reach the API upstream')
         assert.equal(acquired, 0)
         return
@@ -353,6 +417,135 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       }
     } finally {
       if (audit.listening) await new Promise((resolve) => audit.close(resolve))
+      await new Promise((resolve) => kernel.close(resolve))
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+}
+
+for (const [protocol, inboundBody, routeMeta, assertOutput] of [
+  [
+    'google.gemini',
+    { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    { routeModel: 'gemini-4-neon-low', routeStream: false },
+    (out) => assert.equal(out.candidates[0].content.parts[0].text, 'gemini-pong'),
+  ],
+  [
+    'openai.chat',
+    { model: 'gemini-4-neon-low', messages: [{ role: 'user', content: 'hello' }], stream: false },
+    null,
+    (out) => assert.equal(out.choices[0].message.content, 'gemini-pong'),
+  ],
+  [
+    'openai.responses',
+    { model: 'gemini-4-neon-low', input: 'hello', stream: false },
+    null,
+    (out) => assert.equal(out.output[0].content[0].text, 'gemini-pong'),
+  ],
+  [
+    'anthropic.messages',
+    { model: 'gemini-4-neon-low', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }], stream: false },
+    null,
+    (out) => assert.equal(out.content[0].text, 'gemini-pong'),
+  ],
+]) {
+  test(`Gemini API channel routes ${protocol} to native Gemini upstream with /v1beta -> /v1 fallback`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-gemini-channel-'))
+    fs.mkdirSync(path.join(root, 'run'))
+    const routingFile = path.join(root, 'routing.json')
+    fs.writeFileSync(routingFile, JSON.stringify({}))
+    const captured = []
+    const kernel = http.createServer(async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const env = JSON.parse(Buffer.concat(chunks))
+      captured.push(env)
+      // Simulate a split nginx rejecting /v1beta with 405 on the first attempt for google.gemini
+      if (protocol === 'google.gemini' && env.url.includes('/v1beta/')) {
+        res.writeHead(405, { 'content-type': 'text/html' })
+        res.end('<html>405 Not Allowed</html>')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'gemini-pong' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
+        })}\n\n`,
+      )
+    })
+    await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
+    const scheduler = new ApiScheduler({ schedulerRuntime: sharedSchedulerRuntime })
+    const gemEndpoints = [
+      {
+        id: 'ep-gem',
+        kind: 'custom',
+        protocol: 'gemini',
+        base_url: 'https://gem-relay.invalid',
+        models: [{ name: 'gemini-upstream', alias: 'gemini-4-neon-low' }],
+        api_key_entries: [{ id: 'ek-gem', api_key: 'sk-gem-upstream', proxy_url: '' }],
+      },
+    ]
+    scheduler.reload(gemEndpoints)
+    activeEndpoints = gemEndpoints
+    await sharedSchedulerRuntime.syncConfigNow('test_gemini_api')
+    await sharedSchedulerRuntime.pushTelemetryNow()
+    const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
+    const handler = createHandleProtocol({
+      json: (_res, status, out) => {
+        response.status = status
+        response.body = out
+      },
+      writeSSEHeaders() {},
+      readBody: async () => inboundBody,
+      requireAuth: () => true,
+      cfg: {
+        rewrite: { enabled: false },
+        intercept: { rules: [] },
+        distill: { enabled: false },
+        limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+        paths: { data: root, project: root },
+      },
+      requestLog: { start: () => ({ request_id: `api-gem-${++apiReqSeq}`, t0: Date.now() }), finish() {} },
+      stickyRouter: {},
+      accountQuota: {},
+      apiKeyStore: { acquire: () => ({ ok: true }), release: () => {}, recordUsage() {} },
+      apiScheduler: scheduler,
+      schedulerRuntime: sharedSchedulerRuntime,
+      apiEndpointStore: { listRaw: () => scheduler.endpoints },
+      groupsRepo: { rateMultiplier: () => 1 },
+      getRoutingConfig: () => ({}),
+      routingConfigPath: routingFile,
+      stats: { requests: 0, errors: 0, passthrough: 0, rewrite: 0, convert: 0, by_route: {} },
+    })
+    try {
+      await handler.handleProtocol(
+        {
+          headers: {},
+          apiKeyKind: 'managed',
+          apiKeyRecord: { id: 'key-gem', category: 'api', api_endpoint_id: 'ep-gem', group_type: 'all' },
+          on() {},
+          once() {},
+          off() {},
+        },
+        response,
+        protocol,
+        protocol === 'google.gemini' ? '/v1beta/models/gemini-4-neon-low:generateContent' : '/v1/messages',
+        routeMeta,
+      )
+      assert.equal(response.status, 200, JSON.stringify(response.body))
+      assertOutput(response.body)
+      const lastCall = captured[captured.length - 1]
+      assert.equal(lastCall.headers['x-goog-api-key'], 'sk-gem-upstream')
+      assert.equal(
+        lastCall.url,
+        protocol === 'google.gemini'
+          ? 'https://gem-relay.invalid/v1/models/gemini-upstream:streamGenerateContent?alt=sse'
+          : 'https://gem-relay.invalid/v1beta/models/gemini-upstream:streamGenerateContent?alt=sse',
+      )
+      const outbound = JSON.parse(lastCall.body)
+      assert.equal(outbound.contents[0].parts[0].text, 'hello')
+    } finally {
       await new Promise((resolve) => kernel.close(resolve))
       fs.rmSync(root, { recursive: true, force: true })
     }

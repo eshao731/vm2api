@@ -80,6 +80,12 @@ Empty batches are not sent.
 `routing.telemetry.default_enabled` defaults to **false**. When it changes to
 true, every Claude VM is opted in and the policy is published. Changing it back
 to false only affects VMs created afterward.
+`routing.telemetry.disable_nonessential_traffic` defaults to **false**. Unless
+explicitly enabled, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is kept unset
+(and stripped from legacy `settings.json` entries) because official Claude Code
+treats any set value—including `"0"`—as essential-traffic mode, which blocks
+`/usage`; enabling it writes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`
+across Claude slots.
 
 ## Queue and disable semantics
 
@@ -147,8 +153,10 @@ CRAG uses a separate Unix-socket control route, not the queue/ACK protocol
 above. `kin-seed.json` explicitly opts in with `seed_policy.telemetry_disabled:
 false`. The panel writes the guest's `CLAUDE_CONFIG_DIR/settings.json` alongside
 it. On enable it removes `DISABLE_TELEMETRY`, `CLAUDE_CODE_DISABLE_TELEMETRY`,
-`DO_NOT_TRACK`, and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; on disable it
-writes the kill switches. Other kernels retain their existing settings policy.
+and `DO_NOT_TRACK`; on disable it writes the telemetry kill switches.
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` stays unset in both states unless
+`routing.telemetry.disable_nonessential_traffic` is `true` (which writes `"1"`).
+Other kernels retain their existing settings policy.
 
 The panel checks `POST /internal/v1/telemetry/apply` and, only on a restart-required
 response, uses slot maintenance to drain requests, restart the selected CRAG
@@ -158,10 +166,16 @@ an unavailable worker remains unconfirmed. Stopped slots are not started.
 The telemetry page's recheck reads the running worker's authenticated policy
 without republishing configuration or restarting anything. It requires
 `crag_telemetry_apply_v1` (available in CRAG 3.1.4) and shows an unconfirmed
-state when the running worker cannot attest the saved policy. A successful
-check reports `upload_confirmed: false`: it does not attest a running sender,
-an emptied queue, or network delivery. The managed upload interval is not
-applied to CRAG's official Claude process.
+state when the running worker cannot attest the saved policy. Workers that also
+advertise `crag_telemetry_upload_v1` observe real native Claude Code batch
+uploads to `https://api.anthropic.com/api/event_logging/v2/batch`, append
+sanitized counts-only lines (`at`, `ok`, `events`, `error`, `source: "crag"`)
+to `run/telemetry-upload.log` (capped at 40 lines), and report actual
+`upload_confirmed`, `last_upload_at`, and `last_error` in
+`POST /internal/v1/telemetry/apply` without fabricating test telemetry. Older
+CRAG workers without `crag_telemetry_upload_v1` continue to report
+`upload_confirmed: false`. The managed upload interval is not applied to CRAG's
+official Claude process.
 
 ### Official initialization
 

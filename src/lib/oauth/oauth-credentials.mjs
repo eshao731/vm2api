@@ -23,6 +23,33 @@ import {
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 
+const credentialRefreshTail = new Map()
+
+/**
+ * Process-local per-key refresh serialization (SSOT shared across Claude & Codex).
+ * Prevents concurrent panel refreshes, imports, and pre-probe refreshes from
+ * racing on the same refresh token or read-modify-write credential file.
+ */
+export function withCredentialRefreshLock(key, fn) {
+  const prev = credentialRefreshTail.get(key) || Promise.resolve()
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const tail = prev.catch(() => {}).then(() => gate)
+  credentialRefreshTail.set(key, tail)
+  return prev
+    .catch(() => {})
+    .then(async () => {
+      try {
+        return await fn()
+      } finally {
+        release()
+        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
+      }
+    })
+}
+
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
 
 /**
@@ -137,6 +164,120 @@ export function slotWorkerCredentialPath(homeDir) {
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
+const SLOT_CREDENTIAL_EMAIL_KEYS = ['email', 'emailAddress', 'email_address']
+
+function deleteSlotCredentialEmailKeys(target) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return false
+  let removed = false
+  for (const key of SLOT_CREDENTIAL_EMAIL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(target, key)) {
+      delete target[key]
+      removed = true
+    }
+  }
+  return removed
+}
+
+/** Strip email attributes from an Anthropic slot credentials.json document so the VM never sees them. */
+export function stripSlotCredentialEmail(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return { changed: false, doc }
+  let changed = deleteSlotCredentialEmailKeys(doc)
+  if (deleteSlotCredentialEmailKeys(doc.claudeAiOauth)) changed = true
+  if (deleteSlotCredentialEmailKeys(doc.anthropicApiKey)) changed = true
+  return { changed, doc }
+}
+
+/** Strip email attributes from raw credentials.json bytes; clean or non-JSON input returns the original buffer. */
+export function stripSlotCredentialEmailBytes(raw) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw ?? ''), 'utf8')
+  let parsed
+  try {
+    parsed = JSON.parse(buf.toString('utf8'))
+  } catch {
+    return { changed: false, data: buf }
+  }
+  const { changed, doc } = stripSlotCredentialEmail(parsed)
+  if (!changed) return { changed: false, data: buf }
+  return { changed: true, data: Buffer.from(`${JSON.stringify(doc, null, 2)}\n`, 'utf8') }
+}
+
+function lstatOrNull(target) {
+  try {
+    return fs.lstatSync(target)
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null
+    throw error
+  }
+}
+
+function unsafeCredentialPathError(message) {
+  const err = new Error(message)
+  err.code = 'unsafe_credential_path'
+  return err
+}
+
+/**
+ * Reject host-side symlink traversal on container-writable slot paths
+ * (`cli-home`, `.claude`, `credentials.json`, and its lock/attempt sidecars).
+ * `.credentials.json` is intentionally excluded because it is the official
+ * relative symlink alias pointing at `credentials.json`.
+ */
+export function assertSafeSlotCredentialPaths(homeDir) {
+  if (!homeDir) return { ok: false, reason: 'home_missing' }
+  const homeStat = lstatOrNull(homeDir)
+  if (homeStat && (homeStat.isSymbolicLink() || !homeStat.isDirectory())) {
+    throw unsafeCredentialPathError('slot cli-home must be a real directory')
+  }
+  const claudeDir = path.join(homeDir, '.claude')
+  const claudeStat = lstatOrNull(claudeDir)
+  if (claudeStat) {
+    if (claudeStat.isSymbolicLink() || !claudeStat.isDirectory()) {
+      throw unsafeCredentialPathError('slot .claude must be a real directory')
+    }
+    for (const name of ['credentials.json', 'credentials.json.lock', 'credentials.json.refresh-attempt']) {
+      const entryStat = lstatOrNull(path.join(claudeDir, name))
+      if (entryStat && (entryStat.isSymbolicLink() || !entryStat.isFile())) {
+        throw unsafeCredentialPathError(`slot ${name} must be a regular file`)
+      }
+    }
+  }
+  return { ok: true, claudeDir, file: path.join(claudeDir, 'credentials.json') }
+}
+
+/** Remove legacy email fields from an existing slot credentials.json in place without rewriting clean files. */
+export function stripWorkerCredentialEmail(homeDir, { uid, gid } = {}) {
+  const file = slotWorkerCredentialPath(homeDir)
+  if (!file) return { changed: false }
+  let raw
+  let prevMode = 0o600
+  try {
+    assertSafeSlotCredentialPaths(homeDir)
+    const st = fs.lstatSync(file)
+    if (!st.isFile()) return { changed: false }
+    prevMode = st.mode & 0o777
+    raw = fs.readFileSync(file)
+  } catch {
+    return { changed: false }
+  }
+  const cleaned = stripSlotCredentialEmailBytes(raw)
+  if (!cleaned.changed) return { changed: false }
+  try {
+    fs.chmodSync(file, 0o600)
+  } catch {}
+  atomicWriteJson(file, cleaned.data.toString('utf8'), { mode: 0o600 })
+  if (uid != null && gid != null) {
+    try {
+      fs.chownSync(file, uid, gid)
+    } catch {}
+  } else {
+    chownSlotCredentialFile(homeDir, file)
+  }
+  try {
+    fs.chmodSync(file, prevMode || 0o444)
+  } catch {}
+  return { changed: true, path: file }
+}
+
 function regularOauthGrant(file) {
   let st
   try {
@@ -192,6 +333,11 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
+  try {
+    assertSafeSlotCredentialPaths(homeDir)
+  } catch (error) {
+    return { wrote: false, linked: false, error: error?.code || 'unsafe_credential_path' }
+  }
   const workerGrant = regularOauthGrant(workerFile)
   const adopt =
     !!adoptOfficial &&
@@ -200,8 +346,10 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   if (!fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
-    if (adopt) fs.copyFileSync(officialFile, workerFile)
-    else fs.writeFileSync(workerFile, '{}\n', { mode: 0o600 })
+    if (adopt) {
+      const adopted = stripSlotCredentialEmailBytes(fs.readFileSync(officialFile))
+      fs.writeFileSync(workerFile, adopted.data, { mode: 0o600 })
+    } else fs.writeFileSync(workerFile, '{}\n', { mode: 0o600 })
     fs.chmodSync(workerFile, 0o600)
     if (uid != null && gid != null) {
       try {
@@ -209,13 +357,19 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
       } catch {}
     }
   } else if (adopt) {
-    fs.copyFileSync(officialFile, workerFile)
+    const adopted = stripSlotCredentialEmailBytes(fs.readFileSync(officialFile))
+    try {
+      fs.chmodSync(workerFile, 0o600)
+    } catch {}
+    fs.writeFileSync(workerFile, adopted.data, { mode: 0o600 })
     fs.chmodSync(workerFile, 0o600)
     if (uid != null && gid != null) {
       try {
         fs.chownSync(workerFile, uid, gid)
       } catch {}
     }
+  } else {
+    stripWorkerCredentialEmail(homeDir, { uid, gid })
   }
   fs.mkdirSync(claudeDir, { recursive: true })
   try {
@@ -252,6 +406,7 @@ export function readWorkerCredentialFile(homeDir) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file) return null
   try {
+    assertSafeSlotCredentialPaths(homeDir)
     if (!fs.existsSync(file)) return null
     const doc = JSON.parse(fs.readFileSync(file, 'utf8'))
     const api = doc?.anthropicApiKey && typeof doc.anthropicApiKey === 'object' ? doc.anthropicApiKey : null
@@ -385,6 +540,7 @@ export function slotUidGidFromHomeDir(homeDir) {
 
 export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
   if (!homeDir) return
+  assertSafeSlotCredentialPaths(homeDir)
   let u = uid
   let g = gid
   if (u == null || g == null) {
@@ -400,7 +556,10 @@ export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
   fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
   for (const p of [homeDir, claudeDir, ...SLOT_CLAUDE_FILES.map((name) => path.join(claudeDir, name))]) {
     try {
-      if (fs.existsSync(p)) fs.chownSync(p, user, group)
+      const st = lstatOrNull(p)
+      if (!st) continue
+      if (st.isSymbolicLink()) fs.lchownSync(p, user, group)
+      else fs.chownSync(p, user, group)
     } catch {}
   }
 }
@@ -416,10 +575,28 @@ function chownSlotCredentialFile(homeDir, file) {
 
 function sealSlotCredentialFile(file) {
   if (!file) return
-  // Slot Claude must not rewrite the shared RT; that drops kinGeneration.
+  // Slot processes must never rewrite panel credentials.json.
   try {
     fs.chmodSync(file, 0o444)
   } catch {}
+}
+
+/**
+ * Restore panel SSOT invariants after an in-place panel refresh: strip any email,
+ * keep slot ownership + 0444 read-only seal, and relink `.credentials.json` without
+ * ever adopting a slot-written regular file.
+ */
+export function sealWorkerCredentialFile(homeDir) {
+  const file = slotWorkerCredentialPath(homeDir)
+  if (!file) return { sealed: false, reason: 'missing' }
+  assertSafeSlotCredentialPaths(homeDir)
+  const st = lstatOrNull(file)
+  if (!st || !st.isFile()) return { sealed: false, reason: 'missing' }
+  stripWorkerCredentialEmail(homeDir)
+  chownSlotCredentialFile(homeDir, file)
+  sealSlotCredentialFile(file)
+  ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: false })
+  return { sealed: true, path: file }
 }
 
 /** Write slot credentials.json for imports and worker-owned credential updates. */
@@ -427,6 +604,7 @@ function sealSlotCredentialFile(file) {
 export function writeWorkerCredentialFile(homeDir, cred) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file) return null
+  assertSafeSlotCredentialPaths(homeDir)
   const mode = credentialModeFromOauth(cred)
   const authScheme = resolveAuthScheme({ mode, auth_scheme: cred.auth_scheme || cred.authScheme })
   if (mode === 'apikey') {
@@ -482,7 +660,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   }
   if (n.refresh_token && !isOfficialSetupTokenMode(mode)) oauth.refreshToken = n.refresh_token
   if (expiresAtMs) oauth.expiresAt = expiresAtMs
-  if (n.email) oauth.email = n.email
+  // Email stays on the control plane (vm.json / DB); never expose it inside the VM.
   if (n.account_uuid) oauth.accountUuid = n.account_uuid
   if (n.org_uuid) oauth.orgUuid = n.org_uuid
   if (scopes.length) oauth.scopes = scopes
@@ -535,6 +713,7 @@ export function ensureSlotSubscriptionType(homeDir, accountTier = null, { source
 
   const tier = identified || 'pro'
   oauth.subscriptionType = tier
+  stripSlotCredentialEmail(doc)
   try {
     fs.chmodSync(file, 0o600)
   } catch {}
@@ -612,7 +791,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
   if (!vmPath || !fs.existsSync(vmPath)) return null
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   const prev = vm.claude || {}
-  const prevRevoked = /oauth_revoked|token has been revoked/i.test(
+  const prevRevoked = /oauth_revoked|token has been revoked|token_revoked|invalidated oauth token/i.test(
     String(prev.refresh_error || prev.temp_unschedulable_reason || vm.schedule_disabled_reason || ''),
   )
   const prevExp = expiresAtToMs(prev.expires_at)
@@ -685,7 +864,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
 }
 
 function isQuotaParkReason(reason) {
-  return /^(quota_5h|quota_7d)|account_quota_exhausted|^rate_limited$/i.test(String(reason || ''))
+  return /^quota_\d+[mhd]|account_quota_exhausted|^rate_limited$/i.test(String(reason || ''))
 }
 
 function clearClaudeAuthCooldown(claude = {}) {
@@ -732,7 +911,11 @@ export function clearVmQuotaRestriction(vmPath) {
 function isRecoverableCooldownReason(reason) {
   const text = String(reason || '')
   if (!text) return true
-  if (/oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|credential_refresh_failed/i.test(text)) {
+  if (
+    /oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|token_revoked|invalidated oauth token|credential_refresh_failed/i.test(
+      text,
+    )
+  ) {
     return false
   }
   return true
@@ -784,7 +967,8 @@ export function healLeftoverAuthState(vmPath) {
     vm.schedule_disabled_reason || vm.claude.refresh_error || vm.claude.temp_unschedulable_reason || '',
   )
   if (isQuotaParkReason(vm.claude.temp_unschedulable_reason || vm.temp_unschedulable_reason)) return vm
-  if (/oauth_revoked|oauth_invalid_grant|token has been revoked/i.test(reason)) return vm
+  if (/oauth_revoked|oauth_invalid_grant|token has been revoked|token_revoked|invalidated oauth token/i.test(reason))
+    return vm
   const had =
     vm.claude.temp_unschedulable_until || vm.claude.temp_unschedulable_reason || vm.claude.oauth_401_generation
   if (!had) return vm
@@ -811,14 +995,26 @@ export function clearVmAuthCooldown(vmPath) {
   return vm
 }
 
+// The control plane lost track of the worker or slot projection failed after rotation.
+const WORKER_TRANSPORT_CODES =
+  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed|credential_sync_failed)$/i
+
+/** Lost answers are retryable only when the worker's attempt journal guards the refresh token. */
+const unguardedTransportFailure = (result) =>
+  result?.attempt_guard === false &&
+  WORKER_TRANSPORT_CODES.test(String(result?.error?.code || result?.error_code || ''))
+
 export function classifyCredentialRefresh(result) {
   if (result?.ok) return result.refreshed ? 'refreshed' : 'already_fresh'
   const code = String(result?.error?.code || result?.error_code || '')
+  // The worker sent this token once without a usable answer; only re-authorization resolves it.
+  if (code === 'refresh_outcome_unknown') return 'failed'
+  if (unguardedTransportFailure(result)) return 'failed'
   const message = String(result?.error?.message || result?.message || result?.error || '')
   const status = Number(result?.status) || 0
   const blob = `${code} ${message}`.toLowerCase()
   if (
-    /invalid_grant|invalid_refresh_token|refresh_token_missing|refresh token not found|token has been revoked|oauth_revoked|oauth_no_refresh/.test(
+    /invalid_grant|invalid_refresh_token|refresh_token_missing|refresh token not found|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|oauth_no_refresh/.test(
       blob,
     )
   ) {
@@ -827,6 +1023,7 @@ export function classifyCredentialRefresh(result) {
   if (
     status === 429 ||
     status >= 500 ||
+    WORKER_TRANSPORT_CODES.test(code) ||
     /timeout|transport|network|temporar|worker_unavailable|worker_timeout|worker_socket/.test(blob)
   ) {
     return 'retryable'
@@ -835,14 +1032,33 @@ export function classifyCredentialRefresh(result) {
 }
 
 export function refreshErrorCodeOf(result) {
+  // A worker without the attempt journal cannot be retried safely after a lost answer.
+  if (unguardedTransportFailure(result)) return 'worker_upgrade_required'
   const code = String(result?.error?.code || result?.error_code || '').trim()
   const message = String(result?.error?.message || result?.message || '')
   const blob = `${code} ${message}`
   if (/invalid_grant/i.test(blob)) return 'invalid_grant'
   if (/invalid_refresh_token/i.test(blob)) return 'invalid_refresh_token'
   if (/refresh_token_missing|refresh token not found/i.test(blob)) return 'refresh_token_missing'
-  if (/token has been revoked|oauth_revoked/i.test(blob)) return 'oauth_revoked'
+  // Normalize OpenAI's revocation wording ("token_revoked" / "invalidated oauth token")
+  // onto the shared oauth_revoked code so every downstream reader keeps working.
+  if (/token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i.test(blob)) return 'oauth_revoked'
   return code || 'credential_refresh_failed'
+}
+
+/**
+ * A slot was parked as `worker_upgrade_required` because its node's worker could not guard refresh retries.
+ * Once that worker is replaced, drop exactly that code so the normal guarded refresh can run again.
+ */
+export function clearUpgradeRequired(vmPath) {
+  if (!vmPath || !fs.existsSync(vmPath)) return false
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  if (vm?.claude?.refresh_error !== 'worker_upgrade_required') return false
+  vm.claude = stripCredentialSecrets({ ...vm.claude })
+  vm.claude.refresh_error = null
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(vmPath, vm, { mode: 0o600 })
+  return true
 }
 
 /** Persist a fatal/failed refresh onto vm.json. Dead tickets leave the pool even if 调度 was manually on. */

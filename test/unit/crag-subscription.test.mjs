@@ -191,10 +191,337 @@ test('host checkout falls back to the D-Bus machine ID without changing an exist
   assert.equal(service.purchaseDeviceId(), expected)
 
   fs.rmSync(alternate)
-  assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_changed' })
+  // The machine-id now reads differently from the one this host was bound with.
+  // That used to raise `crag_subscription_host_identity_changed`, which wedged
+  // paid hosts after ordinary maintenance -- a regenerated machine-id, a
+  // rebuilt container, a replaced NIC. A stored identity is permanent instead.
+  //
+  // What this gives up is a local heuristic, not a boundary: whoever can copy
+  // the data directory onto another machine already has the credential sitting
+  // in it and can speak to the Authority directly, and `slot_limit` still caps
+  // what a duplicate can consume.
+  assert.equal(service.purchaseDeviceId(), expected)
+  // Tolerating a changed value is not tolerating an unsound source: with the
+  // only remaining source replaced by a symlink, the identity is unavailable
+  // rather than quietly trusted.
   fs.rmSync(machineIdFile)
   fs.symlinkSync(path.join(publicDir, 'host_id'), machineIdFile)
   assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_unavailable' })
+})
+
+/** Fake a `/sys/class/net` tree. `device` present means a real NIC;
+ * `addr_assign_type` 0 means the address is permanent. */
+function fakeNet(root, interfaces) {
+  const dir = fs.mkdtempSync(path.join(root, 'net-'))
+  for (const [name, { mac, assign = '0', virtual = false }] of Object.entries(interfaces)) {
+    const base = path.join(dir, name)
+    fs.mkdirSync(base)
+    if (!virtual) fs.writeFileSync(path.join(base, 'device'), '')
+    fs.writeFileSync(path.join(base, 'addr_assign_type'), `${assign}\n`)
+    fs.writeFileSync(path.join(base, 'address'), `${mac}\n`)
+  }
+  return dir
+}
+
+test('a device UUID is just the host id it derives, in a form an operator can copy and type back', (t) => {
+  const { machineIdFile, connect } = standaloneHost(t)
+  const raw = '1234567890abcdef1234567890abcdef'
+  fs.writeFileSync(machineIdFile, `${raw}\n`, { mode: 0o600 })
+  const { hostId, uuid, source } = connect().deviceIdentity()
+
+  // The 32 hex digits the host id has always been derived from are exactly a
+  // UUID payload, so nothing about the wire format moves.
+  assert.equal(uuid, '12345678-90ab-cdef-1234-567890abcdef')
+  assert.equal(hostId, crypto.createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex'))
+  assert.equal(hostId.length, 64)
+  assert.equal(source, 'override')
+})
+
+test('host identity comes from the NIC, so machines cloned from one image do not collide', (t) => {
+  const { root, connect } = standaloneHost(t)
+  // Two instances of the same image: identical machine-id, distinct MACs. Under
+  // a machine-id baseline both derive one host id and the second to register is
+  // refused for good.
+  const first = connect({ machineIdFile: null, netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' } }) })
+  const second = connect({ machineIdFile: null, netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:ab:cd:ef' } }) })
+  assert.notEqual(first.deviceIdentity().hostId, second.deviceIdentity().hostId)
+  assert.equal(first.deviceIdentity().source, 'mac')
+
+  // The hardware address must not travel inside the identity the operator
+  // copies around.
+  assert.ok(!first.deviceIdentity().uuid.includes('525400'))
+
+  // Enumeration order and interface naming both shift between boots, so the
+  // lowest address decides and the result is order-independent.
+  const forward = fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' }, eth1: { mac: '02:00:00:00:00:01' } })
+  const reverse = fakeNet(root, { enp3s0: { mac: '52:54:00:12:34:56' }, aaa0: { mac: '02:00:00:00:00:01' } })
+  assert.equal(
+    connect({ machineIdFile: null, netDirectory: forward }).deviceIdentity().hostId,
+    connect({ machineIdFile: null, netDirectory: reverse }).deviceIdentity().hostId,
+  )
+
+  // Virtual interfaces and non-permanent addresses are not identity. With only
+  // those present there is no NIC to use at all.
+  const unusable = fakeNet(root, {
+    lo: { mac: '00:00:00:00:00:00', virtual: true },
+    docker0: { mac: '02:42:ac:11:00:02', virtual: true },
+    eth9: { mac: '52:54:00:99:99:99', assign: '1' },
+  })
+  const only = fs.readdirSync(unusable)
+  assert.equal(only.length, 3, 'the fixture really does contain three interfaces')
+  assert.notEqual(connect({ machineIdFile: null, netDirectory: unusable }).deviceIdentity().source, 'mac')
+})
+
+test('a stored identity survives maintenance, and its UUID is backfilled then verified', (t) => {
+  const { machineIdFile, publicDir, connect } = standaloneHost(t)
+  const raw = 'abcdef0123456789abcdef0123456789'
+  fs.writeFileSync(machineIdFile, `${raw}\n`, { mode: 0o600 })
+  const service = connect()
+  const original = service.deviceIdentity()
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), original.hostId, { mode: 0o644 })
+
+  // Backfilled once for an install that predates the file, and self-verified on
+  // every later read.
+  const uuidFile = path.join(publicDir, 'device_uuid')
+  const backfilled = service.deviceIdentity()
+  assert.equal(backfilled.source, 'saved')
+  assert.equal(backfilled.uuid, original.uuid)
+  assert.equal(fs.readFileSync(uuidFile, 'utf8'), original.uuid)
+
+  // Maintenance replaced the machine-id. The host id does not move with it.
+  fs.writeFileSync(machineIdFile, `${'b'.repeat(32)}\n`, { mode: 0o600 })
+  assert.equal(service.deviceIdentity().hostId, original.hostId)
+
+  // The host id is the only authority: a device_uuid that does not derive it is
+  // discarded rather than allowed to speak for this host. With the original
+  // source now gone, no UUID can be reconstructed, and reporting none is honest
+  // -- a fabricated one would aim a migration at a device that does not exist.
+  fs.writeFileSync(uuidFile, '00000000-0000-4000-8000-000000000001', { mode: 0o644 })
+  const tampered = service.deviceIdentity()
+  assert.equal(tampered.hostId, original.hostId)
+  assert.equal(tampered.uuid, null)
+})
+
+test('the identity rebuild escape hatch is never taken by the ordinary path', (t) => {
+  const { root, publicDir, connect } = standaloneHost(t)
+  const service = connect({
+    machineIdFile: null,
+    netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' } }),
+  })
+  const before = service.deviceIdentity()
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), 'c'.repeat(64), { mode: 0o644 })
+
+  // A stored identity stays put no matter how often it is resolved. If resolving
+  // could rebuild, "a stored identity is permanent" would mean nothing.
+  assert.equal(service.deviceIdentity().hostId, 'c'.repeat(64))
+  assert.equal(service.deviceIdentity().hostId, 'c'.repeat(64))
+
+  // Only an explicit call rebuilds, and it has to say why.
+  assert.throws(() => service.rebuildDeviceIdentity(), { code: 'crag_subscription_unavailable' })
+  const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.equal(rebuilt.hostId, before.hostId)
+  assert.equal(service.deviceIdentity().hostId, before.hostId)
+
+  // Without a usable NIC a rebuild no longer refuses: the SMBIOS UUID is also
+  // per-instance, so it descends to that instead of landing back on the
+  // `machine-id` it is escaping.
+  const dmi = path.join(root, 'product_uuid')
+  fs.writeFileSync(dmi, '7f1c9a52-3b84-4d61-9f2e-0a5d8c6b4e13\n')
+  const viaDmi = connect({ machineIdFile: null, netDirectory: path.join(root, 'absent'), dmiUuidFile: dmi })
+  assert.equal(viaDmi.rebuildDeviceIdentity({ reason: 'host_id_collision' }).source, 'dmi')
+
+  // With the per-instance sources gone it keeps descending rather than failing.
+  // `/etc/machine-id` and `/proc/cpuinfo` are not injectable and exist on any
+  // ordinary Linux host, so "every source unavailable" is not reachable from
+  // here -- which is what the CPU fallback is for: a weak identity beats none,
+  // because without one the request fails outright. The descent is asserted
+  // instead of a refusal that can no longer be provoked.
+  const descended = connect({
+    machineIdFile: null,
+    netDirectory: path.join(root, 'absent'),
+    dmiUuidFile: path.join(root, 'absent-dmi'),
+  }).rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.ok(['machine-id', 'mount', 'cpu'].includes(descended.source), `descended to ${descended.source}`)
+  assert.match(descended.hostId, /^[a-f0-9]{64}$/)
+})
+
+/** The v1.4.186 regression and its self-repair. That version retired a stored
+ * identity as soon as it stopped matching the sampled hardware, which replaced a
+ * paid host's identity with one the Authority had never issued -- `status` then
+ * answered 404 and every admission failed with
+ * `license_crag_host_usage_unverified`. A host carrying that damage must heal on
+ * its next admission, and a deliberate rebuild must not be healed away with it. */
+test('a v1.4.186 retirement is reclaimed, while a deliberate rebuild is not', (t) => {
+  const { root, publicDir, connect } = standaloneHost(t)
+  const service = connect({
+    machineIdFile: null,
+    netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' } }),
+  })
+  const privateDir = path.join(path.dirname(publicDir), 'private')
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 })
+
+  // Exactly what v1.4.186 left behind: the paid identity moved to `.legacy`,
+  // with a freshly derived one in its place that no subscription belongs to.
+  const paid = 'a'.repeat(64)
+  const stranded = 'd'.repeat(64)
+  fs.writeFileSync(path.join(publicDir, 'host_id.legacy'), paid, { mode: 0o644 })
+  fs.writeFileSync(path.join(privateDir, 'credential.legacy'), 'K'.repeat(43), { mode: 0o600 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), stranded, { mode: 0o644 })
+
+  assert.equal(service.deviceIdentity().hostId, paid, 'the paid identity comes back')
+  assert.equal(fs.readFileSync(path.join(publicDir, 'host_id'), 'utf8'), paid)
+  assert.ok(!fs.existsSync(path.join(publicDir, 'host_id.legacy')), 'and is reclaimed, not copied')
+  assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), 'K'.repeat(43))
+
+  // A rebuild is a decision, so it must survive the next admission. It retires
+  // to a different suffix for that reason; reusing `.legacy` would make the
+  // repair above undo it.
+  const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.notEqual(rebuilt.hostId, paid)
+  assert.equal(service.deviceIdentity().hostId, rebuilt.hostId, 'the rebuild is not reclaimed')
+})
+
+test('per-voucher detail is shown only when it reconciles with the signed aggregate', async (t) => {
+  let issued
+  let grants
+  const { root, connect } = standaloneHost(t, async (_, { body }) => {
+    issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 3 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims, quota_grants: grants } })
+  })
+  seedEncryptedPackage(root)
+  const signed = () => issued.claims
+
+  // Two windows that add up to the signed limit, the soonest ending exactly
+  // where the signed window ends.
+  await connect().redeem(voucher())
+  grants = [
+    { code_id: 'c0ffee', expires_at: signed().expires_at, slot_limit: 1 },
+    { expires_at: signed().expires_at + 86400, slot_limit: 2 },
+  ]
+  const shown = await connect().status()
+  assert.deepEqual(shown.quota_grants, grants)
+
+  // The entitlement signs only the aggregate, so detail that contradicts it
+  // would let a confident, false expiry date onto the panel. Seats that do not
+  // add up to the signed limit are refused...
+  grants = [{ expires_at: signed().expires_at, slot_limit: 2 }]
+  assert.equal((await connect().status()).quota_grants, undefined)
+
+  // ...as is detail whose soonest window disagrees with the signed one, even
+  // though the seats add up.
+  grants = [
+    { expires_at: signed().expires_at + 1, slot_limit: 1 },
+    { expires_at: signed().expires_at + 86400, slot_limit: 2 },
+  ]
+  assert.equal((await connect().status()).quota_grants, undefined)
+
+  // Unknown fields never reach the panel: entries are rebuilt from what was
+  // checked, not passed through.
+  grants = [
+    { expires_at: signed().expires_at, slot_limit: 1, injected: 'ignore me' },
+    { expires_at: signed().expires_at + 86400, slot_limit: 2 },
+  ]
+  const rebuilt = await connect().status()
+  assert.deepEqual(Object.keys(rebuilt.quota_grants[0]), ['expires_at', 'slot_limit'])
+})
+
+test('redemption accepts the device UUID the panel shows, as well as the hashed host id', async (t) => {
+  let issued
+  const seen = []
+  const { root, machineIdFile, connect } = standaloneHost(t, async (_, { body }) => {
+    const { host_id } = JSON.parse(body)
+    seen.push(host_id)
+    issued ??= issueHostEntitlement(root, host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  fs.writeFileSync(machineIdFile, `${'1234567890abcdef'.repeat(2)}\n`, { mode: 0o600 })
+  const service = connect()
+  const { hostId, uuid } = service.deviceIdentity()
+
+  // Typed or pasted in any case, with or without the dashes -- an operator
+  // copying what is on screen must not have to find the hashed form.
+  assert.equal(service.resolveDeviceUuid(uuid.toUpperCase()), hostId)
+  assert.equal(service.resolveDeviceUuid(uuid.replaceAll('-', '')), hostId)
+  assert.equal(service.resolveDeviceUuid('not-a-uuid'), null)
+
+  await service.redeemDeviceOrder(uuid, voucher())
+  assert.deepEqual(seen, [hostId], 'the UUID resolves to the same host id on the wire')
+  // The hashed form keeps working for existing callers and scripts.
+  await connect().redeemDeviceOrder(hostId, voucher())
+  assert.deepEqual(seen, [hostId, hostId])
+  assert.throws(() => connect().redeemDeviceOrder('neither', voucher()))
+})
+
+test('retiring a host drops its local rights and reports what can be carried over', async (t) => {
+  let issued
+  let unbound = false
+  const seen = []
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    seen.push(action)
+    if (action === 'unbind') {
+      unbound = true
+      return Response.json({
+        ok: true,
+        data: {
+          released_codes: ['code-a', 'code-b'],
+          expires_at: issued.claims.expires_at,
+          cooldown_until: Math.floor(Date.now() / 1000) + 604800,
+        },
+      })
+    }
+    if (unbound) {
+      return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+    }
+    issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  const before = await connect().redeem(voucher())
+  assert.equal(before.state, 'active')
+  const entitlement = path.join(publicDir, 'entitlement.code')
+  assert.equal(fs.existsSync(entitlement), true)
+
+  const retired = await connect().unbind()
+  assert.ok(seen.includes('unbind'))
+  assert.deepEqual(retired.released.released_codes, ['code-a', 'code-b'])
+  // The signed rights have to go with it. Keeping them would have status()
+  // report a subscription the Authority has just deleted -- the one kind of
+  // stale local truth this module never shows.
+  assert.equal(fs.existsSync(entitlement), false)
+  assert.equal(retired.state, 'unredeemed')
+  assert.equal((await connect().status()).state, 'unredeemed')
+})
+
+test('a retirement refused by the transfer cooldown says so instead of looking unconfirmed', async (t) => {
+  let issued
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    if (url.endsWith('/unbind')) {
+      return Response.json({ ok: false, error: { code: 'host_transfer_cooldown' } }, { status: 409 })
+    }
+    issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  await connect().redeem(voucher())
+
+  // Without this code in the recognized set it degrades to
+  // crag_subscription_authority_unavailable (502), which reads as "result
+  // unconfirmed, retry" and sends the operator retrying something not yet due.
+  const refused = await connect()
+    .unbind()
+    .then(
+      () => null,
+      (error) => error,
+    )
+  assert.equal(refused.code, 'host_transfer_cooldown')
+  assert.equal(refused.status, 409)
+  // Refused means nothing moved: the subscription is still here.
+  assert.equal((await connect().status()).state, 'active')
 })
 
 function postSubscription(subscription) {
@@ -1170,6 +1497,123 @@ test('the exact pending voucher can resume after a lost response, even when an i
   assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
 })
 
+test('a credential that was lost outright is re-established from the signed entitlement', async (t) => {
+  let issued
+  let honoured
+  const seen = []
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const { host_id, entitlement } = JSON.parse(body)
+    seen.push(action)
+    if (action === 'redeem') {
+      issued = issueHostEntitlement(root, host_id, { slot_limit: 2 })
+      honoured = headers.authorization
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'recover') {
+      assert.equal(entitlement, issued.code)
+      honoured = headers.authorization
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    return headers.authorization === honoured
+      ? Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+      : Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+  })
+  seedEncryptedPackage(root)
+  const before = await connect().redeem(voucher())
+  const keyFile = path.join(privateDir, 'credential')
+
+  // The data directory was rebuilt and took the private credential with it.
+  // The public entitlement survived, which is enough to prove ownership.
+  fs.rmSync(keyFile)
+
+  const after = await connect().status()
+  assert.ok(seen.includes('recover'), 'a lost credential is recovered, not reported as unavailable')
+  assert.notEqual(after.state, 'unavailable')
+  assert.equal(after.state, before.state)
+  assert.ok(fs.existsSync(keyFile), 'the recovered credential is persisted')
+  assert.equal(after.available_seats, before.available_seats)
+  assert.equal(after.credential_recovery, undefined, 'a recovery that succeeded reports no fault')
+})
+
+test('a credential the Authority no longer recognizes is replaced using the signed entitlement', async (t) => {
+  let issued
+  let honoured
+  const seen = []
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const { host_id, entitlement } = JSON.parse(body)
+    const bearer = headers.authorization.slice('Bearer '.length)
+    seen.push(action)
+    if (action === 'redeem') {
+      issued = issueHostEntitlement(root, host_id, { slot_limit: 2 })
+      honoured = bearer
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'recover') {
+      // Ownership is proven by the entitlement this authority signed. The
+      // bearer token is the *replacement* credential, not a proof of anything.
+      assert.equal(entitlement, issued.code)
+      honoured = bearer
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    return bearer === honoured
+      ? Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+      : Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+  })
+  seedEncryptedPackage(root)
+  const before = await connect().redeem(voucher())
+  const keyFile = path.join(privateDir, 'credential')
+  const accepted = fs.readFileSync(keyFile, 'utf8')
+
+  // The stored credential is no longer the one the Authority has: a rolled-back
+  // data directory, or a host id shared with the machine that registered first.
+  const stale = crypto.randomBytes(32).toString('base64url')
+  fs.writeFileSync(keyFile, stale, { mode: 0o600 })
+
+  const after = await connect().status()
+  assert.deepEqual(seen, ['redeem', 'status', 'recover', 'status'], 'recovery retries the call once')
+  const replacement = fs.readFileSync(keyFile, 'utf8')
+  assert.notEqual(replacement, stale, 'the rejected credential is replaced')
+  assert.notEqual(replacement, accepted, 'the replacement is freshly generated')
+  assert.equal(replacement, honoured, 'the Authority now honours what is on disk')
+  // Recovery swaps a secret; it must not move anything that was paid for.
+  assert.equal(after.state, before.state)
+  assert.equal(after.available_seats, before.available_seats)
+})
+
+test('recovery is refused for a host id shared with another machine, and is not retried', async (t) => {
+  let issued
+  const seen = []
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    seen.push(action)
+    if (action === 'redeem') {
+      issued = issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    // The rightful device holds this host id. Letting this machine recover
+    // would hand it the subscription and lock the other one out, so the
+    // Authority refuses -- and the client must not grind on it.
+    return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+  })
+  seedEncryptedPackage(root)
+  await connect().redeem(voucher())
+  const keyFile = path.join(privateDir, 'credential')
+  const stale = crypto.randomBytes(32).toString('base64url')
+  fs.writeFileSync(keyFile, stale, { mode: 0o600 })
+
+  const degraded = await connect().status()
+  assert.deepEqual(seen, ['redeem', 'status', 'recover'], 'a refused recovery is attempted once, never in a loop')
+  assert.equal(fs.readFileSync(keyFile, 'utf8'), stale, 'a refused recovery must not install a new credential')
+  // Locally signed rights still apply: being unable to reach the Authority --
+  // or being refused by it -- is not grounds for locking the operator out.
+  assert.ok(degraded.state)
+  // But the refusal itself must reach the panel. Swallowing it would leave the
+  // operator with a subscription that looks fine until a redemption fails.
+  assert.equal(degraded.credential_recovery, 'host_id_collision')
+})
+
 test('an Authority denial is not retried or installed, and only a valid correlation ID is exposed', async (t) => {
   const redemption_code = voucher()
   const requestId = crypto.randomUUID()
@@ -1193,7 +1637,7 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   const blocked = await submit('redeem', { redemption_code })
   assert.equal(blocked.status, 403)
   assert.equal(blocked.error.code, 'auth_forbidden')
-  assert.deepEqual(blocked.error.details, { authority_request_id: requestId })
+  assert.deepEqual(blocked.error.details, { recovery: 'not_activated', authority_request_id: requestId })
   assert.equal(calls, 1, 'a refused request must not trigger automatic retries')
   assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
   assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
@@ -1205,7 +1649,7 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   replyId = `${requestId}, ${redemption_code}`
   const untrusted = await submit('redeem', { redemption_code })
   assert.equal(untrusted.status, 403)
-  assert.equal(untrusted.error.details, undefined)
+  assert.deepEqual(untrusted.error.details, { recovery: 'not_activated' })
   assert.equal(JSON.stringify(untrusted).includes(redemption_code), false)
   assert.equal(calls, 2)
 
@@ -1214,6 +1658,44 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   assert.equal(applied.status, 200)
   assert.equal(applied.data.slot_limit, 2)
   assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), key)
+
+  // Subscription route handler strictly whitelists recovery and authority_request_id in error.details.
+  for (const [mockError, expectedDetails] of [
+    [
+      { status: 403, code: 'auth_forbidden', recovery: 'host_id_collision', authorityRequestId: requestId },
+      { recovery: 'host_id_collision', authority_request_id: requestId },
+    ],
+    [{ status: 403, code: 'auth_forbidden', recovery: 'unavailable' }, undefined],
+    [
+      {
+        status: 403,
+        code: 'auth_forbidden',
+        recovery: redemption_code,
+        authorityRequestId: `${requestId}-${redemption_code}`,
+      },
+      undefined,
+    ],
+  ]) {
+    const route = createCragSubscriptionHandler({
+      subscription: {
+        status: async () => {
+          throw Object.assign(new Error(`${redemption_code} /opt/private`), mockError)
+        },
+      },
+      publicBaseUrl: 'https://panel.example.test',
+      json: (_res, status, payload) => ({ status, ...payload }),
+      readRawBody: async () => Buffer.alloc(0),
+    })
+    const reply = await route(
+      { panelUser: 'admin', panelRole: 'admin', headers: {} },
+      { setHeader() {} },
+      cragSubscriptionRoute('GET', '/api/panel/crag-subscription'),
+    )
+    assert.equal(reply.status, 403)
+    assert.equal(reply.error.code, 'auth_forbidden')
+    assert.deepEqual(reply.error.details, expectedDetails)
+    assert.equal(JSON.stringify(reply).includes(redemption_code), false)
+  }
 })
 
 test('a failed slot probe does not hide signed host rights', async (t) => {
@@ -1548,6 +2030,12 @@ test('a lost renewal response suspends real control admission until restart repl
   const service = connect()
   assert.deepEqual(await service.status(), {
     ready: true,
+    host_id: service.deviceIdentity().hostId,
+    // Identity travels with every status: the panel shows it, and an identity
+    // fault is only diagnosable with its source. Derived here rather than
+    // hardcoded because the fixture's machine-id is random per run.
+    device_uuid: service.deviceIdentity().uuid,
+    identity_source: 'override',
     state: 'unredeemed',
     available_seats: 0,
     reclaim_pending_count: 0,
@@ -2281,6 +2769,26 @@ test('H1 deletion preserves exact evidence until H2 upgrade releases the deleted
   )
 })
 
+test('a degraded status still reports the device identity it read locally', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const healthy = await f.service.status()
+  assert.ok(healthy.device_uuid, 'the normal path carries the identity')
+
+  // `readDeferredReleases` throws on a malformed file and is one of the few calls
+  // in `status()` with no inner catch of its own, so this is what the degraded
+  // branch actually looks like. Note what it is *not*: an Authority that rejects
+  // our credential is caught one level in, and that path keeps returning rights.
+  fs.writeFileSync(f.deferredFile, '{"version":2}', { mode: 0o600 })
+  const degraded = await f.service.status()
+  assert.equal(degraded.state, 'unavailable')
+  // The identity is derived from this machine's own files and never needed the
+  // Authority, so dropping it here would hide the panel's device-identity block —
+  // and with it the only migration entry — from a host that is still migratable
+  // by order id.
+  assert.equal(degraded.device_uuid, healthy.device_uuid)
+  assert.equal(degraded.identity_source, healthy.identity_source)
+})
+
 test('H1 deletion stores unproven intent before destruction and never reclaims an unconfirmed delete', async (t) => {
   const f = await seatReleaseFixture(t)
   const vm = f.state.targets[0]
@@ -2535,6 +3043,8 @@ test('only an authenticated same-origin admin session can redeem without reveali
   const response = await handler(req, res, route)
   assert.equal(response.status, 404)
   assert.equal(response.body.error.code, 'redeem_unavailable')
+  assert.match(response.body.error.message, /voucher code/i)
+  assert.doesNotMatch(response.body.error.message, /combined quota window/i)
   assert.equal(attempts, 1)
   assert.equal(JSON.stringify(response).includes(code), false)
   // The master API key is operator automation without a browser origin.
@@ -2755,4 +3265,406 @@ test('runtime admission reclaims non-crag/orphaned seats and rebinds over-quota 
   const blockedVm3 = await service.withRuntimeAdmission(vm3, { bindSubscription: true }, () => ({ ok: true }))
   assert.equal(blockedVm3.code, 'license_crag_host_over_quota')
   assert.equal(await service.admitInference({ vm: vm2 }), null)
+})
+
+test('recording the shop order never blocks the redemption it belongs to', async (t) => {
+  const { root, connect } = standaloneHost(t)
+  seedEncryptedPackage(root)
+  const sent = []
+  let rights
+  const service = connect({
+    fetchImpl: async (url, { body }) => {
+      const request = JSON.parse(body)
+      if (url.endsWith('/redeem')) {
+        sent.push(Object.hasOwn(request, 'order_id') ? request.order_id : null)
+        // An Authority older than this field rejects the whole request shape,
+        // because its redeem request denies unknown fields.
+        if (Object.hasOwn(request, 'order_id'))
+          return Response.json({ ok: false, error: { code: 'invalid_request' } }, { status: 400 })
+        rights ??= issueHostEntitlement(root, request.host_id, { slot_limit: 1 })
+      }
+      if (!rights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+      return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims, used_slots: 0 } })
+    },
+  })
+  const hostId = service.purchaseDeviceId()
+  // The order id only matters for a migration that has not happened yet, so an
+  // Authority that cannot accept it must not cost the buyer the redemption in
+  // front of them. Degrading also keeps the rejection from arriving as
+  // `crag_subscription_authority_unavailable`, which reads as "retry later" and
+  // would never resolve.
+  const confirmed = await service.redeemDeviceOrder(hostId, voucher(), 'order-abc')
+  assert.deepEqual(sent, ['order-abc', null], 'retried exactly once, without the field')
+  assert.equal(confirmed, undefined, 'a device redemption reports through status, not a return value')
+  assert.equal((await service.status()).state, 'active')
+})
+
+test('claiming by order id asserts the package so the voucher stays individually movable', async (t) => {
+  const { root, connect } = standaloneHost(t)
+  seedEncryptedPackage(root)
+  let claim
+  let rights
+  const service = connect({
+    fetchImpl: async (url, { body }) => {
+      const request = JSON.parse(body)
+      if (url.endsWith('/claim-by-order')) {
+        claim = request
+        rights = issueHostEntitlement(root, request.host_id, { slot_limit: 2 })
+      }
+      if (!rights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+      return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims, used_slots: 0 } })
+    },
+  })
+
+  // Refused while deploy/payload.json is absent: `standardEnrollment` returns {}
+  // there instead of throwing, so without this check the claim would go out with no
+  // payload_key_id and the Authority would record the voucher as an unlabelled
+  // baseline -- sharing one combined window with every other such voucher, and never
+  // movable by order id again. That is not recoverable, so it must not happen quietly.
+  await assert.rejects(
+    service.claimByOrder('order-xyz'),
+    /crag_subscription_host_package_unready/,
+    'a host with no trusted package cannot claim',
+  )
+  assert.equal(claim, undefined, 'nothing was sent')
+
+  const { issuerId, payloadKeyId } = cragTargetIds(root)
+  fs.mkdirSync(path.join(root, 'deploy'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({ crag_authorization: { issuer_public_key_id: issuerId, payload_key_id: payloadKeyId } }),
+  )
+
+  const next = await service.claimByOrder('order-xyz')
+  assert.equal(claim.order_id, 'order-xyz')
+  assert.equal(claim.host_id, service.purchaseDeviceId())
+  // The package is asserted exactly as redemption does, which is what keeps this
+  // voucher individually addressable for the next migration.
+  assert.equal(claim.payload_key_id, payloadKeyId)
+  assert.equal(claim.issuer_public_key_id, issuerId)
+  assert.equal(next.state, 'active')
+
+  // Refused locally: the Authority could only answer 400 for this, and a shape
+  // check here keeps that from being reported as an unconfirmed result.
+  await assert.rejects(service.claimByOrder('not a valid id'), /crag_subscription_invalid_request/)
+  await assert.rejects(service.claimByOrder(''), /crag_subscription_invalid_request/)
+})
+
+test('crag subscription route scopes claim-by-order error copy away from other actions', async () => {
+  const err = (code, status) => Object.assign(new Error(code), { code, status })
+  const handler = createCragSubscriptionHandler({
+    subscription: {
+      status: () => {
+        throw err('not_found', 404)
+      },
+      redeem: () => {
+        throw err('redeem_unavailable', 404)
+      },
+      claimByOrder: (id) => {
+        if (id === 'order-missing') throw err('not_found', 404)
+        if (id === 'order-combined') throw err('redeem_unavailable', 409)
+        throw err('request_conflict', 409)
+      },
+    },
+    json: (_, status, body) => ({ status, body }),
+    readRawBody: (req) => Buffer.from(req.rawBody || '{}'),
+  })
+  const baseReq = {
+    panelUser: 'owner',
+    panelRole: 'admin',
+    headers: { host: 'localhost', origin: 'http://localhost', 'content-type': 'application/json' },
+  }
+  const res = { setHeader() {} }
+
+  const statusNotFound = await handler(baseReq, res, cragSubscriptionRoute('GET', '/api/panel/crag-subscription'))
+  assert.equal(statusNotFound.body.error.code, 'not_found')
+  assert.doesNotMatch(statusNotFound.body.error.message, /order id/i)
+
+  const claimRoute = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/claim-by-order')
+  const claimMissing = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ order_id: 'order-missing' }) },
+    res,
+    claimRoute,
+  )
+  assert.equal(claimMissing.body.error.code, 'not_found')
+  assert.match(claimMissing.body.error.message, /order id/i)
+
+  const claimCombined = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ order_id: 'order-combined' }) },
+    res,
+    claimRoute,
+  )
+  assert.equal(claimCombined.body.error.code, 'redeem_unavailable')
+  assert.match(claimCombined.body.error.message, /combined quota window/i)
+
+  const claimConflict = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ order_id: 'order-conflict' }) },
+    res,
+    claimRoute,
+  )
+  assert.equal(claimConflict.body.error.code, 'request_conflict')
+  assert.match(claimConflict.body.error.message, /already recorded/i)
+})
+
+test('rebuildDeviceIdentity generates a fresh identity when hardware sources still collide', (t) => {
+  const { root, publicDir, connect } = standaloneHost(t)
+  const service = connect()
+  const original = service.deviceIdentity()
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), original.hostId, { mode: 0o644 })
+
+  const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.equal(rebuilt.source, 'generated')
+  assert.notEqual(rebuilt.hostId, original.hostId)
+  assert.equal(service.deviceIdentity().hostId, rebuilt.hostId)
+  assert.equal(service.deviceIdentity().uuid, rebuilt.uuid)
+})
+
+test('redeem and claimByOrder automatically rebuild a colliding host_id and retry once', async (t) => {
+  const seenRedeemHosts = []
+  const seenClaimHosts = []
+  let collidingHostId
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const request = JSON.parse(body)
+    if (action === 'redeem') {
+      seenRedeemHosts.push(request.host_id)
+      if (request.host_id === collidingHostId) {
+        return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+      }
+      const issued = issueHostEntitlement(root, request.host_id, { slot_limit: 2, revision: 1 })
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'claim-by-order') {
+      seenClaimHosts.push(request.host_id)
+      if (request.host_id === collidingHostId) {
+        return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+      }
+      const issued = issueHostEntitlement(root, request.host_id, { slot_limit: 3, revision: 1 })
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'recover') {
+      return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+    }
+    return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+  })
+  seedEncryptedPackage(root)
+  const { issuerId, payloadKeyId } = cragTargetIds(root)
+  fs.mkdirSync(path.join(root, 'deploy'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({ crag_authorization: { issuer_public_key_id: issuerId, payload_key_id: payloadKeyId } }),
+  )
+  const service = connect()
+
+  // Seed a host that already activated once and then hits a confirmed host_id_collision.
+  await service.redeem(voucher())
+  collidingHostId = service.deviceIdentity().hostId
+  fs.writeFileSync(path.join(privateDir, 'credential'), crypto.randomBytes(32).toString('base64url'), { mode: 0o600 })
+
+  const redeemed = await service.redeem(voucher())
+  assert.equal(redeemed.slot_limit, 2)
+  assert.equal(seenRedeemHosts.length, 3, 'initial redeem + colliding attempt + rebuilt retry')
+  assert.equal(seenRedeemHosts[1], collidingHostId)
+  assert.notEqual(seenRedeemHosts[2], collidingHostId)
+  assert.equal(service.deviceIdentity().hostId, seenRedeemHosts[2])
+
+  // Same automatic rebuild on claimByOrder when colliding.
+  collidingHostId = service.deviceIdentity().hostId
+  fs.writeFileSync(path.join(privateDir, 'credential'), crypto.randomBytes(32).toString('base64url'), { mode: 0o600 })
+  const claimed = await service.claimByOrder('order-collision-1')
+  assert.equal(claimed.slot_limit, 3)
+  assert.equal(seenClaimHosts.length, 2)
+  assert.equal(seenClaimHosts[0], collidingHostId)
+  assert.notEqual(seenClaimHosts[1], collidingHostId)
+  assert.equal(service.deviceIdentity().hostId, seenClaimHosts[1])
+})
+
+test('rebuild-identity panel route invokes subscription.rebuildIdentity with empty JSON body', async () => {
+  let called = 0
+  const handler = createCragSubscriptionHandler({
+    subscription: {
+      rebuildIdentity: async () => {
+        called++
+        return { ready: true, state: 'unredeemed', device_uuid: '11111111-2222-3333-4444-555555555555' }
+      },
+    },
+    json: (_, status, body) => ({ status, body }),
+    readRawBody: (req) => Buffer.from(req.rawBody || '{}'),
+  })
+  const route = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/rebuild-identity')
+  assert.deepEqual(route, { action: 'rebuild-identity' })
+  const res = { setHeader() {} }
+  const req = {
+    panelUser: 'owner',
+    panelRole: 'admin',
+    headers: { host: 'localhost', origin: 'http://localhost', 'content-type': 'application/json' },
+    rawBody: '{}',
+  }
+  const reply = await handler(req, res, route)
+  assert.equal(reply.status, 200)
+  assert.equal(called, 1)
+  assert.equal(reply.body.data.state, 'unredeemed')
+
+  const invalid = await handler({ ...req, rawBody: JSON.stringify({ extra: true }) }, res, route)
+  assert.equal(invalid.status, 400)
+  assert.equal(called, 1)
+})
+
+test('direct-credit pull via status() activates an unredeemed host without Bearer and upgrades revisions', async (t) => {
+  let remoteRights
+  const seenAuth = []
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    seenAuth.push([action, headers.authorization ?? null])
+    const req = JSON.parse(body)
+    if (action === 'status') {
+      if (!remoteRights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+      return Response.json({
+        ok: true,
+        data: { entitlement: remoteRights.code, ...remoteRights.claims, used_slots: 0 },
+      })
+    }
+    return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+  })
+  seedEncryptedPackage(root)
+  const service = connect()
+  const hostId = service.purchaseDeviceId()
+
+  // Unredeemed host with 404 stays unredeemed without writing local entitlement.
+  const empty = await service.status()
+  assert.equal(empty.state, 'unredeemed')
+  assert.equal(empty.host_id, hostId)
+  assert.equal(seenAuth[0][1], null, 'unredeemed status pull sends no Bearer header')
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
+
+  // Direct credit lands at Authority -> status() pulls signed entitlement rev 1 automatically.
+  remoteRights = issueHostEntitlement(root, hostId, { revision: 1, slot_limit: 4 })
+  const credited = await service.status()
+  assert.equal(credited.state, 'active')
+  assert.equal(credited.slot_limit, 4)
+  assert.equal(credited.revision, 1)
+  assert.equal(fs.readFileSync(path.join(publicDir, 'entitlement.code'), 'utf8'), remoteRights.code)
+
+  // Second purchase stacks slots at Authority (rev 2) -> status() upgrades local entitlement automatically.
+  remoteRights = issueHostEntitlement(root, hostId, { revision: 2, slot_limit: 9 })
+  const stacked = await service.status()
+  assert.equal(stacked.state, 'active')
+  assert.equal(stacked.slot_limit, 9)
+  assert.equal(stacked.revision, 2)
+})
+
+test('cloud orders and whole-host migration work via host_id or device UUID and expose panel routes', async (t) => {
+  const fromHost = '1'.repeat(64)
+  let migratedPayload
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const req = JSON.parse(body)
+    if (action === 'orders') {
+      assert.equal(headers.authorization, undefined)
+      return Response.json({
+        ok: true,
+        data: {
+          host_id: req.host_id,
+          product: 'crag-v2',
+          orders: [
+            {
+              order_id: 'ord-1',
+              order_kind: 'purchase',
+              sku: 'starter-1m',
+              slot_limit: 2,
+              months: 1,
+              amount_minor: 2900,
+              subtotal_minor: 2900,
+              discount_minor: 0,
+              payment_method: 'alipay',
+              original_host_id: req.host_id,
+              current_host_id: req.host_id,
+              status: 'active',
+              paid_at: 1700000000,
+              granted_at: 1700000000,
+              expires_at: 1900000000,
+              created_at: 1700000000,
+            },
+          ],
+          vouchers: [{ code_id: 'c-1', slot_limit: 2, months: 1, status: 'active' }],
+          total: 1,
+          limit: req.limit,
+          offset: req.offset,
+        },
+      })
+    }
+    if (action === 'migrate') {
+      migratedPayload = req
+      const rights = issueHostEntitlement(root, req.to_host_id, { revision: 3, slot_limit: 6 })
+      return Response.json({
+        ok: true,
+        data: {
+          from_host_id: req.from_host_id,
+          to_host_id: req.to_host_id,
+          migrated_vouchers: 2,
+          migrated_orders: 3,
+          rights: { entitlement: rights.code, ...rights.claims, used_slots: 0 },
+        },
+      })
+    }
+    return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+  })
+  seedEncryptedPackage(root)
+  const service = connect()
+  const toHost = service.purchaseDeviceId()
+
+  const handler = createCragSubscriptionHandler({
+    subscription: service,
+    json: (_, status, body) => ({ status, body }),
+    readRawBody: (req) => Buffer.from(req.rawBody || '{}'),
+  })
+  const baseReq = {
+    panelUser: 'owner',
+    panelRole: 'admin',
+    headers: { host: 'localhost', origin: 'http://localhost', 'content-type': 'application/json' },
+  }
+  const res = { setHeader() {} }
+
+  const ordersRoute = cragSubscriptionRoute('GET', '/api/panel/crag-subscription/orders')
+  const ordersRes = await handler(
+    { ...baseReq, url: '/api/panel/crag-subscription/orders?limit=20&offset=0' },
+    res,
+    ordersRoute,
+  )
+  assert.equal(ordersRes.status, 200)
+  assert.equal(ordersRes.body.data.host_id, toHost)
+  assert.equal(ordersRes.body.data.orders.length, 1)
+  assert.equal(ordersRes.body.data.orders[0].amount_minor, 2900)
+
+  const migrateRoute = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/migrate')
+  const selfMigrate = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: toHost, proof: 'ord-1' }) },
+    res,
+    migrateRoute,
+  )
+  assert.equal(selfMigrate.status, 400)
+
+  // Bare migration without ownership proof must be rejected before calling Authority.
+  const noProofMigrate = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: fromHost }) },
+    res,
+    migrateRoute,
+  )
+  assert.equal(noProofMigrate.status, 400)
+
+  const migratedRes = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: fromHost, proof: 'ord-1' }) },
+    res,
+    migrateRoute,
+  )
+  assert.equal(migratedRes.status, 200)
+  assert.equal(migratedPayload.from_host_id, fromHost)
+  assert.equal(migratedPayload.to_host_id, toHost)
+  assert.equal(migratedPayload.proof_order_id, 'ord-1')
+  assert.equal(migratedRes.body.data.migrated_vouchers, 2)
+  assert.equal(migratedRes.body.data.migrated_orders, 3)
+  assert.equal(migratedRes.body.data.status.state, 'active')
+  assert.equal(migratedRes.body.data.status.slot_limit, 6)
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), true)
 })

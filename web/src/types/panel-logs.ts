@@ -1,3 +1,13 @@
+export type RequestLogLiveMeta = {
+  phase?: string
+  attempt_count?: number
+  started_at?: number
+  ttft_ms?: number | null
+  vm_id?: string | null
+  account_id?: string | null
+  active_provider?: string | null
+}
+
 export type RequestLogItem = {
   request_id?: string
   id?: string
@@ -5,6 +15,10 @@ export type RequestLogItem = {
   ts?: string
   created_at?: string
   status?: number | string
+  /** 是否仍在处理中（Redis 在飞请求合并到列表顶部时为 true）。 */
+  in_flight?: boolean
+  /** 进行中请求的实时阶段与节点元数据。 */
+  _live?: RequestLogLiveMeta | null
   model?: string
   requested_model?: string
   upstream_model?: string
@@ -24,6 +38,8 @@ export type RequestLogItem = {
   error_owner?: ErrorOwner
   error_code?: string
   error_message?: string
+  upstream_type?: string | null
+  error_details?: Record<string, string | number | boolean> | null
   vm_id?: string
   duration_ms?: number
   attempt_count?: number
@@ -72,12 +88,20 @@ export type RequestAttempt = {
   completed_at?: string | null
   upstream_status?: number | string | null
   error_scope?: string | null
+  error_code?: string | null
+  upstream_type?: string | null
+  error_details?: Record<string, string | number | boolean> | null
   action?: string | null
   cooldown_until?: number | null
   downstream_committed?: boolean
   status?: number | string | null
   terminal_state?: string | null
   usage?: Record<string, unknown> | null
+  hop_request_id?: string | null
+  provider_run_id?: string | null
+  provider_turn_id?: string | null
+  provider_attempt_id?: number | null
+  provider_request_id?: string | null
   wait_ms?: number | null
   queue_wait_ms?: number | null
   scheduling_ms?: number | null

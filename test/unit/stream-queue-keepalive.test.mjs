@@ -6,6 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const MESSAGE = {
@@ -106,11 +107,15 @@ function createHandler({ root, routing, run, stream = true }) {
   })
 }
 
-async function invoke(handler, res) {
+async function invoke(handler, res, extraHeaders = {}) {
   const req = {
     method: 'POST',
     url: '/v1/messages',
-    headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.187 (external, cli)' },
+    headers: {
+      authorization: 'Bearer master',
+      'user-agent': 'claude-cli/2.1.187 (external, cli)',
+      ...extraHeaders,
+    },
     apiKeyKind: 'master',
     once() {},
     off() {},
@@ -215,23 +220,26 @@ async function activeAttemptFailure({ block, delta, clusterDisconnect = false })
     }
   })
   const released = []
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve({ excluded, avoid }) {
-        const selected = candidates.find(
-          (candidate) =>
-            !excluded.has(candidate.accountId) &&
-            !excluded.has(candidate.vmId) &&
-            !avoid?.has(candidate.accountId) &&
-            !avoid?.has(candidate.vmId),
-        )
-        return selected
-          ? { ...selected, ok: true, release: () => released.push(selected.accountId) }
-          : { ok: false, reason: 'no_eligible_accounts' }
-      },
-      markCooldown() {},
-      markSuccess() {},
+  const scheduler = {
+    candidates,
+    async selectAndReserve({ excluded, avoid }) {
+      const selected = candidates.find(
+        (candidate) =>
+          !excluded.has(candidate.accountId) &&
+          !excluded.has(candidate.vmId) &&
+          !avoid?.has(candidate.accountId) &&
+          !avoid?.has(candidate.vmId),
+      )
+      return selected
+        ? { ...selected, ok: true, release: () => released.push(selected.accountId) }
+        : { ok: false, reason: 'no_eligible_accounts' }
     },
+    markCooldown() {},
+    markSuccess() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: {
       max_same_account_retries: 0,
       max_account_switches: 1,
@@ -426,6 +434,123 @@ test('a Claude stream that fails before the queue delay keeps the HTTP status', 
   }
 })
 
+test('x-kin-queue: off reaches the runner as allowQueue:false; without it the request may queue', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-hint-'))
+  const seen = []
+  const handler = createHandler({
+    root,
+    routing: { compatibility: {}, failover: { stream_keepalive_ms: 1000, queue_keepalive_delay_ms: 5_000 } },
+    run: async (opts) => {
+      seen.push(opts.allowQueue)
+      return overloaded()
+    },
+  })
+  try {
+    const off = createResponse()
+    await invoke(handler, off, { 'x-kin-queue': 'off' })
+    assert.equal(off.statusCode, 529)
+    assert.equal(off.body.error.code, 'pool_overloaded')
+    assert.equal(off.chunks.length, 0)
+    await invoke(handler, createResponse())
+    assert.deepEqual(seen, [false, true])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('zero-execution session_home_slot_busy 529 logs attribution without ingesting quota or billing key requests', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-home-slot-busy-no-bill-'))
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {}, failover: {} }))
+  let ingested = 0
+  let recorded = 0
+  let finished = null
+  const handler = createHandleProtocol({
+    json(res, status, body) {
+      res.statusCode = status
+      res.body = body
+      res.headersSent = true
+      return body
+    },
+    writeSSEHeaders(res) {
+      res.writeHead(200)
+    },
+    readBody: async () => ({ ...MESSAGE, stream: false }),
+    requireAuth(req) {
+      req.apiKeyKind = 'managed'
+      req.apiKeyRecord = { id: 'key_1', group_id: 1, group_type: 'all' }
+      return true
+    },
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: {
+      start: () => ({ request_id: 'home-slot-busy', mode: 'normal', t0: Date.now() }),
+      finish(_ctx, bag) {
+        finished = bag
+      },
+    },
+    stickyRouter: {},
+    accountQuota: {
+      ingestHeaders() {
+        ingested++
+      },
+    },
+    apiKeyStore: {
+      acquire: () => ({ ok: true }),
+      release() {},
+      recordUsage() {
+        recorded++
+      },
+    },
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: {}, failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+    failoverRunner: {
+      run: async () => ({
+        ok: false,
+        status: 529,
+        via: 'pool-failover',
+        terminalState: 'exhausted',
+        retryAfterSec: 1,
+        accountId: 'account-1',
+        vmId: 'vm-01',
+        attemptCount: 0,
+        body: {
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            code: 'pool_overloaded',
+            message: '号池负载过高，稍后再试',
+            details: { reason: 'session_home_slot_busy', attempt_count: 0 },
+          },
+        },
+      }),
+    },
+  })
+  try {
+    const res = createResponse()
+    await invoke(handler, res, { 'x-kin-queue': 'off' })
+    assert.equal(res.statusCode, 529)
+    assert.equal(res.body.error.code, 'pool_overloaded')
+    assert.equal(ingested, 0)
+    assert.equal(recorded, 0)
+    assert.equal(finished.account_id, 'account-1')
+    assert.equal(finished.vm_id, 'vm-01')
+    assert.equal(finished.attempt_count, 0)
+    assert.equal(finished.upstream_status, null)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('a non-stream Claude request does not emit queue pings', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-keepalive-json-'))
   const res = createResponse()
@@ -518,6 +643,97 @@ test('an incomplete native handoff never becomes a successful output-limit termi
     assert.doesNotMatch(body, /"stop_reason":"max_tokens"|event: message_stop/)
     if (res.statusCode === 200) assert.match(body, /event: error/)
     else assert.equal(res.statusCode, 502)
+  } finally {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('SSE stream preserves deltas containing literal response_headers and multi-byte UTF-8 across chunks', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-sse-response-headers-'))
+  const socketPath = path.join(root, 'kernel.sock')
+  const tokenPath = path.join(root, 'internal.token')
+  fs.writeFileSync(tokenPath, 'offline-sse-filter-token')
+  const server = http.createServer(async (req, response) => {
+    for await (const _chunk of req) {
+    }
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    const raw = [
+      'event: response_headers\ndata: {"type":"response_headers","headers":{"x-request-id":"req_internal"}}\n\n',
+      `event: message_start\ndata: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: 'msg_response_headers_text',
+          type: 'message',
+          role: 'assistant',
+          model: MESSAGE.model,
+          content: [],
+          usage: { input_tokens: 2, output_tokens: 0 },
+        },
+      })}\n\n`,
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"check response_headers 字段"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const buf = Buffer.from(raw, 'utf8')
+    // Split directly inside the multi-byte UTF-8 sequence for "字".
+    const splitAt = buf.indexOf(Buffer.from('字', 'utf8')) + 1
+    response.write(buf.subarray(0, splitAt))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    response.end(buf.subarray(splitAt))
+  })
+  await new Promise((resolve) => server.listen(socketPath, resolve))
+  const exec = {
+    projectRoot: root,
+    homeDir: path.join(root, 'cli-home'),
+    vm: {
+      id: 'sse-filter-test',
+      runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
+    },
+  }
+  const res = createResponse()
+  const handler = createHandler({
+    root,
+    routing: { compatibility: {}, failover: { stream_keepalive_ms: 1000, queue_keepalive_delay_ms: 5000 } },
+    run: async ({ callAttempt }) =>
+      callAttempt({
+        candidate: { exec, vmId: 'sse-filter-test' },
+        body: { ...MESSAGE, stream: true },
+        attemptMeta: {
+          cliHop: true,
+          cragPrint: false,
+          preparedHop: { decision: { wanted: 'rust', blocked: false }, ready: { ok: true, health: { ok: true } } },
+        },
+        deliveryMode: 'realtime',
+        onCommit() {},
+      }),
+  })
+  try {
+    await invoke(handler, res)
+    const rawOut = res.chunks.join('')
+    const frames = rawOut
+      .split(/\r?\n\r?\n/)
+      .map((frame) => frame.trim())
+      .filter(Boolean)
+    const parsed = frames.map((frame) => {
+      const eventLine = frame.split('\n').find((line) => line.startsWith('event:'))
+      const dataLines = frame
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+      assert.ok(eventLine, `expected event line in frame: ${frame}`)
+      assert.ok(dataLines.length > 0, `expected non-empty data line in frame: ${frame}`)
+      return { event: eventLine.slice(6).trim(), data: JSON.parse(dataLines.join('\n')) }
+    })
+    assert.equal(
+      parsed.some((f) => f.event === 'response_headers' || f.data.type === 'response_headers'),
+      false,
+    )
+    const delta = parsed.find((f) => f.event === 'content_block_delta')
+    assert.equal(delta?.data?.delta?.text, 'check response_headers 字段')
   } finally {
     server.closeAllConnections()
     await new Promise((resolve) => server.close(resolve))

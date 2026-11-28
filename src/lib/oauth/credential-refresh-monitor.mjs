@@ -9,6 +9,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   PROACTIVE_REFRESH_SKEW_MS,
+  classifyCredentialRefresh,
   hasCredentialPresence,
   hasRefreshPresence,
   needsRefresh,
@@ -60,6 +61,10 @@ export function vmHasProxyPath(vm) {
 
 export function isCredentialRefreshTarget(vm) {
   if (!vm?.id) return false
+  // Codex 槽明确挡在网外：OpenAI 协议 AT TTL=240h、RT 可重复使用且不轮换，
+  // 流量随路（rotateIfNeeded）天然覆盖——本网对它只会把 RT 送去 slot-oauth
+  // 路径空撞（codex 槽无 kin-worker，必回 credential_required 落脏标）。
+  if (isCodexVm(vm)) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh) return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false
@@ -67,7 +72,7 @@ export function isCredentialRefreshTarget(vm) {
   return true
 }
 
-const REVOKED_ACCESS = /access token has been revoked|token has been revoked|oauth_revoked/i
+const REVOKED_ACCESS = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
 
 /** Operator hint only. Scheduled Ensure must not auto-force a still-unexpired ticket. */
 export function shouldForceRefresh(vm) {
@@ -83,8 +88,18 @@ export function shouldForceRefresh(vm) {
 
 /** Due 15 minutes ahead so the host refresh always beats the in-slot CLI's 5-minute refresh. */
 export function needsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_REFRESH_SKEW_MS) {
-  if (vm?.refresh_error || vm?.claude?.refresh_error) return false
+  // Older versions persisted transport failures as credential errors. Retry
+  // those at the ordinary monitor cadence; actual grant rejection stays parked.
+  const errors = [vm?.refresh_error, vm?.claude?.refresh_error].filter(Boolean)
+  if (errors.some((code) => classifyCredentialRefresh({ error: { code } }) !== 'retryable')) return false
   return needsRefresh(vm?.expires_at || vm?.claude?.expires_at, now, skewMs)
+}
+
+/** Parked because the node's worker could not guard refresh retries; only a worker upgrade ends that. */
+export function isUpgradeParked(vm) {
+  // Only where clearUpgradeRequired can clear it: markVmRefreshError writes claude.refresh_error and nothing
+  // writes the top-level field. Looking at both would probe a slot every pass that could never be released.
+  return vm?.claude?.refresh_error === 'worker_upgrade_required'
 }
 
 /**
@@ -124,6 +139,10 @@ export function createCredentialRefreshMonitor(opts = {}) {
     inflight = (async () => {
       const started = nowFn()
       const vms = opts.listTargets?.() || []
+      // Codex 槽不进本网：OpenAI 的 AT TTL=10 天、RT 不轮换且可重复使用，
+      // 流量随路（rotateIfNeeded）天然覆盖；持续保活只会高频暴露 token 端点
+      // （风控关联信号，撞封号三铁律）。isCredentialRefreshTarget 的
+      // hasRefreshPresence(vm.claude) 门天然把 codex 槽挡在外面。
       const due = vms.filter((vm) => isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, started))
       const items = []
       if (due.length && typeof opts.refreshOne === 'function') {
@@ -144,6 +163,20 @@ export function createCredentialRefreshMonitor(opts = {}) {
               refresh_class: 'retryable',
               error: String(error?.message || error).slice(0, 200),
             })
+          }
+        })
+      }
+      // Slots parked on an old worker: ask the node whether it has been upgraded. A yes clears the park and
+      // the next pass refreshes through the guarded path; nothing is sent to the upstream here.
+      const revived = []
+      if (typeof opts.reviveOne === 'function') {
+        const waiting = vms.filter((vm) => isCredentialRefreshTarget(vm) && isUpgradeParked(vm))
+        await mapPool(waiting, config.concurrency, async (vm) => {
+          try {
+            const result = await opts.reviveOne(vm)
+            if (result?.revived) revived.push(vm.id)
+          } catch {
+            /* probe failed: stay parked, try again next pass */
           }
         })
       }
@@ -181,6 +214,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
         at: new Date(nowFn()).toISOString(),
         duration_ms: nowFn() - started,
         due: due.length,
+        revived,
         link_failures: linkFailures,
         items,
       }

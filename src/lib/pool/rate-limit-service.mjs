@@ -9,6 +9,7 @@
  * clears these columns. Only a live `5h-status=allowed` header or the reset
  * passing lifts a rate limit.
  */
+import { getCacheRuntime } from '../cache/index.mjs'
 import { extraHeadersFromLimitError, parseResetMs, WINDOW_5H_MS } from './quota-window.mjs'
 
 export const DEFAULT_RATE_LIMIT = Object.freeze({
@@ -23,6 +24,8 @@ export const EMPTY_RESPONSE_REASON = 'empty_response'
 
 const SESSION_WINDOW_MIN_AGE_MS = WINDOW_5H_MS
 const SESSION_WINDOW_MAX_AHEAD_MS = 7 * 24 * 3600_000
+const SESSION_WINDOW_DEDUPE_MS = 60_000
+const MAX_LOCAL_RPM_BUCKETS = 4096
 
 function positive(value, fallback) {
   const n = Number(value)
@@ -87,12 +90,102 @@ export function anthropic429Reset(headers = {}, now = Date.now()) {
   return null
 }
 
+export function infer429Window(headers = {}, parsed = null) {
+  if (parsed?.window) return parsed.window
+  if (isRejected(header(headers, 'anthropic-ratelimit-unified-7d-status'))) return '7d'
+  const claim = String(header(headers, 'anthropic-ratelimit-unified-representative-claim') || '').toLowerCase()
+  if (/seven_day_overage_included|7d_oi/.test(claim)) return '7d_oi'
+  if (/seven_day|7d/.test(claim)) return '7d'
+  return '5h'
+}
+
+export function inferRateLimitWindow(result = {}, now = Date.now()) {
+  const headers = extraHeadersFromLimitError(bodyMessage(result?.body), result?.headers || {}, now)
+  const parsed = anthropic429Reset(headers, now)
+  return infer429Window(headers, parsed)
+}
+
 export class RateLimitService {
   constructor({ runtimeRepo = null, accountQuota = null, config = {}, onUsageProbe = null } = {}) {
     this.runtimeRepo = runtimeRepo
     this.accountQuota = accountQuota
     this.config = normalizeRateLimitConfig(config)
     this.onUsageProbe = onUsageProbe
+    this.localRpmBuckets = new Map() // `${scope}:${id}:${bucket}` -> { count, expiresAtMs }
+    this._lastWindowPatch = new Map() // accountId -> { vmId, status, start, end, at }
+  }
+
+  /**
+   * Synchronous local fixed-window RPM check & increment (fallback when Redis is unavailable).
+   */
+  checkRpm(scope, id, limit, { windowSec = 60, now = Date.now() } = {}) {
+    const cap = Number(limit) || 0
+    const win = Math.max(1, Math.floor(Number(windowSec) || 60))
+    if (cap <= 0 || !id) {
+      return { allowed: true, current: 0, limit: 0, remaining: null, retryAfterSec: 0, resetAt: 0 }
+    }
+    const nowSec = Math.floor(now / 1000)
+    const bucket = Math.floor(nowSec / win)
+    const resetSec = (bucket + 1) * win
+    const retryAfterSec = Math.max(1, resetSec - nowSec)
+    const key = `${String(scope || 'account')}:${String(id)}:${bucket}`
+    if (this.localRpmBuckets.size >= MAX_LOCAL_RPM_BUCKETS) {
+      for (const [k, v] of this.localRpmBuckets) {
+        if (v.expiresAtMs <= now) this.localRpmBuckets.delete(k)
+      }
+    }
+    const cur = this.localRpmBuckets.get(key)
+    const count = cur && cur.expiresAtMs > now ? cur.count : 0
+    if (count >= cap) {
+      return {
+        allowed: false,
+        current: count,
+        limit: cap,
+        remaining: 0,
+        retryAfterSec,
+        resetAt: resetSec * 1000,
+      }
+    }
+    const next = count + 1
+    this.localRpmBuckets.set(key, { count: next, expiresAtMs: (resetSec + win) * 1000 })
+    return {
+      allowed: true,
+      current: next,
+      limit: cap,
+      remaining: Math.max(0, cap - next),
+      retryAfterSec: 0,
+      resetAt: resetSec * 1000,
+    }
+  }
+
+  /**
+   * Cross-instance RPM check & increment backed by Redis `ConcurrencyCache.checkAndIncrRpm`
+   * when Redis is ready; Fail-Opens seamlessly to local Map `checkRpm()` when Redis is absent.
+   */
+  async checkRpmAsync(scope, id, limit, { windowSec = 60, now = Date.now() } = {}) {
+    const cap = Number(limit) || 0
+    const win = Math.max(1, Math.floor(Number(windowSec) || 60))
+    if (cap <= 0 || !id) {
+      return { allowed: true, current: 0, limit: 0, remaining: null, retryAfterSec: 0, resetAt: 0 }
+    }
+    const cache = getCacheRuntime()
+    if (cache?.client?.hasRedis) {
+      return cache.concurrency.checkAndIncrRpm(String(scope || 'account'), String(id), cap, win)
+    }
+    return this.checkRpm(scope, id, cap, { windowSec: win, now })
+  }
+
+  /** Read current window RPM count (Redis when ready, local Map fallback). */
+  async getRpmCountAsync(scope, id, { windowSec = 60, now = Date.now() } = {}) {
+    if (!id) return 0
+    const win = Math.max(1, Math.floor(Number(windowSec) || 60))
+    const cache = getCacheRuntime()
+    if (cache?.client?.hasRedis) {
+      return cache.concurrency.getRpmCount(String(scope || 'account'), String(id), win)
+    }
+    const bucket = Math.floor(Math.floor(now / 1000) / win)
+    const entry = this.localRpmBuckets.get(`${String(scope || 'account')}:${String(id)}:${bucket}`)
+    return entry && entry.expiresAtMs > now ? entry.count : 0
   }
 
   setConfig(config = {}) {
@@ -108,14 +201,50 @@ export class RateLimitService {
    * account until its reset, a short limit just passes. Retry-After alone
    * never proves a plan window.
    */
-  handleUpstreamError({ accountId, vmId, result = {}, policy = null, now = Date.now() } = {}) {
+  handleUpstreamError({
+    accountId,
+    vmId,
+    result = {},
+    policy = null,
+    now = Date.now(),
+    requestStartedAt = null,
+    resetGenerations = null,
+  } = {}) {
     if (!accountId || !this.runtimeRepo || result?.committed || policy?.scope === 'request') return null
     const reason = String(policy?.reason || '')
-    if (Number(result?.status) === 429) {
-      this.requestUsageProbe({ accountId, vmId, now })
+    if (reason === 'fable_rate_limited') {
+      if (
+        this.accountQuota?.isPreResetResponse?.(accountId, '7d_oi', {
+          requestStartedAt,
+          resetGenerations,
+        })
+      ) {
+        return { kind: 'pre_reset_ignored', ignored: true, window: '7d_oi' }
+      }
+      if (Number(result?.status) === 429) {
+        this.requestUsageProbe({ accountId, vmId, now })
+      }
+      return null
     }
     if (policy?.scope === 'account' && reason === 'account_quota_exhausted') {
-      return this.handle429({ accountId, vmId, result, now })
+      const headers = extraHeadersFromLimitError(bodyMessage(result.body), result.headers || {}, now)
+      const parsed = anthropic429Reset(headers, now)
+      const targetWindow = infer429Window(headers, parsed)
+      if (
+        this.accountQuota?.isPreResetResponse?.(accountId, targetWindow, {
+          requestStartedAt,
+          resetGenerations,
+        })
+      ) {
+        return { kind: 'pre_reset_ignored', ignored: true, window: targetWindow }
+      }
+      if (Number(result?.status) === 429) {
+        this.requestUsageProbe({ accountId, vmId, now })
+      }
+      return this.handle429({ accountId, vmId, result, now, requestStartedAt, resetGenerations })
+    }
+    if (Number(result?.status) === 429) {
+      this.requestUsageProbe({ accountId, vmId, now })
     }
     if (reason === 'rate_limited_unknown') return null
     if (reason === 'provider_overloaded' && Number(result?.status) === 529) {
@@ -143,12 +272,42 @@ export class RateLimitService {
     return true
   }
 
-  handle429({ accountId, vmId, result = {}, now = Date.now() }) {
+  /** Redis-shared throttled usage probe (falls back to local Map when Redis is absent). */
+  async requestUsageProbeAsync({ accountId, vmId, now = Date.now() }) {
+    if (typeof this.onUsageProbe !== 'function') return false
+    const key = String(accountId || vmId || '')
+    if (!key) return false
+    const gapSec = Math.max(1, Math.round(Number(this.config.usage_probe_min_interval_sec) || 180))
+    const cache = getCacheRuntime()
+    if (cache?.client?.hasRedis) {
+      const verdict = await cache.concurrency.checkAndIncrRpm('usage_probe', key, 1, gapSec)
+      if (!verdict.allowed) return false
+      if (!this.probeAskedAt) this.probeAskedAt = new Map()
+      this.probeAskedAt.set(key, now)
+      try {
+        this.onUsageProbe({ accountId, vmId })
+      } catch {}
+      return true
+    }
+    return this.requestUsageProbe({ accountId, vmId, now })
+  }
+
+  handle429({ accountId, vmId, result = {}, now = Date.now(), requestStartedAt = null, resetGenerations = null }) {
     const headers = extraHeadersFromLimitError(bodyMessage(result.body), result.headers || {}, now)
     const parsed = anthropic429Reset(headers, now)
+    const targetWindow = infer429Window(headers, parsed)
+    if (
+      this.accountQuota?.isPreResetResponse?.(accountId, targetWindow, {
+        requestStartedAt,
+        resetGenerations,
+      })
+    ) {
+      return null
+    }
     const fallback = !parsed
     const resetAt = parsed?.resetAt || now + this.config.fallback_cooldown_min * 60_000
     const windowEnd = parsed?.fiveHourReset || (parsed?.window === '7d' ? null : resetAt)
+    this._lastWindowPatch.delete(accountId)
     this.runtimeRepo.updateWindow?.(accountId, {
       vmId,
       rateLimitedAt: now,
@@ -161,6 +320,9 @@ export class RateLimitService {
         exhausted: true,
         status: 429,
         countRequest: false,
+        now,
+        ...(requestStartedAt != null ? { requestStartedAt } : {}),
+        ...(resetGenerations ? { resetGenerations } : {}),
       })
     } catch {}
     if (fallback) this.requestUsageProbe({ accountId, vmId, now })
@@ -169,6 +331,7 @@ export class RateLimitService {
 
   handle529({ accountId, vmId, now = Date.now() }) {
     const until = now + this.config.overload_cooldown_min * 60_000
+    this._lastWindowPatch.delete(accountId)
     this.runtimeRepo.updateWindow?.(accountId, { vmId, overloadUntil: until })
     return { kind: 'overloaded', until }
   }
@@ -177,8 +340,23 @@ export class RateLimitService {
    * Update the session window on every response with live headers.
    * An out-of-range reset is ignored. `allowed` is the only early unblock.
    */
-  updateSessionWindow({ accountId, vmId = null, headers = {}, now = Date.now() } = {}) {
+  updateSessionWindow({
+    accountId,
+    vmId = null,
+    headers = {},
+    now = Date.now(),
+    requestStartedAt = null,
+    resetGenerations = null,
+  } = {}) {
     if (!accountId || !this.runtimeRepo) return false
+    if (
+      this.accountQuota?.isPreResetResponse?.(accountId, '5h', {
+        requestStartedAt,
+        resetGenerations,
+      })
+    ) {
+      return false
+    }
     const status = String(header(headers, 'anthropic-ratelimit-unified-5h-status') || '').toLowerCase()
     if (!status) return false
     const patch = { vmId, sessionWindowStatus: status }
@@ -196,6 +374,28 @@ export class RateLimitService {
     const sevenDayOpen = !isRejected(header(headers, 'anthropic-ratelimit-unified-7d-status'))
     if (status === 'allowed' && sevenDayOpen && limited) {
       patch.rateLimitResetAt = null
+    }
+    if (this.runtimeRepo.db && patch.rateLimitResetAt !== null) {
+      const prev = this._lastWindowPatch.get(accountId)
+      if (
+        prev &&
+        prev.vmId === (vmId || null) &&
+        prev.status === status &&
+        prev.start === (patch.sessionWindowStart ?? null) &&
+        prev.end === (patch.sessionWindowEnd ?? null) &&
+        now - prev.at < SESSION_WINDOW_DEDUPE_MS
+      ) {
+        return false
+      }
+      this._lastWindowPatch.set(accountId, {
+        vmId: vmId || null,
+        status,
+        start: patch.sessionWindowStart ?? null,
+        end: patch.sessionWindowEnd ?? null,
+        at: now,
+      })
+    } else if (patch.rateLimitResetAt === null) {
+      this._lastWindowPatch.delete(accountId)
     }
     this.runtimeRepo.updateWindow?.(accountId, patch)
     return patch.rateLimitResetAt === null

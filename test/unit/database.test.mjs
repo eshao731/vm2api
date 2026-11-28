@@ -502,3 +502,82 @@ test('migration 042 adds image generation columns; old rows and prompt totals st
   )
   db.close()
 })
+
+test('migration 067 upgrades pre-067 crag_shop_orders in place with NULL activation failure columns and idempotent checksums', () => {
+  const src = path.resolve('src/lib/db/migrations')
+  const oldDir = path.join(tmp, 'before067')
+  fs.mkdirSync(oldDir)
+  for (const file of fs.readdirSync(src)) {
+    if (file.endsWith('.sql') && file < '067') fs.copyFileSync(path.join(src, file), path.join(oldDir, file))
+  }
+  const db = new DatabaseSync(':memory:')
+  try {
+    applyMigrations(db, { migrationsDir: oldDir })
+    db.prepare(`INSERT INTO crag_shop_orders
+      (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit,
+       activation_vm_id, activation_fingerprint)
+      VALUES ('legacy-pinned', 'panel:admin', 'req-067', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10,
+              'vm-1', ?)`).run('a'.repeat(64))
+    const applied = applyMigrations(db, { migrationsDir: src })
+    assert.ok(applied.includes('067_crag_shop_activation_error.sql'))
+    assert.deepEqual(applyMigrations(db, { migrationsDir: src }), [])
+    const row = db
+      .prepare(
+        'SELECT activation_error_code, activation_error_recovery, activation_request_id FROM crag_shop_orders WHERE order_id = ?',
+      )
+      .get('legacy-pinned')
+    assert.deepEqual(
+      { ...row },
+      { activation_error_code: null, activation_error_recovery: null, activation_request_id: null },
+    )
+  } finally {
+    db.close()
+  }
+})
+
+test('migration 073 / pg 010 backfill api_endpoints body_policy to caller and keep persona selectable', () => {
+  const src = path.resolve('src/lib/db/migrations')
+  const pg010 = path.resolve('src/lib/db/pg/pg-migrations/010_api_endpoint_body_policy_default.sql')
+  const oldDir = path.join(tmp, 'before073')
+  fs.mkdirSync(oldDir, { recursive: true })
+  for (const file of fs.readdirSync(src)) {
+    if (file.endsWith('.sql') && file < '073') fs.copyFileSync(path.join(src, file), path.join(oldDir, file))
+  }
+  const db = new DatabaseSync(':memory:')
+  try {
+    applyMigrations(db, { migrationsDir: oldDir })
+    db.prepare(`INSERT INTO api_endpoints (id, name, base_url, created_at, updated_at)
+      VALUES ('ep_old_default', 'Old Default', 'https://api.anthropic.com', '2026-11-27', '2026-11-27')`).run()
+    db.prepare(`INSERT INTO api_endpoints (id, name, base_url, created_at, updated_at, body_policy)
+      VALUES ('ep_old_caller', 'Old Caller', 'https://api.anthropic.com', '2026-11-27', '2026-11-27', 'caller')`).run()
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_default').body_policy,
+      'persona',
+    )
+
+    const applied = applyMigrations(db, { migrationsDir: src })
+    assert.ok(applied.includes('073_api_endpoint_body_policy_default.sql'))
+    assert.deepEqual(applyMigrations(db, { migrationsDir: src }), [])
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_default').body_policy,
+      'caller',
+    )
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_caller').body_policy,
+      'caller',
+    )
+
+    // Turning persona injection back on explicitly stays allowed by CHECK constraint
+    db.prepare(`UPDATE api_endpoints SET body_policy = 'persona' WHERE id = 'ep_old_default'`).run()
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_default').body_policy,
+      'persona',
+    )
+
+    const pg010Sql = fs.readFileSync(pg010, 'utf8')
+    assert.match(pg010Sql, /ALTER TABLE api_endpoints[\s\S]*ALTER COLUMN body_policy SET DEFAULT 'caller'/i)
+    assert.match(pg010Sql, /UPDATE api_endpoints[\s\S]*SET body_policy = 'caller'/i)
+  } finally {
+    db.close()
+  }
+})

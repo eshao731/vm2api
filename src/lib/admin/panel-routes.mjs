@@ -3,6 +3,7 @@
  * envelopes are unchanged; slot start/reload go through startSlotReady.
  */
 import { setSlotDesktopEnabled, slotDesktopStatus } from '../vm/slot-desktop.mjs'
+import { validateGeminiRoutingPatch } from '../gemini/routing-config.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -41,13 +42,22 @@ import {
   publicJevConfig,
   publicJevKeys,
   readJevConfig,
+  resumeJevKeys,
 } from '../protocol/jev-intercept.mjs'
+import { invalidateRiskBanCache } from '../protocol/intercept-gate.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
+import {
+  parseCodexImportPayload,
+  upsertCodexAccount,
+  readCodexAccounts,
+  persistCodexCredentialState,
+  markCodexGrantDead,
+} from '../vm/codex-slot.mjs'
+import { clearOpenAIAccountHold } from '../pool/openai-account-runtime.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -89,6 +99,12 @@ import {
   saveGptModelPolicy,
   resetGptModelPolicy,
 } from '../protocol/gpt-model-policy.mjs'
+import {
+  getGeminiModelPolicy,
+  listGeminiPolicyModels,
+  saveGeminiModelPolicy,
+  resetGeminiModelPolicy,
+} from '../protocol/gemini-model-policy.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import {
   defaultSeedPolicy,
@@ -99,11 +115,19 @@ import {
 
 import { runVmTestChat, resolveTestModels, syncCodexCatalog } from './vm-test-chat.mjs'
 import { VmTestScheduleError } from './vm-test-schedule.mjs'
-import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-monitor.mjs'
+import { readCatalogSync, syncClaudeCatalog, syncGptCatalog, syncGeminiCatalog } from './catalog-monitor.mjs'
 import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
 import { buildPricing } from './pricing-view.mjs'
 import { publicKeyView } from './api-keys.mjs'
-import { assertVmScope, normalizeGroupType, normalizeKeyScope } from './key-scope.mjs'
+import {
+  assertKeyResourceOwnership,
+  assertVmScope,
+  keyTierPolicyFromRecord,
+  normalizeGroupType,
+  normalizeKeyPoolBindingInput,
+  normalizeKeyScope,
+  normalizeMultiTierKeyConfig,
+} from './key-scope.mjs'
 import {
   assertVmPoolExists,
   createVmPool,
@@ -112,11 +136,25 @@ import {
   vmPoolHttpStatus,
   vmPoolsFor,
 } from './vm-pools.mjs'
+import { SchedulerPoolsRepo } from '../db/repos/scheduler-pools-repo.mjs'
+import {
+  createSchedulerPoolsHandler,
+  enrichApiKeyViewsWithPools,
+  syncVmPoolToSchedulerPool,
+} from './scheduler-pools-routes.mjs'
 import { publicEndpointView, fetchUpstreamModels, API_ENDPOINT_PRESETS } from './api-endpoints.mjs'
 import { runAnthropicConsole, resolveConsoleProxyUrl, savedEndpointKey } from './anthropic-console.mjs'
 import { publicUserView } from './panel-users.mjs'
 import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
-import { createGeminiPanelHandler, isGeminiPanelPath } from '../gemini/routes.mjs'
+import { INTEGRATION_DELEGATED, handleIntegrationAdminRoute } from './integration-routes.mjs'
+import { IntegrationTokenStore } from './integration-tokens.mjs'
+import {
+  callGeminiHost,
+  createGeminiPanelHandler,
+  geminiProxyEgressOptionsFor,
+  geminiProxyFor,
+  isGeminiPanelPath,
+} from '../gemini/routes.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
@@ -131,12 +169,14 @@ import {
   assignOriginForOwner,
   clampVmCreateQuota,
   countUserCreatedVms,
+  endpointOwnerId,
   filterVmsForPanel,
   normalizeOwnerId,
+  ownerScopeFromApiKey,
   vmOwnerId,
 } from './resource-owner.mjs'
 import { servePoolSeatStream } from './pool-seat-stream.mjs'
-import { logsToCsv, logsToJsonl } from './request-log.mjs'
+import { logsToCsv, logsToJsonl, validateLoggingRoutingPatch } from './request-log.mjs'
 import {
   listVms,
   getVm,
@@ -185,7 +225,10 @@ import { parseScheduleLevelInput, manualScheduleLevelOf } from '../pool/credenti
 import { parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
 import { validateOpenAIQuotaPatch, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
+import { validateQuotaRoutingPatch } from '../pool/pool-scheduler.mjs'
 import { validateInferenceWebsocketPatch } from '../protocol/codex-route.mjs'
+import { validateRedactionPatch } from '../redaction/policy.mjs'
+import { ensureRedaction, redactionStatus } from '../redaction/runtime.mjs'
 import {
   normalizeInferenceConfig,
   normalizeSessionSlots,
@@ -199,16 +242,23 @@ import {
   SESSION_SLOT_MIN,
   validateInferenceRoutingPatch,
 } from '../vm/slot-engine.mjs'
-import { telemetryDefaultEnabled, validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  validateTelemetryRoutingPatch,
+} from '../vm/native-telemetry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
-import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
+import { snapshotDatabaseMetricsAsync } from '../db/database-metrics.mjs'
 import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
-import { getDb, getDbPath } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, getDbEngine, getDbPath, getPgPool, isDbOpen } from '../db/database.mjs'
+import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
+import { computeEtag, matchesEtag } from '../cache/cache-client.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../cache/index.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -220,6 +270,7 @@ import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersio
 import {
   cragReleasePin,
   describeKernelCatalog,
+  geminiReleasePin,
   listKernelReleases,
   pullKernelRelease,
   selectKernelRelease,
@@ -237,16 +288,18 @@ import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { renameVmId } from '../vm/vm-rename.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
-import { reloadActiveVm } from '../core/config.mjs'
+import { DEFAULT_MAX_REQUEST_BYTES, reloadActiveVm } from '../core/config.mjs'
 import {
   OS_CATALOG,
   kernelForIndex,
+  normalizeOsKernel,
   normalizeTimezone,
   nextNumericIndex,
   padVm,
   discardSlotContainer,
   STANDARD_LOCALE,
 } from '../vm/vm-runtime.mjs'
+import { isCragDebian13Kernel } from '../vm/custom-os-runtime.mjs'
 import {
   startSlotReady,
   reloadSlotReady,
@@ -294,10 +347,16 @@ import {
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
-import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
+import {
+  assignComputerFingerprint,
+  fingerprintDir,
+  pushLiveSlotTimezoneSync,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
 import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
+  cragTargetArch,
   describeWrapSample,
   makeWrapSample,
   materializeResolvedKernel,
@@ -315,16 +374,24 @@ import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import {
   createCragShopHandler,
+  createGeminiCragShopHandler,
   cragShopRoute,
+  geminiCragShopRoute,
   isCragDeviceShopPath,
   isCragShopPath,
+  isGeminiCragShopPath,
   sameOriginPost,
 } from './crag-shop.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
-import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
+import {
+  countTokensViaWorker,
+  syncClaudeClientCredentials,
+  withCredentialRefreshLock,
+} from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
+import { countTokensEnabled } from '../protocol/user-count-tokens.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import {
   activateCragLicense,
@@ -338,7 +405,7 @@ import {
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
-import { normalizeHealthProbeConfig } from './health-probe.mjs'
+import { listPlatformCatalogModels, normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import {
   isNotifyChannel,
@@ -446,10 +513,14 @@ function usageLogFilters(req, u) {
     model: get('model'),
     endpoint: get('endpoint'),
     protocol: get('protocol'),
+    via: get('via'),
+    final_state: get('final_state'),
     status_code: get('status_code'),
     upstream_400: get('upstream_400') === '1',
+    upstream_risk_errors: get('upstream_risk_errors') === '1',
     request_id: get('request_id'),
     exclude_status_200: get('exclude_status_200') === '1',
+    failed_only: get('failed_only') === '1',
     model_mismatch: get('model_mismatch') === '1',
     min_attempt_count: get('min_attempt_count'),
     error_class: get('error_class'),
@@ -534,6 +605,9 @@ async function commitImportedCodexVm({
   if (saved.access_token || saved.refresh_token) {
     const reopened = clearUnschedulable(cfg.paths.project, existing.id, { by: 'credential_import' })
     if (reopened) Object.assign(existing, getVm(cfg.paths.project, existing.id) || {})
+    // 凭证换新同时清进程内存 hold（含 grant-death 的 MAX_SAFE_INTEGER 永久占位），
+    // 否则复活号磁盘健康但调度层恒 cooldown，直到进程重启才回池。
+    clearOpenAIAccountHold(existing.id)
   }
   let catalog = null
   try {
@@ -675,10 +749,13 @@ async function runKernelSync({
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartKernel(exec).catch((e) => ({
-        ok: false,
-        error: String(e?.message || e).slice(0, 200),
-      }))
+      // A callback may return a plain result instead of a promise; neither may abort the loop.
+      item.kernel = await Promise.resolve()
+        .then(() => restartKernel(exec))
+        .catch((e) => ({
+          ok: false,
+          error: String(e?.message || e).slice(0, 200),
+        }))
       if (!item.kernel?.ok) {
         markKernelRestartPending(project, item.id, item.kernel?.reason || 'kernel_restart_failed')
         item.ok = false
@@ -740,12 +817,65 @@ function slotProxyHint(px = {}, label = null) {
   return label ? `${label} · ${endpoint}` : endpoint
 }
 
+const PANEL_STATUS_SYM = Symbol('panelStatus')
+
 export function createPanelHandler(ctx) {
+  const json = (res, status, ...args) => {
+    if (res && typeof res === 'object') res[PANEL_STATUS_SYM] = status
+    return (res?._integrationJson || ctx.json)(res, status, ...args)
+  }
+  const readBody = (req, ...args) => (req?._integrationReadBody || ctx.readBody)(req, ...args)
+  const resolvePanelDb = () => {
+    try {
+      return ctx.apiKeyStore?.db || ctx.getDb?.() || (isDbOpen() ? getDb() : null)
+    } catch {
+      return null
+    }
+  }
+  const cacheScopeOf = (db = resolvePanelDb()) => {
+    if (db && isDbOpen() && db === getDb()) {
+      return db.engine === 'postgres' ? 'pg' : db[DB_INSTANCE_ID] || 'sqlite'
+    }
+    return db?.[DB_INSTANCE_ID] || ctx.cfg?.paths?.project || 'isolated'
+  }
+  const sendCachedJson = (req, res, status, payload, { etag = null, cacheStatus = null } = {}) => {
+    const tag = etag || computeEtag(payload)
+    if (typeof res?.setHeader === 'function') {
+      res.setHeader('ETag', tag)
+      res.setHeader('Cache-Control', 'private, no-cache')
+      if (cacheStatus) res.setHeader('X-Snapshot-Cache', cacheStatus)
+    }
+    const inm = req?.headers?.['if-none-match']
+    if (inm && matchesEtag(inm, tag) && typeof res?.writeHead === 'function' && typeof res?.end === 'function') {
+      if (res && typeof res === 'object') res[PANEL_STATUS_SYM] = 304
+      res.writeHead(
+        304,
+        corsHeadersForRequest(req, {
+          ETag: tag,
+          'Cache-Control': 'private, no-cache',
+          ...(cacheStatus ? { 'X-Snapshot-Cache': cacheStatus } : {}),
+        }),
+      )
+      res.end()
+      return true
+    }
+    return json(res, status, payload)
+  }
+  const integrationTokenStore = ctx.integrationTokenStore || new IntegrationTokenStore()
   const geminiPanel = createGeminiPanelHandler({
-    json: ctx.json,
-    readBody: ctx.readBody,
+    json,
+    readBody,
     proxyPool: () => ctx.proxyPool,
+    poolScheduler: () => ctx.poolScheduler,
     terminal: ctx.geminiTerminal,
+    cragSubscription: ctx.geminiCragSubscription,
+    geminiOwnersRepo: ctx.geminiOwnersRepo || null,
+    geminiSlotPrefs: ctx.geminiSlotPrefs || null,
+    geminiScheduler: ctx.geminiScheduler || null,
+    panelUsers: ctx.panelUsers || null,
+    requestLog: ctx.requestLog || null,
+    billingReady: Boolean(ctx.requestLog),
+    publicBaseUrl: ctx.cfg?.base_url || null,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -756,7 +886,6 @@ export function createPanelHandler(ctx) {
       if (job.expiresAt <= now) kernelInstallJobs.delete(id)
     }
   }
-  const json = (...args) => ctx.json(...args)
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
     json(res, 409, {
@@ -765,21 +894,32 @@ export function createPanelHandler(ctx) {
     })
     return true
   }
-  const readBody = (...args) => ctx.readBody(...args)
   const readRawBody = (...args) => (ctx.readRawBody || defaultReadRawBody)(...args)
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const isShopCurrentAdmin = (req) => {
+    const record = ctx.panelUsers.getByUsername(req.panelUser)
+    if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+    return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+  }
   const handleCragShop =
     ctx.handleCragShop ??
     createCragShopHandler({
       getDb: ctx.getDb,
       subscription: ctx.cragSubscription,
-      isCurrentAdmin: (req) => {
-        const record = ctx.panelUsers.getByUsername(req.panelUser)
-        if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
-        return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
-      },
+      isCurrentAdmin: isShopCurrentAdmin,
+      dataDir: cfg?.paths?.data,
+      publicBaseUrl: cfg?.base_url,
+      json,
+      readRawBody,
+    })
+  const handleGeminiCragShop =
+    ctx.handleGeminiCragShop ??
+    createGeminiCragShopHandler({
+      getDb: ctx.getDb,
+      subscription: ctx.geminiCragSubscription,
+      isCurrentAdmin: isShopCurrentAdmin,
       dataDir: cfg?.paths?.data,
       publicBaseUrl: cfg?.base_url,
       json,
@@ -791,6 +931,31 @@ export function createPanelHandler(ctx) {
     publicBaseUrl: cfg?.base_url,
     json,
     readRawBody,
+  })
+  const resolveSchedulerRuntime = () => {
+    if (typeof ctx.getSchedulerRuntime === 'function') return ctx.getSchedulerRuntime()
+    return typeof ctx.schedulerRuntime === 'function' ? ctx.schedulerRuntime() : ctx.schedulerRuntime || null
+  }
+  const notifySchedulerConfigChanged = (reason) => {
+    const rt = resolveSchedulerRuntime()
+    if (!rt || typeof rt.syncConfigNow !== 'function') return
+    void rt.syncConfigNow(reason).catch(() => {})
+  }
+  const handleSchedulerPools = createSchedulerPoolsHandler({
+    getDb: () => apiKeyStore?.db || ctx.getDb?.() || getDb(),
+    getRouting: () => ctx.routingConfig || {},
+    cfg,
+    apiKeyStore: ctx.apiKeyStore,
+    apiEndpointStore: ctx.apiEndpointStore,
+    accountQuota: ctx.accountQuota,
+    poolScheduler: () => ctx.poolScheduler,
+    geminiScheduler: () => ctx.geminiScheduler,
+    geminiSlotPrefs: ctx.geminiSlotPrefs || null,
+    geminiOwnersRepo: ctx.geminiOwnersRepo || null,
+    schedulerRuntime: resolveSchedulerRuntime,
+    writeSSEHeaders: ctx.writeSSEHeaders || null,
+    json,
+    readBody,
   })
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
@@ -899,7 +1064,10 @@ export function createPanelHandler(ctx) {
     if (!hasBoundExit(vm.proxy)) {
       startError = 'no_exit'
     } else {
-      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig, bindSubscription })
+      const boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
+        routing: ctx.routingConfig,
+        bindSubscription,
+      })
       vm = getVm(cfg.paths.project, id) || vm
       if (!boot?.ok) {
         startError = boot?.error || boot?.reason || 'runtime start failed'
@@ -1074,6 +1242,10 @@ export function createPanelHandler(ctx) {
       delete normalized.group_id
       delete normalized.vm_pool_id
       delete normalized.api_endpoint_id
+      delete normalized.permission_tier
+      delete normalized.owner_id
+      delete normalized.allowed_endpoints
+      delete normalized.allowed_gemini_envs
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -1095,9 +1267,16 @@ export function createPanelHandler(ctx) {
     )
   }
 
-  function validateKeyEndpoint(value, isApi, previous = null) {
+  function isMixedOrApiCategory(value) {
+    const v = String(value || '')
+      .trim()
+      .toLowerCase()
+    return v === 'api' || v === 'all'
+  }
+
+  function validateKeyEndpoint(value, allowsEndpoint, previous = null) {
     if (value == null) return null
-    if (typeof value !== 'string' || !value.trim() || !isApi) {
+    if (typeof value !== 'string' || !value.trim() || !allowsEndpoint) {
       throw Object.assign(new Error('请选择有效的 API 渠道'), { code: 'invalid_api_endpoint_id' })
     }
     const id = value.trim()
@@ -1196,7 +1375,7 @@ export function createPanelHandler(ctx) {
             const row = byFp.get(key.key_fingerprint)
             return {
               ...key,
-              status: key.retired ? 'paused' : row?.status || key.status,
+              status: row?.status || key.status,
               last_http_status: row?.last_http_status ?? key.last_http_status ?? null,
             }
           }),
@@ -1364,6 +1543,14 @@ export function createPanelHandler(ctx) {
       targetDataplane !== 'crag' &&
       !isCodexVm(desired) &&
       typeof ctx.cragSubscription?.releaseStoppedBinding === 'function'
+    if (!isCodexVm(desired) && isCragDebian13Kernel(desired.kernel) && targetDataplane !== 'crag') {
+      return {
+        ok: false,
+        id,
+        code: 'crag_debian13_crag_only',
+        error: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+      }
+    }
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
@@ -1395,7 +1582,7 @@ export function createPanelHandler(ctx) {
     if (kernelSwitch && !isCodexVm(desired)) {
       try {
         const initialize = ctx.kernelPolicyOps?.initializeSlotSeedFiles || initializeSlotSeedFiles
-        await initialize(cfg.paths.project, desired, slotHost(desired))
+        await initialize(cfg.paths.project, desired, slotHost(desired), { routing: ctx.routingConfig })
       } catch {
         return { ok: false, id, code: 'kernel_seed_failed', error: 'Claude Code 初始化配置生成或发布失败' }
       }
@@ -1655,10 +1842,12 @@ export function createPanelHandler(ctx) {
     })
   }
 
-  function restoreRoutingRuntime(previous) {
+  async function restoreRoutingRuntime(previous) {
     ctx.routingConfig = previous
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
+    ctx.warmupMonitor?.setConfig(ctx.routingConfig.warmup)
+    ctx.cragZombieGuard?.setConfig(ctx.routingConfig.crag_zombie_guard)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {
       requestLog.setConfig({
@@ -1672,6 +1861,9 @@ export function createPanelHandler(ctx) {
     stickyRouter.reloadConfig(ctx.routingConfig)
     accountQuota.reloadConfig(ctx.routingConfig)
     ctx.poolScheduler?.reloadConfig?.(poolSchedulerConfig())
+    try {
+      await ensureRedaction(ctx.routingConfig, { projectRoot: cfg.paths.project })
+    } catch {}
   }
 
   async function prepareInheritedInferenceEngine(body) {
@@ -1688,7 +1880,7 @@ export function createPanelHandler(ctx) {
         try {
           return await persistRoutingPatch(body)
         } catch (error) {
-          restoreRoutingRuntime(previousRoutingConfig)
+          await restoreRoutingRuntime(previousRoutingConfig)
           if (body.pool || body.failover) initPoolRuntime()
           throw error
         }
@@ -1726,7 +1918,198 @@ export function createPanelHandler(ctx) {
     }
   }
 
-  return async function handlePanel(req, res, url) {
+  const shouldSyncSchedulerOnMutation = (method, pathname) => {
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return false
+    return (
+      pathname === '/admin/routing' ||
+      pathname === '/api/panel/routing' ||
+      pathname === '/api/panel/api-keys' ||
+      pathname.startsWith('/api/panel/api-keys/') ||
+      pathname === '/api/panel/api-endpoints' ||
+      pathname.startsWith('/api/panel/api-endpoints/') ||
+      pathname === '/api/panel/vms' ||
+      pathname.startsWith('/api/panel/vms/') ||
+      pathname === '/api/panel/refusal-guards' ||
+      pathname.startsWith('/api/panel/refusal-guards/') ||
+      pathname === '/api/panel/jev-intercept' ||
+      pathname.startsWith('/api/panel/jev-intercept/')
+    )
+  }
+
+  const isReadOnlyPanelPost = (method, pathname) => {
+    if (method !== 'POST') return false
+    if (
+      pathname === '/api/panel/login' ||
+      pathname === '/api/panel/login/totp' ||
+      pathname === '/api/panel/logout' ||
+      pathname === '/api/panel/scheduler/explain' ||
+      pathname === '/api/panel/api-endpoints/fetch-models' ||
+      pathname === '/api/panel/api/messages' ||
+      pathname === '/api/panel/anthropic/messages' ||
+      pathname === '/api/panel/jev-intercept/models' ||
+      pathname === '/api/panel/jev-intercept/probe' ||
+      pathname === '/api/panel/jev-intercept/quota' ||
+      pathname === '/api/panel/notify/test' ||
+      pathname === '/api/panel/notify/check'
+    ) {
+      return true
+    }
+    return (
+      /^\/api\/panel\/api-keys\/[^/]+\/reveal$/.test(pathname) ||
+      /^\/api\/panel\/proxies\/[^/]+\/reveal$/.test(pathname) ||
+      /^\/api\/panel\/api-endpoints\/[^/]+\/fetch-models$/.test(pathname) ||
+      /^\/api\/panel\/vms\/[^/]+\/(desktop-ticket|shell-ticket|test-chat|count-tokens)$/.test(pathname)
+    )
+  }
+
+  const invalidateCachesForPanelMutation = (method, pathname) => {
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return
+    if (isReadOnlyPanelPost(method, pathname)) return
+    // Pool & scheduler routes already invalidate with exact tables inside handleSchedulerPools.
+    if (
+      pathname === '/api/panel/pools' ||
+      pathname.startsWith('/api/panel/pools/') ||
+      pathname.startsWith('/api/panel/scheduler/')
+    ) {
+      return
+    }
+    const cache = getCacheRuntime()
+    let tables = ['settings']
+    let namespaces = ['panel']
+    let clearBilling = false
+    let clearUsers = false
+    let clearGroups = false
+    let clearPoolAccess = false
+    let clearNamesTable = null
+    let vmIdToClear = null
+    let riskBanKindToClear = null
+
+    if (
+      pathname === '/api/panel/vms' ||
+      pathname.startsWith('/api/panel/vms/') ||
+      pathname.startsWith('/admin/vms/') ||
+      pathname.startsWith('/admin/vm/') ||
+      pathname === '/api/panel/dataplane' ||
+      pathname.startsWith('/api/panel/kernels/') ||
+      pathname.startsWith('/api/panel/wrap-cli/') ||
+      pathname === '/api/panel/probe' ||
+      pathname === '/api/panel/health-probe' ||
+      pathname === '/api/panel/usage-probe'
+    ) {
+      tables = ['vms', 'accounts', 'account_runtime']
+      namespaces = ['panel', 'overview', 'filter-options']
+      clearNamesTable = 'vms'
+      const m = pathname.match(/^\/api\/panel\/vms\/([^/]+)/)
+      if (m) vmIdToClear = decodeURIComponent(m[1])
+    } else if (pathname === '/api/panel/proxies' || pathname.startsWith('/api/panel/proxies/')) {
+      tables = ['proxies', 'settings']
+      namespaces = ['panel']
+    } else if (pathname === '/api/panel/api-keys' || pathname.startsWith('/api/panel/api-keys/')) {
+      tables = ['api_keys', 'api_key_pool_bindings']
+      namespaces = ['panel', 'filter-options']
+      clearPoolAccess = true
+      clearNamesTable = 'api_keys'
+    } else if (pathname === '/api/panel/vm-pools' || pathname.startsWith('/api/panel/vm-pools/')) {
+      tables = ['vm_pools', 'scheduler_pools', 'scheduler_pool_members']
+      namespaces = ['panel']
+      clearPoolAccess = true
+    } else if (pathname === '/api/panel/api-endpoints' || pathname.startsWith('/api/panel/api-endpoints/')) {
+      tables = ['api_endpoints', 'api_endpoint_keys']
+      namespaces = ['panel']
+    } else if (
+      pathname === '/api/panel/users' ||
+      pathname.startsWith('/api/panel/users/') ||
+      pathname.startsWith('/api/panel/2fa') ||
+      pathname.startsWith('/api/panel/redeem') ||
+      pathname.startsWith('/api/panel/groups')
+    ) {
+      tables = ['users', 'groups']
+      namespaces = ['panel', 'stats', 'stats-filtered', 'filter-options']
+      clearUsers = true
+      clearGroups = true
+      clearNamesTable = 'users'
+    } else if (pathname === '/api/panel/pricing' || pathname.startsWith('/api/panel/pricing/')) {
+      tables = ['settings', 'usage_logs']
+      namespaces = ['panel', 'stats', 'stats-filtered', 'overview', 'logs-summary']
+      clearBilling = true
+    } else if (
+      pathname === '/api/panel/request-logs' ||
+      pathname.startsWith('/api/panel/request-logs/') ||
+      pathname.startsWith('/api/panel/usage-logs/')
+    ) {
+      tables = ['usage_logs', 'settings']
+      namespaces = ['panel', 'stats', 'stats-filtered', 'overview', 'logs-summary', 'active-sessions', 'filter-options']
+      clearBilling = true
+    } else if (/^\/api\/panel\/backups\/[^/]+\/restore$/.test(pathname)) {
+      tables = ['usage_logs', 'users', 'api_keys', 'settings', 'accounts', 'account_runtime', 'scheduler_pools']
+      namespaces = [
+        'panel',
+        'stats',
+        'stats-filtered',
+        'overview',
+        'logs-summary',
+        'active-sessions',
+        'filter-options',
+        'metrics',
+      ]
+      clearBilling = true
+      clearUsers = true
+      clearGroups = true
+      clearPoolAccess = true
+      clearNamesTable = '*'
+      riskBanKindToClear = 'all'
+    } else if (pathname.startsWith('/api/panel/refusal-session-blocks')) {
+      tables = ['refusal_session_blocks']
+      namespaces = ['panel']
+      riskBanKindToClear = 'session'
+    } else if (pathname.startsWith('/api/panel/refusal-device-blocks')) {
+      tables = ['refusal_device_blocks', 'refusal_session_blocks']
+      namespaces = ['panel']
+      riskBanKindToClear = 'all'
+    } else if (pathname.startsWith('/api/panel/refusal-guards')) {
+      tables = ['refusal_guards', 'settings']
+      namespaces = ['panel']
+      riskBanKindToClear = 'all'
+    } else if (
+      pathname === '/api/panel/routing' ||
+      pathname === '/admin/routing' ||
+      pathname.startsWith('/api/panel/settings') ||
+      pathname.startsWith('/api/panel/model-policy') ||
+      pathname.startsWith('/api/panel/distill') ||
+      pathname.startsWith('/api/panel/refusal-') ||
+      pathname.startsWith('/api/panel/jev-intercept') ||
+      pathname.startsWith('/api/panel/notify') ||
+      pathname === '/api/panel/onboarding'
+    ) {
+      tables = ['settings']
+      namespaces = ['panel']
+    }
+
+    notifyDbTablesMutated(tables)
+    if (clearBilling) requestLog?.repo?.invalidateBillingCache?.()
+    if (namespaces.length) cache.dashboard.invalidateNamespaces(namespaces).catch(() => {})
+    if (tables.includes('settings')) cache.entity.invalidateSettings().catch(() => {})
+    if (clearUsers) cache.entity.invalidateUsers().catch(() => {})
+    if (clearGroups) cache.entity.invalidateGroups().catch(() => {})
+    if (clearPoolAccess) cache.entity.invalidatePoolAccess().catch(() => {})
+    if (riskBanKindToClear === 'session') {
+      invalidateRiskBanCache({ kind: 'session' })
+    } else if (riskBanKindToClear === 'all') {
+      invalidateRiskBanCache()
+    }
+    if (vmIdToClear) {
+      cache.entity.invalidateVmOwner(vmIdToClear).catch(() => {})
+    } else if (tables.includes('vms')) {
+      cache.entity.invalidateVmOwners().catch(() => {})
+    }
+    if (clearNamesTable === '*') {
+      cache.entity.invalidateNames().catch(() => {})
+    } else if (clearNamesTable) {
+      cache.entity.invalidateNames(clearNamesTable).catch(() => {})
+    }
+  }
+
+  async function handlePanelInner(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
 
@@ -1989,22 +2372,44 @@ export function createPanelHandler(ctx) {
       return handleCragShop(req, res, url, route)
     }
 
+    if (isGeminiCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      const route = geminiCragShopRoute(req.method, p)
+      if (route === 'plans') {
+        requireAuth(req, res, { buyer: true, optionalBuyer: true })
+        if (res.headersSent) return true
+        return handleGeminiCragShop(req, res, url, route)
+      }
+      if (!requireAuth(req, res, { buyer: true })) return true
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleGeminiCragShop(req, res, url, route)
+    }
+
     if (p.startsWith('/api/panel')) {
-      if (!requireAuth(req, res)) return
-      // Managed client keys may only call protocol endpoints — never panel/admin.
-      // Only panel session or master KIN_API_KEY may administer.
-      const isPanelOperator = !!req.panelUser || req.apiKeyKind === 'master'
-      if (!isPanelOperator) {
-        return json(
-          res,
-          403,
-          makeError({
-            type: ErrorType.PERMISSION,
-            code: 'forbidden',
-            message: 'Panel requires admin login or master API key',
-            status: 403,
-          }).body,
-        )
+      const delegated = req[INTEGRATION_DELEGATED] === true
+      if (delegated) {
+        req.apiKeyKind = 'master'
+        req.panelRole = 'admin'
+        req.panelUser = 'integration'
+      } else {
+        if (!requireAuth(req, res)) return
+        // Managed client keys may only call protocol endpoints — never panel/admin.
+        // Only panel session or master KIN_API_KEY may administer.
+        const isPanelOperator = !!req.panelUser || req.apiKeyKind === 'master'
+        if (!isPanelOperator) {
+          return json(
+            res,
+            403,
+            makeError({
+              type: ErrorType.PERMISSION,
+              code: 'forbidden',
+              message: 'Panel requires admin login or master API key',
+              status: 403,
+            }).body,
+          )
+        }
       }
       if (req.method === 'GET' && p === '/api/panel/me') {
         const me = mePayload(req)
@@ -2077,7 +2482,25 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
-      if (isGeminiPanelPath(p)) return geminiPanel(req, res, p)
+      if (isGeminiPanelPath(p)) {
+        const out = await geminiPanel(req, res, p)
+        if (req.method !== 'GET' && req.method !== 'HEAD' && (res.statusCode || 200) < 400) {
+          notifySchedulerConfigChanged(`gemini:${req.method}:${p}`)
+        }
+        return out
+      }
+      if (p === '/api/panel/pools' || p.startsWith('/api/panel/pools/') || p.startsWith('/api/panel/scheduler/')) {
+        const handled = await handleSchedulerPools(req, res, p, url)
+        if (handled !== false) return
+      }
+      if (!delegated && p.startsWith('/api/panel/integration')) {
+        const handled = await handleIntegrationAdminRoute(req, res, p, {
+          tokenStore: integrationTokenStore,
+          json,
+          readBody,
+        })
+        if (handled !== false) return
+      }
       const subscriptionRoute = cragSubscriptionRoute(req.method, p)
       if (subscriptionRoute) return handleCragSubscription(req, res, subscriptionRoute)
 
@@ -2153,6 +2576,14 @@ export function createPanelHandler(ctx) {
           return json(res, 400, {
             ok: false,
             error: { code: 'kernel_switch_unsupported', message: '当前槽位不支持切换 Claude 内核' },
+          })
+        if (isCragDebian13Kernel(vm.kernel) && body.dataplane !== 'crag')
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'crag_debian13_crag_only',
+              message: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+            },
           })
         // readBody yielded: reserve only after checking the latest admission state.
         if (kernelSwitchJobs.get(id)?.status === 'running')
@@ -2239,18 +2670,24 @@ export function createPanelHandler(ctx) {
       }
       if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url)
       if (req.method === 'GET' && p === '/api/panel/database/metrics') {
-        const snapshot = snapshotDatabaseMetrics({
+        const bypass = url.searchParams.get('refresh') === '1'
+        const snapshot = await snapshotDatabaseMetricsAsync({
           db: getDb(),
           dbPath: getDbPath(),
+          pgPool: getPgPool(),
           usageCache: getUsageCache(),
+          cacheRuntime: getCacheRuntime(),
+          bypass,
         })
-        return json(res, 200, panel.ok(snapshot))
+        return sendCachedJson(req, res, 200, panel.ok(snapshot))
       }
       if (req.method === 'GET' && p === '/api/panel/version') {
+        const refresh = ['1', 'true'].includes(String(url.searchParams.get('refresh') || '').toLowerCase())
         const status = await buildUpdateStatus({
           projectRoot: cfg?.paths?.project,
           currentVersion: runningVersion,
           upgrade: await readHostUpgradeStatus(),
+          ...(refresh ? { cacheMs: 0 } : {}),
         })
         return json(res, 200, panel.ok(status))
       }
@@ -2361,7 +2798,10 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/vm-pools') {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, listVms(cfg.paths.project))
+          const allVms = listVms(cfg.paths.project)
+          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, allVms)
+          syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
+          notifySchedulerConfigChanged('panel_vm_pool_create')
           return json(res, 201, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2374,8 +2814,11 @@ export function createPanelHandler(ctx) {
         const id = decodeURIComponent(p.split('/').pop())
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, listVms(cfg.paths.project))
+          const allVms = listVms(cfg.paths.project)
+          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, allVms)
           if (!pool) return json(res, 404, { ok: false, error: { message: '账号池不存在', code: 'vm_pool_not_found' } })
+          syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
+          notifySchedulerConfigChanged('panel_vm_pool_update')
           return json(res, 200, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2397,17 +2840,68 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+        syncVmPoolToSchedulerPool(apiKeyStore.db, 'delete', { id })
+        notifySchedulerConfigChanged('panel_vm_pool_delete')
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
-        const snap = apiKeyStore.snapshot()
-        const mine = (snap.keys || []).filter((key) => panelOwnsKey(req, key))
-        return json(res, 200, {
-          ok: true,
-          total: mine.length,
-          active: mine.filter((k) => k.status === 'active').length,
-          keys: mine,
-        })
+        const ident = panelIdentity(req)
+        const filterOwner = ident.role === 'admin' ? normalizeOwnerId(url.searchParams.get('owner_id')) : null
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'api-keys',
+            scope: cacheScopeOf(apiKeyStore?.db || resolvePanelDb()),
+            delegated: req[INTEGRATION_DELEGATED] === true,
+            apiKeyKind: req.apiKeyKind || null,
+            role: ident.role,
+            panelUserId: normalizeOwnerId(req.panelUserId),
+            filterOwner,
+          },
+          () => {
+            let mine
+            let rawById = null
+            if (typeof apiKeyStore?.repo?.list === 'function') {
+              const rawList = apiKeyStore.repo.list()
+              let vmPoolNames = null
+              const getVmPoolNames = () => {
+                if (vmPoolNames) return vmPoolNames
+                vmPoolNames = new Map()
+                try {
+                  for (const pool of new VmPoolsRepo(apiKeyStore.db).list()) vmPoolNames.set(pool.id, pool.name)
+                } catch {}
+                return vmPoolNames
+              }
+              rawById = new Map()
+              mine = []
+              for (const raw of rawList) {
+                const rec = typeof apiKeyStore._overlayDbRecord === 'function' ? apiKeyStore._overlayDbRecord(raw) : raw
+                if (!panelOwnsKey(req, rec)) continue
+                const view = publicKeyView(rec, { reveal: false })
+                if (filterOwner && normalizeOwnerId(view.owner_id) !== filterOwner) continue
+                view.inflight = apiKeyStore.inflight?.get?.(rec.id) || 0
+                if (view.vm_pool_id) view.vm_pool_name = getVmPoolNames().get(view.vm_pool_id) || null
+                rawById.set(rec.id, rec)
+                mine.push(view)
+              }
+            } else {
+              const snap = apiKeyStore.snapshot()
+              mine = (snap.keys || []).filter(
+                (key) => panelOwnsKey(req, key) && (!filterOwner || normalizeOwnerId(key.owner_id) === filterOwner),
+              )
+            }
+            const enrichedKeys = enrichApiKeyViewsWithPools(apiKeyStore.db, mine, rawById)
+            return {
+              ok: true,
+              total: enrichedKeys.length,
+              active: enrichedKeys.filter((k) => k.status === 'active').length,
+              keys: enrichedKeys,
+            }
+          },
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
@@ -2415,7 +2909,12 @@ export function createPanelHandler(ctx) {
         const rec = apiKeyStore.getById(id)
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         const usage_stats = requestLog?.keyUsageStats?.({ apiKeyId: id, days: 30 }) || null
-        return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
+        const [item] = enrichApiKeyViewsWithPools(
+          apiKeyStore.db,
+          [publicKeyView(rec, { reveal: false })],
+          new Map([[rec.id, rec]]),
+        )
+        return json(res, 200, { ok: true, item, usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
         const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
@@ -2426,13 +2925,18 @@ export function createPanelHandler(ctx) {
             error: { code: 'gemini_key_forbidden', message: '只有管理员可以生成 Gemini 密钥' },
           })
         }
-        if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
+        const hasAdminPoolFields =
+          (body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') ||
+          (body?.default_pool_id != null && String(body.default_pool_id).trim() !== '') ||
+          (Array.isArray(body?.allowed_pool_ids) && body.allowed_pool_ids.length > 0) ||
+          body?.pool_binding_mode === 'strict_pool'
+        if (ident.role !== 'admin' && hasAdminPoolFields) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
           })
         }
-        if (ident.role !== 'admin' && isApiCategory(body?.category)) {
+        if (ident.role !== 'admin' && isMixedOrApiCategory(body?.category)) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_category_forbidden', message: '只有管理员可以创建 API 直连密钥' },
@@ -2446,16 +2950,90 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
-          const isApi = isApiCategory(body?.category)
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms, category: body?.category }
-          if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
+          const schedPoolsRepo = new SchedulerPoolsRepo(apiKeyStore.db)
+          const hasUnifiedPoolFields =
+            Object.hasOwn(body || {}, 'pool_binding_mode') ||
+            Object.hasOwn(body || {}, 'default_pool_id') ||
+            Object.hasOwn(body || {}, 'allowed_pool_ids')
+          const poolBinding =
+            ident.role === 'admin' && hasUnifiedPoolFields
+              ? normalizeKeyPoolBindingInput(body || {}, { partial: false, poolsRepo: schedPoolsRepo })
+              : null
+          const tierCfg =
+            ident.role === 'admin'
+              ? normalizeMultiTierKeyConfig({ ...body, user_id: input.user_id }, { partial: false })
+              : {
+                  permission_tier: 'platform',
+                  owner_id: null,
+                  category: 'oauth',
+                  allowed_endpoints: [],
+                  allowed_gemini_envs: [],
+                }
+          const isApi = isApiCategory(tierCfg.category)
+          const allowsEndpoint = isMixedOrApiCategory(tierCfg.category)
+          const reqGroupType = normalizeGroupType(body?.group_type)
+          const scopeInput = {
+            group_type:
+              poolBinding?.pool_binding_mode === 'strict_pool' && reqGroupType !== 'gemini' ? 'all' : body?.group_type,
+            allowed_vms: poolBinding?.pool_binding_mode === 'strict_pool' ? [] : body?.allowed_vms,
+            category: tierCfg.category,
+            permission_tier: tierCfg.permission_tier,
+            owner_id: tierCfg.owner_id,
+          }
+          if (ident.role === 'admin' && poolBinding) {
+            scopeInput.vm_pool_id =
+              reqGroupType !== 'gemini' &&
+              poolBinding.default_pool_id &&
+              /^pool_[a-f0-9]{8}$/.test(poolBinding.default_pool_id)
+                ? poolBinding.default_pool_id
+                : null
+          } else if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, { isApi })
           const pools = vmPoolsFor(apiKeyStore.db)
+          const validEndpointId = validateKeyEndpoint(input.api_endpoint_id, allowsEndpoint)
           if (!isApi) {
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            if (scope.vm_pool_id && !schedPoolsRepo.get(scope.vm_pool_id)) {
+              assertVmPoolExists(pools, scope.vm_pool_id)
+            } else if (!scope.vm_pool_id && !poolBinding?.default_pool_id) {
+              assertVmScope(keyScopeVms(req), scope)
+            }
+          }
+          const enforceMultiTierOwnership =
+            req[INTEGRATION_DELEGATED] === true ||
+            Object.hasOwn(body || {}, 'permission_tier') ||
+            Object.hasOwn(body || {}, 'owner_id') ||
+            tierCfg.allowed_endpoints.length > 0 ||
+            tierCfg.allowed_gemini_envs.length > 0 ||
+            Boolean(validEndpointId)
+          if (ident.role === 'admin' && enforceMultiTierOwnership) {
+            const policy = keyTierPolicyFromRecord({
+              permission_tier: tierCfg.permission_tier,
+              owner_id: tierCfg.owner_id,
+              category: tierCfg.category,
+              group_type: scope.group_type,
+              allowed_vms: scope.allowed_vms,
+              vm_pool_id: scope.vm_pool_id,
+              api_endpoint_id: validEndpointId,
+              allowed_endpoints: tierCfg.allowed_endpoints,
+              allowed_gemini_envs: tierCfg.allowed_gemini_envs,
+            })
+            const keyOwnerScope = ownerScopeFromApiKey(
+              { owner_id: policy.owner_id, user_id: input.user_id, permission_tier: policy.permission_tier },
+              { ownerRole: ident.role },
+            )
+            assertKeyResourceOwnership({
+              vms: listVms(cfg.paths.project),
+              endpoints: apiEndpointStore?.listRaw?.() || [],
+              geminiOwnerMap: ctx.geminiOwnersRepo?.ownerMap?.() || null,
+              policy: {
+                ...policy,
+                default_pool_id: poolBinding?.default_pool_id ?? null,
+                allowed_pool_ids: poolBinding?.allowed_pool_ids ?? [],
+              },
+              ownerScope: keyOwnerScope,
+            })
           }
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
@@ -2465,8 +3043,12 @@ export function createPanelHandler(ctx) {
           const rec = apiKeyStore.create({
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
-            category: body?.category,
-            api_endpoint_id: validateKeyEndpoint(input.api_endpoint_id, isApi),
+            category: tierCfg.category,
+            permission_tier: tierCfg.permission_tier,
+            owner_id: tierCfg.owner_id,
+            api_endpoint_id: validEndpointId,
+            allowed_endpoints: tierCfg.allowed_endpoints,
+            allowed_gemini_envs: tierCfg.allowed_gemini_envs,
             user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
@@ -2487,13 +3069,29 @@ export function createPanelHandler(ctx) {
                 ? new Date(Date.now() + Number(body.expires_in_days) * 86400_000).toISOString()
                 : null),
           })
+          if (ident.role === 'admin' && poolBinding) {
+            schedPoolsRepo.setKeyBindings(rec.id, poolBinding.allowed_pool_ids, {
+              defaultPoolId: poolBinding.default_pool_id,
+              bindingMode: poolBinding.pool_binding_mode,
+            })
+            apiKeyStore.reload()
+          } else if (ident.role === 'admin' && scope.vm_pool_id && schedPoolsRepo.get(scope.vm_pool_id)) {
+            schedPoolsRepo.setKeyBindings(rec.id, [scope.vm_pool_id], {
+              defaultPoolId: scope.vm_pool_id,
+              bindingMode: 'legacy_scope',
+            })
+            apiKeyStore.reload()
+          }
+          const latestRec = apiKeyStore.getById(rec.id) || rec
+          const baseView = publicKeyView({ ...latestRec, _plain_key: rec._plain_key }, { reveal: true })
+          const [item] = enrichApiKeyViewsWithPools(apiKeyStore.db, [baseView], new Map([[latestRec.id, latestRec]]))
           return json(res, 201, {
             ok: true,
-            item: publicKeyView(rec, { reveal: true }),
+            item,
             note: 'plaintext stays recoverable via POST /api/panel/api-keys/:id/reveal',
           })
         } catch (e) {
-          const status = vmPoolHttpStatus(e.code)
+          const status = Number.isInteger(e.status) ? e.status : vmPoolHttpStatus(e.code)
           return json(res, status, {
             ok: false,
             error: { message: String(e.message || e), code: e.code || 'create_failed' },
@@ -2515,30 +3113,75 @@ export function createPanelHandler(ctx) {
             error: { code: 'gemini_key_forbidden', message: '只有管理员可以修改 Gemini 密钥' },
           })
         }
-        if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
+        const hasAdminPoolPatch =
+          (body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') ||
+          (body?.default_pool_id != null && String(body.default_pool_id).trim() !== '') ||
+          (Array.isArray(body?.allowed_pool_ids) && body.allowed_pool_ids.length > 0) ||
+          body?.pool_binding_mode === 'strict_pool' ||
+          (currentRec?.pool_binding_mode === 'strict_pool' &&
+            (Object.hasOwn(body || {}, 'pool_binding_mode') ||
+              Object.hasOwn(body || {}, 'default_pool_id') ||
+              Object.hasOwn(body || {}, 'allowed_pool_ids')))
+        if (ident.role !== 'admin' && hasAdminPoolPatch) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
           })
         }
-        if (ident.role !== 'admin' && isApiCategory(body?.category)) {
+        if (ident.role !== 'admin' && isMixedOrApiCategory(body?.category)) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_category_forbidden', message: '只有管理员可以创建 API 直连密钥' },
           })
         }
         try {
+          const schedPoolsRepo = new SchedulerPoolsRepo(apiKeyStore.db)
+          const hasUnifiedPoolPatch =
+            Object.hasOwn(body || {}, 'pool_binding_mode') ||
+            Object.hasOwn(body || {}, 'default_pool_id') ||
+            Object.hasOwn(body || {}, 'allowed_pool_ids')
+          const poolBinding =
+            ident.role === 'admin' && hasUnifiedPoolPatch
+              ? normalizeKeyPoolBindingInput(body || {}, {
+                  current: currentRec,
+                  partial: true,
+                  poolsRepo: schedPoolsRepo,
+                })
+              : null
           const input = normalizePanelApiKeyInput(body || {}, req)
-          const isApi = isApiCategory(body?.category ?? currentRec?.category)
+          const tierCfg =
+            ident.role === 'admin'
+              ? normalizeMultiTierKeyConfig(
+                  { ...body, user_id: currentRec?.user_id },
+                  { partial: true, current: currentRec },
+                )
+              : null
+          const effectiveCategory = tierCfg ? tierCfg.category : (body?.category ?? currentRec?.category)
+          const isApi = isApiCategory(effectiveCategory)
+          const allowsEndpoint = isMixedOrApiCategory(effectiveCategory)
           if (Object.hasOwn(input, 'api_endpoint_id')) {
-            input.api_endpoint_id = validateKeyEndpoint(input.api_endpoint_id, isApi, currentRec?.api_endpoint_id)
+            input.api_endpoint_id = validateKeyEndpoint(
+              input.api_endpoint_id,
+              allowsEndpoint,
+              currentRec?.api_endpoint_id,
+            )
           }
+          const reqGroupType = normalizeGroupType(body?.group_type ?? currentRec?.group_type)
           const scopeInput = {
-            group_type: body?.group_type,
-            allowed_vms: body?.allowed_vms,
-            category: isApi ? 'api' : 'oauth',
+            group_type:
+              poolBinding?.pool_binding_mode === 'strict_pool' && reqGroupType !== 'gemini' ? 'all' : body?.group_type,
+            allowed_vms: poolBinding?.pool_binding_mode === 'strict_pool' ? [] : body?.allowed_vms,
+            category: effectiveCategory || 'oauth',
+            ...(tierCfg ? { permission_tier: tierCfg.permission_tier, owner_id: tierCfg.owner_id } : {}),
           }
-          if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
+          if (ident.role === 'admin' && poolBinding) {
+            scopeInput.vm_pool_id =
+              reqGroupType !== 'gemini' &&
+              poolBinding.default_pool_id &&
+              /^pool_[a-f0-9]{8}$/.test(poolBinding.default_pool_id)
+                ? poolBinding.default_pool_id
+                : null
+          } else if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec, isApi })
@@ -2548,20 +3191,95 @@ export function createPanelHandler(ctx) {
             }
             const pools = vmPoolsFor(apiKeyStore.db)
             if (!isApi) {
-              if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-              else assertVmScope(keyScopeVms(req), scope)
+              if (scope.vm_pool_id && !schedPoolsRepo.get(scope.vm_pool_id)) {
+                assertVmPoolExists(pools, scope.vm_pool_id)
+              } else if (!scope.vm_pool_id && !poolBinding?.default_pool_id) {
+                assertVmScope(keyScopeVms(req), scope)
+              }
             }
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id
           }
+          if (tierCfg) {
+            input.permission_tier = tierCfg.permission_tier
+            input.owner_id = tierCfg.owner_id
+            input.category = tierCfg.category
+            input.allowed_endpoints = tierCfg.allowed_endpoints
+            input.allowed_gemini_envs = tierCfg.allowed_gemini_envs
+            const enforceMultiTierOwnership =
+              req[INTEGRATION_DELEGATED] === true ||
+              Object.hasOwn(body || {}, 'permission_tier') ||
+              Object.hasOwn(body || {}, 'owner_id') ||
+              Object.hasOwn(body || {}, 'allowed_endpoints') ||
+              Object.hasOwn(body || {}, 'allowed_gemini_envs') ||
+              Object.hasOwn(body || {}, 'api_endpoint_id') ||
+              Boolean(currentRec?.owner_id) ||
+              (currentRec?.permission_tier && currentRec.permission_tier !== 'platform')
+            if (enforceMultiTierOwnership) {
+              const policy = keyTierPolicyFromRecord({
+                ...currentRec,
+                ...input,
+                group_type: input.group_type ?? currentRec?.group_type,
+                allowed_vms: input.allowed_vms ?? currentRec?.allowed_vms,
+                vm_pool_id: Object.hasOwn(input, 'vm_pool_id') ? input.vm_pool_id : currentRec?.vm_pool_id,
+                api_endpoint_id: Object.hasOwn(input, 'api_endpoint_id')
+                  ? input.api_endpoint_id
+                  : currentRec?.api_endpoint_id,
+              })
+              const keyOwnerScope = ownerScopeFromApiKey(
+                { owner_id: policy.owner_id, user_id: currentRec?.user_id, permission_tier: policy.permission_tier },
+                { ownerRole: ident.role },
+              )
+              assertKeyResourceOwnership({
+                vms: listVms(cfg.paths.project),
+                endpoints: apiEndpointStore?.listRaw?.() || [],
+                geminiOwnerMap: ctx.geminiOwnersRepo?.ownerMap?.() || null,
+                policy: {
+                  ...policy,
+                  default_pool_id: poolBinding?.default_pool_id ?? currentRec?.default_pool_id ?? null,
+                  allowed_pool_ids: poolBinding?.allowed_pool_ids ?? [],
+                },
+                ownerScope: keyOwnerScope,
+              })
+            }
+          }
           const rec = apiKeyStore.update(id, input)
           if (!rec) {
             return json(res, 404, { ok: false, error: { message: 'api key not found' } })
           }
-          return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }) })
+          if (ident.role === 'admin' && poolBinding) {
+            schedPoolsRepo.setKeyBindings(rec.id, poolBinding.allowed_pool_ids, {
+              defaultPoolId: poolBinding.default_pool_id,
+              bindingMode: poolBinding.pool_binding_mode,
+            })
+            apiKeyStore.reload()
+          } else if (ident.role === 'admin' && Object.hasOwn(body || {}, 'vm_pool_id')) {
+            const legacyId = scope?.vm_pool_id ?? null
+            if (legacyId && schedPoolsRepo.get(legacyId)) {
+              schedPoolsRepo.setKeyBindings(rec.id, [legacyId], {
+                defaultPoolId: legacyId,
+                bindingMode: currentRec?.pool_binding_mode || 'legacy_scope',
+              })
+              apiKeyStore.reload()
+            } else if (!legacyId) {
+              schedPoolsRepo.setKeyBindings(rec.id, [], {
+                defaultPoolId: null,
+                bindingMode: currentRec?.pool_binding_mode === 'strict_pool' ? 'strict_pool' : 'legacy_scope',
+              })
+              apiKeyStore.reload()
+            }
+          }
+          const latestRec = apiKeyStore.getById(rec.id) || rec
+          const [item] = enrichApiKeyViewsWithPools(
+            apiKeyStore.db,
+            [publicKeyView(latestRec, { reveal: false })],
+            new Map([[latestRec.id, latestRec]]),
+          )
+          return json(res, 200, { ok: true, item })
         } catch (e) {
-          return json(res, vmPoolHttpStatus(e.code), {
+          const status = Number.isInteger(e.status) ? e.status : vmPoolHttpStatus(e.code)
+          return json(res, status, {
             ok: false,
             error: { message: String(e.message || e), code: e.code },
           })
@@ -2606,13 +3324,19 @@ export function createPanelHandler(ctx) {
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         const ok = apiKeyStore.remove(id)
         if (!ok) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
+        try {
+          new SchedulerPoolsRepo(apiKeyStore.db).deleteBindingsForKey(id)
+        } catch {}
         return json(res, 200, { ok: true, deleted: id })
       }
 
       if (req.method === 'GET' && p === '/api/panel/api-endpoints') {
+        const filterOwner = normalizeOwnerId(url.searchParams.get('owner_user_id'))
+        const allItems = apiEndpointStore.list({ reveal: false })
+        const items = filterOwner ? allItems.filter((ep) => endpointOwnerId(ep) === filterOwner) : allItems
         return json(res, 200, {
           ok: true,
-          items: apiEndpointStore.list({ reveal: false }),
+          items,
           presets: API_ENDPOINT_PRESETS,
         })
       }
@@ -2654,7 +3378,10 @@ export function createPanelHandler(ctx) {
           }
           const rec = apiEndpointStore.create(body || {})
           apiScheduler.reload(apiEndpointStore.listRaw())
-          return json(res, 201, { ok: true, item: publicEndpointView(rec, { reveal: true }) })
+          return json(res, 201, {
+            ok: true,
+            item: publicEndpointView(rec, { reveal: req[INTEGRATION_DELEGATED] !== true }),
+          })
         } catch (e) {
           return json(res, 400, {
             ok: false,
@@ -2757,7 +3484,9 @@ export function createPanelHandler(ctx) {
         try {
           const key = apiEndpointStore.addKey(id, body || {})
           apiScheduler.reload(apiEndpointStore.listRaw())
-          const view = publicEndpointView(apiEndpointStore.getRaw(id), { reveal: true })
+          const view = publicEndpointView(apiEndpointStore.getRaw(id), {
+            reveal: req[INTEGRATION_DELEGATED] !== true,
+          })
           return json(res, 201, { ok: true, item: view?.api_key_entries?.find((k) => k.id === key.id) || key })
         } catch (e) {
           const status = e.code === 'endpoint_not_found' ? 404 : 400
@@ -2893,43 +3622,66 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/request-logs/stats') {
         const u = new URL(req.url, 'http://x')
         const bucket = (u.searchParams.get('bucket') || 'day').toLowerCase() === 'hour' ? 'hour' : 'day'
-        const since = u.searchParams.get('since') || new Date(Date.now() - 7 * 86400_000).toISOString()
+        const rawSince = u.searchParams.get('since')
+        const since = rawSince || new Date(Date.now() - 7 * 86400_000).toISOString()
         const until = u.searchParams.get('until') || null
-        const tenant = panelIdentity(req).role === 'user'
+        const ident = panelIdentity(req)
+        const tenant = ident.role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
-        let totals
-        let buckets
-        let window
-        if (usagePoolEnabled()) {
-          try {
-            const jobs = [
-              usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
-              usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
-            ]
-            if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
-            const out = await Promise.all(jobs)
-            if (tenant) [buckets, window] = out
-            else [totals, buckets, window] = out
-          } catch (err) {
-            console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
-          }
-        }
-        if (buckets === undefined) {
-          totals = tenant ? null : requestLog.totals()
-          buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
-          window = requestLog.windowStats({ since, until, owner_user_id })
-        }
-        return json(res, 200, {
-          ok: true,
-          bucket,
-          since,
-          until,
-          totals: totals ?? null,
-          buckets,
-          window,
-          muted_error_classes: requestLog.snapshot().muted_error_classes,
-          config: tenant ? null : requestLog.snapshot(),
-        })
+        const bypass = u.searchParams.get('refresh') === '1'
+        const snapCfg = requestLog.snapshot()
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'stats',
+          {
+            ep: 'request-logs-stats',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            role: ident.role,
+            tenant,
+            owner_user_id: owner_user_id == null ? null : String(owner_user_id),
+            bucket,
+            since: rawSince || 'default_7d',
+            until,
+            muted: snapCfg?.muted_error_classes || [],
+          },
+          async () => {
+            let totals
+            let buckets
+            let window
+            if (usagePoolEnabled()) {
+              try {
+                const jobs = [
+                  usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
+                  usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
+                ]
+                if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
+                const out = await Promise.all(jobs)
+                if (tenant) [buckets, window] = out
+                else [totals, buckets, window] = out
+              } catch (err) {
+                console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
+              }
+            }
+            if (buckets === undefined) {
+              totals = tenant ? null : requestLog.totals()
+              buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
+              window = requestLog.windowStats({ since, until, owner_user_id })
+            }
+            const curCfg = requestLog.snapshot()
+            return {
+              ok: true,
+              bucket,
+              since,
+              until,
+              totals: totals ?? null,
+              buckets,
+              window,
+              muted_error_classes: curCfg.muted_error_classes,
+              config: tenant ? null : curCfg,
+            }
+          },
+          { freshTtlMs: 15_000, ttlMs: 30_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && /^\/api\/panel\/request-logs\/[^/]+\/attempts$/.test(p)) {
         const requestId = p.split('/')[4]
@@ -2966,14 +3718,44 @@ export function createPanelHandler(ctx) {
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(await readView('listBatch', usageLogFilters(req, u))))
+        const filters = usageLogFilters(req, u)
+        const view = usageLogsView()
+        const data =
+          typeof view.listBatchAsync === 'function'
+            ? await view.listBatchAsync(filters, { baseLoader: (f) => readView('listBatch', f) })
+            : await readView('listBatch', filters)
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(await readView('summary', usageLogFilters(req, u))))
+        const filters = usageLogFilters(req, u)
+        const ident = panelIdentity(req)
+        const bypass = u.searchParams.get('refresh') === '1'
+        const snap = await getCacheRuntime().dashboard.getOrLoadSnapshot(
+          'logs-summary',
+          {
+            scope: cacheScopeOf(isDbOpen() ? getDb() : null),
+            role: ident.role,
+            filters,
+            muted: requestLog?.mutedErrorClasses || [],
+          },
+          async () => panel.ok(await readView('summary', filters)),
+          { ttlMs: 15_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, snap.value, { etag: snap.etag, cacheStatus: snap.cacheStatus })
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(await readView('filterOptions', { owner_user_id: tenantId() })))
+        const u = new URL(req.url, 'http://x')
+        const bypass = u.searchParams.get('refresh') === '1'
+        const view = usageLogsView()
+        const data =
+          typeof view.filterOptionsAsync === 'function'
+            ? await view.filterOptionsAsync(
+                { owner_user_id: tenantId(), bypass },
+                { baseLoader: (o) => readView('filterOptions', o) },
+              )
+            : await readView('filterOptions', { owner_user_id: tenantId() })
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
@@ -2985,12 +3767,31 @@ export function createPanelHandler(ctx) {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })))
+        const bypass = u.searchParams.get('refresh') === '1'
+        const view = usageLogsView()
+        const data =
+          typeof view.activeSessionsAsync === 'function'
+            ? await view.activeSessionsAsync(
+                { minutes, limit, owner_user_id: tenantId(), bypass },
+                { baseLoader: (o) => readView('activeSessions', o) },
+              )
+            : await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(await readView('overview', { tz, owner_user_id: tenantId() })))
+        const owner = tenantId()
+        const bypass = u.searchParams.get('refresh') === '1'
+        const view = usageLogsView()
+        const data =
+          typeof view.overviewAsync === 'function'
+            ? await view.overviewAsync(
+                { tz, owner_user_id: owner, bypass },
+                { baseLoader: (o) => readView('overview', o) },
+              )
+            : await readView('overview', { tz, owner_user_id: owner })
+        return json(res, 200, panel.ok(data))
       }
 
       // ---- Statistics page ----
@@ -2999,7 +3800,35 @@ export function createPanelHandler(ctx) {
         const q = statsParams(req, u, 'dimension')
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension, tz, owner_user_id } = q
-        return json(res, 200, panel.ok(new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id })))
+        const ident = panelIdentity(req)
+        const bypass = u.searchParams.get('refresh') === '1'
+        const cacheKey = {
+          ep: 'statistics',
+          scope: cacheScopeOf(isDbOpen() ? getDb() : null),
+          role: ident.role,
+          range,
+          dimension,
+          tz,
+          owner_user_id: owner_user_id == null ? null : String(owner_user_id),
+        }
+        const load = async () =>
+          panel.ok(
+            (await readUsage('stats', 'statistics', [{ range, dimension, tz, owner_user_id }])) ??
+              new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id }),
+          )
+        if (owner_user_id) {
+          const snap = await getCacheRuntime().dashboard.getOrLoadSnapshot('stats-filtered', cacheKey, load, {
+            ttlMs: 30_000,
+            bypass,
+          })
+          return sendCachedJson(req, res, 200, snap.value, { etag: snap.etag, cacheStatus: snap.cacheStatus })
+        }
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR('stats', cacheKey, load, {
+          freshTtlMs: 15_000,
+          ttlMs: 30_000,
+          bypass,
+        })
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && p === '/api/panel/statistics/leaderboard') {
         const u = new URL(req.url, 'http://x')
@@ -3007,11 +3836,37 @@ export function createPanelHandler(ctx) {
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension: scope, tz, owner_user_id } = q
         const limit = u.searchParams.get('limit')
-        return json(
-          res,
-          200,
-          panel.ok(new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id })),
-        )
+        const ident = panelIdentity(req)
+        const bypass = u.searchParams.get('refresh') === '1'
+        const cacheKey = {
+          ep: 'statistics-leaderboard',
+          scope: cacheScopeOf(isDbOpen() ? getDb() : null),
+          role: ident.role,
+          range,
+          lbScope: scope,
+          limit,
+          tz,
+          owner_user_id: owner_user_id == null ? null : String(owner_user_id),
+        }
+        const load = async () =>
+          panel.ok(
+            (await readUsage('stats', 'leaderboard', [{ range, scope, limit, tz, owner_user_id }])) ??
+              new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id }),
+          )
+        const customLimit = limit != null && limit !== '' && !['10', '20'].includes(String(limit))
+        if (owner_user_id || customLimit) {
+          const snap = await getCacheRuntime().dashboard.getOrLoadSnapshot('stats-filtered', cacheKey, load, {
+            ttlMs: 30_000,
+            bypass,
+          })
+          return sendCachedJson(req, res, 200, snap.value, { etag: snap.etag, cacheStatus: snap.cacheStatus })
+        }
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR('stats', cacheKey, load, {
+          freshTtlMs: 15_000,
+          ttlMs: 30_000,
+          bypass,
+        })
+        return sendCachedJson(req, res, 200, payload)
       }
 
       if (req.method === 'GET' && p === '/api/panel/billing') {
@@ -3021,13 +3876,36 @@ export function createPanelHandler(ctx) {
         const groupBy = u.searchParams.get('group_by') === 'key' ? 'key' : 'vm'
         const since = u.searchParams.get('from') || u.searchParams.get('since') || null
         const until = u.searchParams.get('until') || null
-        return json(res, 200, panel.ok(requestLog.ownerBilling({ ownerUserId, since, until, groupBy })))
+        const bypass = u.searchParams.get('refresh') === '1'
+        let data
+        if (typeof requestLog?.ownerBillingAsync === 'function') {
+          data = await requestLog.ownerBillingAsync({ ownerUserId, since, until, groupBy, bypass })
+        } else if (typeof requestLog?.repo?.ownerBillingAsync === 'function') {
+          data = await requestLog.repo.ownerBillingAsync({ ownerUserId, since, until, groupBy, bypass })
+        } else {
+          data = await getCacheRuntime().dashboard.getOrSetSWR(
+            'stats',
+            {
+              ep: 'billing',
+              scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+              role: ident.role,
+              ownerUserId: ownerUserId == null ? null : String(ownerUserId),
+              groupBy,
+              since,
+              until,
+            },
+            () => requestLog.ownerBilling({ ownerUserId, since, until, groupBy }),
+            { freshTtlMs: 15_000, ttlMs: 60_000, bypass },
+          )
+        }
+        return sendCachedJson(req, res, 200, panel.ok(data))
       }
 
       // ---- Backups (local auto/manual, download, restore) ----
       if (req.method === 'GET' && p === '/api/panel/backups') {
         return json(res, 200, {
           ok: true,
+          engine: getDbEngine(),
           items: backupService.list(),
           config: backupService.getSchedule(),
           next_auto_at: backupService.nextAutoAt(),
@@ -3068,12 +3946,14 @@ export function createPanelHandler(ctx) {
         if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
           return json(res, 404, { ok: false, error: { message: 'backup file not found' } })
         }
+        const downloadName = rec.file_name || path.basename(rec.file_path)
+        const contentType = downloadName.endsWith('.pgdump') ? 'application/octet-stream' : 'application/gzip'
         res.writeHead(
           200,
           corsHeadersForRequest(req, {
-            'content-type': 'application/gzip',
+            'content-type': contentType,
             'content-length': fs.statSync(rec.file_path).size,
-            'content-disposition': `attachment; filename="${rec.file_name}"`,
+            'content-disposition': `attachment; filename="${downloadName}"`,
             'x-kin-backup-sha256': rec.sha256 || '',
             'access-control-expose-headers': 'content-disposition, x-kin-backup-sha256',
           }),
@@ -3100,6 +3980,8 @@ export function createPanelHandler(ctx) {
             restore_in_progress: 409,
             backup_corrupt: 422,
             backup_not_ok: 422,
+            backup_incompatible: 422,
+            pg_restore_missing: 503,
           }
           return json(res, map[e.code] || 500, {
             ok: false,
@@ -3115,39 +3997,80 @@ export function createPanelHandler(ctx) {
 
       // GET /api/panel/dashboard
       if (req.method === 'GET' && p === '/api/panel/dashboard') {
-        return json(
-          res,
-          200,
-          await panel.buildDashboard({
-            cfg,
-            accountQuota,
-            stickyRouter,
-            routingConfig: ctx.routingConfig,
-            stats,
-            requestLog,
-            poolScheduler: ctx.poolScheduler,
-            proxyPool,
-            clusterNodes: clusterNodesOf(ctx),
-          }),
+        const ident = panelIdentity(req)
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'dashboard',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            project: cfg?.paths?.project || null,
+            role: ident.role,
+          },
+          () =>
+            panel.buildDashboard({
+              cfg,
+              accountQuota,
+              stickyRouter,
+              routingConfig: ctx.routingConfig,
+              stats,
+              requestLog,
+              poolScheduler: ctx.poolScheduler,
+              proxyPool,
+              clusterNodes: clusterNodesOf(ctx),
+              bypass,
+            }),
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
         )
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && p === '/api/panel/vms') {
         const ident = panelIdentity(req)
-        return json(
-          res,
-          200,
-          await panel.buildVmList({
-            cfg,
-            accountQuota,
-            routingConfig: ctx.routingConfig,
-            poolScheduler: ctx.poolScheduler,
-            proxyPool,
-            requestLog,
+        const ownerUserId = ident.role === 'user' ? req.panelUserId : null
+        const filterOwner = ident.role === 'admin' ? normalizeOwnerId(url.searchParams.get('owner_user_id')) : null
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'vms',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            project: cfg?.paths?.project || null,
             role: ident.role,
-            ownerUserId: ident.role === 'user' ? req.panelUserId : null,
-            clusterNodes: clusterNodesOf(ctx),
-          }),
+            ownerUserId: normalizeOwnerId(ownerUserId),
+            filterOwner,
+          },
+          async () => {
+            const built = await panel.buildVmList({
+              cfg,
+              accountQuota,
+              routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
+              proxyPool,
+              requestLog,
+              role: ident.role,
+              ownerUserId,
+              clusterNodes: clusterNodesOf(ctx),
+              bypass,
+            })
+            if (filterOwner && built?.data) {
+              return {
+                ...built,
+                data: {
+                  ...built.data,
+                  ...(Array.isArray(built.data.items)
+                    ? { items: built.data.items.filter((v) => vmOwnerId(v) === filterOwner) }
+                    : {}),
+                  ...(Array.isArray(built.data.vms)
+                    ? { vms: built.data.vms.filter((v) => vmOwnerId(v) === filterOwner) }
+                    : {}),
+                },
+              }
+            }
+            return built
+          },
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
         )
+        return sendCachedJson(req, res, 200, payload)
       }
       // GET /api/panel/pool/stream — live seat / queue snapshots (SSE over fetch).
       if (req.method === 'GET' && p === '/api/panel/pool/stream') {
@@ -3185,7 +4108,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             vm: normalizeVmConfig(ctx.routingConfig?.vm),
             kvm,
-            crag_supported: process.platform === 'linux' && process.arch === 'x64',
+            crag_supported: process.platform === 'linux' && cragTargetArch(cfg.paths.project) === 'amd64',
           }),
         )
       }
@@ -3224,6 +4147,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             kernels: describeKernelCatalog(cfg.paths.project),
             crag_pin: cragReleasePin(cfg.paths.project),
+            gemini_pin: geminiReleasePin(cfg.paths.project),
             licenses,
             install_licenses: installLicenses,
             installations,
@@ -3526,7 +4450,7 @@ export function createPanelHandler(ctx) {
                 const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
                 if (resolveKernelDataplane(vm, previous) === resolveKernelDataplane(desired, nextRouting)) continue
                 if (checkCragLicense(cfg.paths.project, desired, nextRouting).ok)
-                  await initialize(cfg.paths.project, desired, slotHost(desired))
+                  await initialize(cfg.paths.project, desired, slotHost(desired), { routing: nextRouting })
               }
             } catch {
               return json(res, 503, {
@@ -4041,6 +4965,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         const ident = panelIdentity(req)
+        const bypass = url.searchParams.get('refresh') === '1'
         const result = await panel.buildVmDetail({
           cfg,
           accountQuota,
@@ -4052,6 +4977,7 @@ export function createPanelHandler(ctx) {
           kernelHealth: panelKernelHealth,
           clusterNodes: clusterNodesOf(ctx),
           role: ident.role,
+          bypass,
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
@@ -4108,6 +5034,8 @@ export function createPanelHandler(ctx) {
             : body.maxConcurrency
           const nextRpm = Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ? body.max_rpm : body.maxRpm
           const hasMaxSessions = body && Object.prototype.hasOwnProperty.call(body, 'max_sessions')
+          const hasMaxPrimarySessions = body && Object.prototype.hasOwnProperty.call(body, 'max_primary_sessions')
+          const hasMaxSubagents = body && Object.prototype.hasOwnProperty.call(body, 'max_subagents_per_session')
           // Explicit null = drop the slot's pin and follow its tier / global default again.
           const inheritConc = body?.max_concurrency === null
           const inheritRpm = body?.max_rpm === null
@@ -4143,6 +5071,8 @@ export function createPanelHandler(ctx) {
             !inheritRpm &&
             !hasSessionSlots &&
             !hasMaxSessions &&
+            !hasMaxPrimarySessions &&
+            !hasMaxSubagents &&
             !hasQuotaOverride &&
             !hasModels &&
             !hasAuthScheme &&
@@ -4185,6 +5115,10 @@ export function createPanelHandler(ctx) {
             if (hasSessionSlots && body.session_slots !== null)
               strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
             if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
+            if (hasMaxPrimarySessions && body.max_primary_sessions !== null)
+              strictInteger(body.max_primary_sessions, 1, 20, 'max_primary_sessions')
+            if (hasMaxSubagents && body.max_subagents_per_session !== null)
+              strictInteger(body.max_subagents_per_session, 0, 20, 'max_subagents_per_session')
             // null puts the slot back on the default weight of 1
             if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
           } catch (error) {
@@ -4223,6 +5157,12 @@ export function createPanelHandler(ctx) {
             return json(res, 400, {
               ok: false,
               error: { code: 'claude_max_sessions_forbidden', message: 'Claude 槽不使用 OpenAI 会话容量上限' },
+            })
+          }
+          if ((hasMaxPrimarySessions || hasMaxSubagents) && isCodexVm(currentVm)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'gpt_family_limits_forbidden', message: 'GPT slots do not use Claude family limits' },
             })
           }
           if (hasAuthScheme && hostUnsupported(res, currentVm, 'auth_scheme')) return
@@ -4314,6 +5254,24 @@ export function createPanelHandler(ctx) {
               if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
             }
           }
+          if (hasMaxPrimarySessions || hasMaxSubagents) {
+            const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
+              policy: {
+                ...record.policy,
+                ...(hasMaxPrimarySessions && {
+                  maxPrimarySessions: body.max_primary_sessions,
+                  maxPrimarySessionsOverride: body.max_primary_sessions !== null,
+                }),
+                ...(hasMaxSubagents && {
+                  maxSubagentsPerSession: body.max_subagents_per_session,
+                  maxSubagentsPerSessionOverride: body.max_subagents_per_session !== null,
+                }),
+              },
+            }))
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            ctx.poolScheduler?.notifyCapacity?.()
+            ctx.poolScheduler?.signalChange?.()
+          }
           if (parsedQuotaOverride) {
             const vm = applyVmQuotaOverride(id, parsedQuotaOverride.value)
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
@@ -4326,6 +5284,18 @@ export function createPanelHandler(ctx) {
           if (hasAuthScheme) {
             const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            try {
+              const host = slotHost(vm)
+              await (host.syncCredentials || host.onImport)?.(vm, path.join(cfg.paths.project, 'vms', id))
+            } catch (error) {
+              return json(res, 502, {
+                ok: false,
+                error: {
+                  code: 'credential_sync_failed',
+                  message: String(error?.message || 'failed to sync auth_scheme to slot'),
+                },
+              })
+            }
           }
           let slotPolicyResult = null
           if (hasSlotPolicy) {
@@ -4343,7 +5313,8 @@ export function createPanelHandler(ctx) {
                   ? 404
                   : slotPolicyResult.code?.startsWith('license_')
                     ? 403
-                    : slotPolicyResult.code === 'gpt_engine_forbidden'
+                    : slotPolicyResult.code === 'gpt_engine_forbidden' ||
+                        slotPolicyResult.code === 'crag_debian13_crag_only'
                       ? 400
                       : 503
               return json(res, status, {
@@ -4364,17 +5335,30 @@ export function createPanelHandler(ctx) {
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           }
           if (hasTimezone) {
+            const prevZone = currentVm.timezone || ''
             const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
             const kernel = projectSlotKernelConfig(vm)
             timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
+            const freshVm = getVm(cfg.paths.project, id)
+            if (freshVm?.status === 'running') {
+              if (freshVm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, freshVm).catch(() => null)
+              } else if (prevZone !== timezoneSync.timezone) {
+                timezoneSync.restart_recommended_for_tz = true
+              }
+            }
           } else if (followProxyTz) {
             const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
             timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
             if (synced.applied) {
               const kernel = projectSlotKernelConfig({ id })
               timezoneSync.kernel_hot = kernel?.changed === true
+              const freshVm = getVm(cfg.paths.project, id)
+              if (freshVm?.status === 'running' && freshVm.runtime?.type !== 'kvm') {
+                timezoneSync.restart_recommended_for_tz = true
+              }
             }
           }
           if (nextName != null && nextName !== String(currentVm.name || '')) {
@@ -4466,10 +5450,27 @@ export function createPanelHandler(ctx) {
       // Explicit quota refresh: no inference request or cached-success response.
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/usage\/query$/.test(p)) {
         const id = p.split('/')[4]
+        let body = {}
+        try {
+          body = (await readBody(req, 4096)) || {}
+        } catch (error) {
+          return json(res, error?.status || 400, {
+            ok: false,
+            error: { code: error?.code || 'invalid_request', message: String(error?.message || 'invalid JSON body') },
+          })
+        }
+        if (typeof body !== 'object' || Array.isArray(body)) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: 'Request body must be a JSON object' },
+          })
+        }
+        const forceReconcile = body.force_reconcile === true || body.reconcile_headers === true
         const result = await queryActiveUsage({
           projectRoot: cfg.paths.project,
           vm: getVm(cfg.paths.project, id),
           accountQuota,
+          forceReconcile,
         })
         return json(res, result.status, result.body)
       }
@@ -4532,6 +5533,7 @@ export function createPanelHandler(ctx) {
         }
         const result = await panel.buildClaudeResetRedeem({
           cfg,
+          accountQuota,
           id,
           idempotencyKey: req.headers['idempotency-key'],
           card: body.card,
@@ -4575,11 +5577,74 @@ export function createPanelHandler(ctx) {
           baseUrl: `http://127.0.0.1:${cfg.port}`,
           apiKey: cfg.api_key,
           accountQuota,
+          nodePenalty: ctx.poolScheduler?.nodePenalties?.()?.get(id) || null,
         })
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/count-tokens$/.test(p)) {
-        return json(res, 404, { ok: false, error: { code: 'not_found', message: 'not found' } })
+        // Same switch as the public entry. `ctx.routingConfig` is a getter on the live
+        // object, so flipping it in the panel takes effect without a restart.
+        if (!countTokensEnabled(ctx.routingConfig))
+          return json(res, 404, { ok: false, error: { code: 'not_found', message: 'not found' } })
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        const mode = credentialModeOfVm(vm)
+        if (!isAnySetupTokenMode(mode) && !isApiKeyMode(mode)) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'count_tokens_unsupported',
+              message: 'count_tokens 只支持 Setup Token / Console API Key，完整 OAuth 走 Claude Code Messages usage',
+            },
+          })
+        }
+        const exec = workerExecForVm(id)
+        if (!exec) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        const reqBody = await readBody(req, 256 * 1024).catch(() => ({}))
+        const model = String(reqBody.model || reqBody.model_id || '').trim()
+        const messages = Array.isArray(reqBody.messages) ? reqBody.messages : null
+        if (!model || !messages?.length) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: 'model 与 messages 必填' },
+          })
+        }
+        const anthropicBody = { model, messages }
+        if (reqBody.system != null) anthropicBody.system = reqBody.system
+        if (Array.isArray(reqBody.tools)) anthropicBody.tools = reqBody.tools
+        const hop = await countTokensViaWorker(exec, {
+          body: anthropicBody,
+          headers: {
+            'user-agent': 'kin-inference/1.0',
+            'anthropic-version': '2023-06-01',
+            'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(model),
+          },
+          timeoutMs: Math.min(Math.max(Number(reqBody.timeout_ms || reqBody.timeoutMs) || 45000, 5000), 120000),
+        })
+        if (!hop.ok) {
+          const err = hop.body?.error || {}
+          return json(res, hop.status || 502, {
+            ok: false,
+            error: {
+              code: err.code || 'count_tokens_failed',
+              message: err.message || 'count_tokens 失败',
+              type: err.type || undefined,
+            },
+          })
+        }
+        return json(
+          res,
+          200,
+          panel.ok({
+            vm_id: id,
+            model,
+            credential_mode: mode,
+            input_tokens: Number(hop.body?.input_tokens) || 0,
+            usage: hop.body || null,
+            via: hop.via,
+          }),
+        )
       }
       // GET /api/panel/test-models — models available for test dropdown
       if (req.method === 'GET' && p === '/api/panel/test-models') {
@@ -4642,7 +5707,7 @@ export function createPanelHandler(ctx) {
         }
         const currentVm = getVm(cfg.paths.project, id)
         const credentialFailure =
-          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
+          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked|token_revoked|invalidated oauth token/i.test(
             `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
           )
         if (body.schedulable && credentialFailure) {
@@ -5035,7 +6100,9 @@ export function createPanelHandler(ctx) {
         const payload = {
           vm_id: id,
           seed_policy,
-          ...seedTelemetryContract(seed_policy),
+          ...seedTelemetryContract(seed_policy, {
+            disableNonessentialTraffic: telemetryDisableNonessentialTraffic(ctx.routingConfig),
+          }),
           ...observed,
         }
         if (debug) {
@@ -5151,6 +6218,18 @@ export function createPanelHandler(ctx) {
           vm.seed_policy = next
           vm.updated_at = new Date().toISOString()
           atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          if (fs.existsSync(fingerprintDir(cfg.paths.project, id))) {
+            try {
+              const tzSync = syncSlotIdentityTimezoneAndPreset(cfg.paths.project, vm, {
+                timezone: vm.timezone,
+                locale: vm.locale,
+                telemetryEnabled: isTelemetryEnabled(next),
+              })
+              if (tzSync?.ok && vm.status === 'running' && vm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, vm, tzSync).catch(() => null)
+              }
+            } catch {}
+          }
           let service
           if (unsupported) {
             service = await withVmLock(`seed-publication:${vmPath}`, async () => {
@@ -5173,6 +6252,7 @@ export function createPanelHandler(ctx) {
                   existingSettings:
                     existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
                   replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+                  routing: ctx.routingConfig,
                 })
                 outcome.wrote = outcome.seed.wrote === true
                 const result = await host.syncSeed(fresh, path.join(cfg.paths.project, 'vms', id))
@@ -5193,13 +6273,16 @@ export function createPanelHandler(ctx) {
               routing: ctx.routingConfig,
               lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
               replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+              ...(ctx.telemetryOps ? { ops: ctx.telemetryOps } : {}),
             })
           }
           const { seed: written, ...publicService } = service
           const data = {
             vm_id: id,
             seed_policy: next,
-            ...seedTelemetryContract(next),
+            ...seedTelemetryContract(next, {
+              disableNonessentialTraffic: telemetryDisableNonessentialTraffic(ctx.routingConfig),
+            }),
             saved: true,
             published: service.published === true,
             applied: service.applied === true,
@@ -5211,7 +6294,12 @@ export function createPanelHandler(ctx) {
           if (!service.ok) {
             return json(res, 502, {
               ok: false,
-              error: { code: service.code || 'telemetry_not_applied', message: service.error || 'VM 原生配置尚未生效' },
+              error: {
+                code: service.code || 'telemetry_not_applied',
+                message: service.error || 'VM 原生配置尚未生效',
+                ...(service.reason ? { reason: service.reason } : {}),
+                ...(service.upstream_message ? { upstream_message: service.upstream_message } : {}),
+              },
               data,
             })
           }
@@ -5453,18 +6541,26 @@ export function createPanelHandler(ctx) {
           }
         }
         const startNow = body.start !== false && body.status !== 'stopped'
-        const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
+        const wantKernel = normalizeOsKernel(body.kernel) || kernelForIndex(idx)
+        const cragDebian13Create = isCragDebian13Kernel(wantKernel)
         let nodeId = body.node_id ? String(body.node_id) : null
         const kindProbe = {}
         stampVmKind(kindProbe, body)
         const codexCreate = isCodexVm(kindProbe)
+        if (codexCreate && cragDebian13Create) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_create_dataplane', message: 'crag-debian13 仅支持 Anthropic CRAG 槽位' },
+          })
+        }
         if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
           return json(res, 400, {
             ok: false,
             error: { code: 'invalid_create_dataplane', message: '仅 Anthropic 支持选择 cli-node 或 CRAG 推理内核' },
           })
         }
-        const selectedCrag = body.dataplane === 'crag'
+        const effectiveDataplane = !codexCreate ? (cragDebian13Create ? 'crag' : (body.dataplane ?? 'wrap')) : undefined
+        const selectedCrag = !codexCreate && effectiveDataplane === 'crag'
         const unsupportedCrag = () =>
           json(res, 409, {
             ok: false,
@@ -5508,7 +6604,7 @@ export function createPanelHandler(ctx) {
         const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
         const wanted = requestedPlacement(body, placementPolicy)
         const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
-        const localCragSupported = process.platform === 'linux' && process.arch === 'x64'
+        const localCragSupported = process.platform === 'linux' && cragTargetArch(cfg.paths.project) === 'amd64'
         const cragCapableNodes = new Set()
         if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
           const picked = await (ctx.pickPlacement || pickPlacement)({
@@ -5719,12 +6815,13 @@ export function createPanelHandler(ctx) {
           vm.owner_user_id = normalizeOwnerId(req.panelUserId)
           vm.origin = VM_ORIGIN.userCreated
         } else {
-          vm.owner_user_id = null
-          vm.origin = VM_ORIGIN.platform
+          const explicitOwner = normalizeOwnerId(body.owner_user_id)
+          vm.owner_user_id = explicitOwner
+          vm.origin = explicitOwner ? VM_ORIGIN.userCreated : VM_ORIGIN.platform
         }
         if (nodeId) vm.node_id = nodeId
         stampVmKind(vm, body)
-        if (!codexCreate) vm.dataplane = body.dataplane ?? 'wrap'
+        if (!codexCreate) vm.dataplane = effectiveDataplane
         if (selectedCrag) {
           vm.crag_kernel_version = 'v2'
           // Do not publish a running record before the selected CRAG has passed licensing.
@@ -5860,7 +6957,7 @@ export function createPanelHandler(ctx) {
         if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
-            boot = await startSlotReady(vm, cfg.paths.project, {
+            boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
               routing: ctx.routingConfig,
               bindSubscription: createBindSubscription,
             })
@@ -6572,22 +7669,63 @@ export function createPanelHandler(ctx) {
               error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          const tok = await refreshCodexAccessToken({
-            refreshToken,
-            proxyUrl: hostProxyUrlForVm(vm),
+          // 共锁（key=codex:<vmId>）且锁内重读凭证：等待期间并发方轮换出的新票
+          // 直接采用，不用锁外捕获的旧 RT 重放、也不用旧票元数据落盘。
+          const tok = await withCredentialRefreshLock(`codex:${id}`, async () => {
+            const current = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            const liveRefreshToken = String(current.refresh_token || '').trim()
+            if (!liveRefreshToken) return { ok: false, error: 'credential_mode_unsupported' }
+            const result = await refreshCodexAccessToken({
+              refreshToken: liveRefreshToken,
+              proxyUrl: hostProxyUrlForVm(vm),
+            })
+            if (!result?.ok) return result
+            const latest = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            if (latest.refresh_token && latest.refresh_token !== liveRefreshToken) {
+              // 并发方已轮换：直接采用其新票，本方轮换结果作废。
+              return { ok: true, adopted: true }
+            }
+            upsertCodexAccount(cfg.paths.project, id, {
+              access_token: result.access_token,
+              refresh_token: result.refresh_token,
+              id_token: result.id_token || latest.id_token,
+              expires_at: result.expires_at || latest.expires_at,
+            })
+            return result
           })
-          if (!tok.ok) {
-            return json(res, 502, {
+          if (tok?.error === 'credential_mode_unsupported') {
+            return json(res, 400, {
               ok: false,
-              error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
+              error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          upsertCodexAccount(cfg.paths.project, id, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
-          })
+          if (!tok.ok) {
+            // 操作员手动刷新=最强的死活证据源：吊销结论立即落盘摘池（面板显示
+            // 「不可调度 · 凭证吊销」），其余失败维持现状只回 502。
+            if (tok.error === 'oauth_revoked') {
+              try {
+                persistCodexCredentialState(cfg.paths.project, id, { error: 'oauth_revoked' })
+                markCodexGrantDead(cfg.paths.project, id, {
+                  description: tok.description || 'oauth_revoked',
+                  status: tok.status || null,
+                })
+              } catch {}
+            }
+            const message =
+              tok.error === 'oauth_revoked'
+                ? 'GPT OAuth 凭证已被吊销，需重新授权导入'
+                : 'GPT OAuth 刷新失败，请重新导入'
+            return json(res, 502, {
+              ok: false,
+              error: { code: tok.error || 'refresh_failed', message },
+            })
+          }
+          // upsert 已在锁内完成（并发轮换时采用对方新票）；成功=活票：
+          // 清掉 grant-death 内存 hold 与陈旧吊销标。
+          clearOpenAIAccountHold(id)
+          try {
+            persistCodexCredentialState(cfg.paths.project, id, { error: null })
+          } catch {}
           return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
         }
         if (isApiKeyMode(vm?.claude?.mode)) {
@@ -6628,6 +7766,17 @@ export function createPanelHandler(ctx) {
         return json(res, 200, result)
       }
       if (req.method === 'GET' && p === '/api/panel/health-probe') {
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -6635,11 +7784,27 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor?.getConfig?.() || ctx.routingConfig.health_probe,
             snapshot: ctx.healthMonitor?.getSnapshot?.() || null,
             snapshots: ctx.healthMonitor?.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }
       if (req.method === 'POST' && p === '/api/panel/health-probe') {
-        const snapshot = await ctx.healthMonitor.runRealProbe()
+        const body = await readBody(req, 4096).catch(() => ({}))
+        const platform =
+          typeof body?.platform === 'string' && body.platform.trim() ? body.platform.trim().toLowerCase() : 'all'
+        const model = typeof body?.model === 'string' ? body.model.trim() : ''
+        const snapshot = await ctx.healthMonitor.runRealProbe({ platform, ...(model ? { model } : {}) })
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -6647,6 +7812,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor.getConfig(),
             snapshot,
             snapshots: ctx.healthMonitor.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }
@@ -6673,7 +7839,20 @@ export function createPanelHandler(ctx) {
       }
       // GET /api/panel/usage
       if (req.method === 'GET' && p === '/api/panel/usage') {
-        return json(res, 200, panel.buildUsage({ accountQuota, cfg, requestLog }))
+        const ident = panelIdentity(req)
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'usage',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            project: cfg?.paths?.project || null,
+            role: ident.role,
+          },
+          () => panel.buildUsageAsync({ accountQuota, cfg, requestLog, bypass }),
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, payload)
       }
       // GET /api/panel/models
       if (req.method === 'GET' && p === '/api/panel/models') {
@@ -6694,6 +7873,20 @@ export function createPanelHandler(ctx) {
               effective: models,
               image_tools: listImageToolModels(),
               platform: 'openai',
+            }),
+          )
+        }
+        if (platform === 'google' || platform === 'gemini') {
+          const pol = getGeminiModelPolicy()
+          const models = listGeminiPolicyModels()
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: pol,
+              models,
+              effective: models,
+              platform: 'google',
             }),
           )
         }
@@ -6727,6 +7920,20 @@ export function createPanelHandler(ctx) {
             }),
           )
         }
+        if (platform === 'google' || platform === 'gemini') {
+          const saved = saveGeminiModelPolicy(body.policy || body)
+          const models = listGeminiPolicyModels()
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: saved,
+              models,
+              effective: models,
+              platform: 'google',
+            }),
+          )
+        }
         const saved = saveModelPolicy(body.policy || body)
         seedModelCatalog()
         syncClaudeKernelConfigs(cfg.paths.project, ctx.routingConfig)
@@ -6757,6 +7964,20 @@ export function createPanelHandler(ctx) {
               effective: models,
               image_tools: listImageToolModels(),
               platform: 'openai',
+            }),
+          )
+        }
+        if (platform === 'google' || platform === 'gemini') {
+          const saved = resetGeminiModelPolicy()
+          const models = listGeminiPolicyModels()
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: saved,
+              models,
+              effective: models,
+              platform: 'google',
             }),
           )
         }
@@ -6881,6 +8102,45 @@ export function createPanelHandler(ctx) {
           }),
         )
       }
+      // POST /api/panel/model-policy/sync-gemini — latest Google Gemini models from slots, Gemini API endpoints & models.dev
+      if (req.method === 'POST' && p === '/api/panel/model-policy/sync-gemini') {
+        const result = await syncGeminiCatalog({
+          callGeminiHost,
+          resolveGeminiProxy: (proxyId, envId) => {
+            const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
+            return geminiProxyFor(ctx.proxyPool, proxyId, { ownerUserId })
+          },
+          resolveGeminiProxyEgressOptions: (proxyId, envId) => {
+            const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
+            return geminiProxyEgressOptionsFor(ctx.proxyPool, proxyId, { ownerUserId })
+          },
+          apiEndpointStore: ctx.apiEndpointStore,
+          cfg,
+          refreshModelsDev: true,
+        })
+        if (!result.ok) {
+          return json(res, result.error === 'no_google_models' ? 400 : 502, {
+            ok: false,
+            error: { code: result.error, message: result.error },
+            data: { synced: 0, catalog_sync: readCatalogSync() },
+          })
+        }
+        const models = listGeminiPolicyModels()
+        return json(
+          res,
+          200,
+          panel.ok({
+            policy: getGeminiModelPolicy(),
+            models,
+            effective: models,
+            platform: 'google',
+            synced: result.synced,
+            added: result.added || [],
+            sources: result.sources || [],
+            catalog_sync: readCatalogSync(),
+          }),
+        )
+      }
 
       // GET /api/panel/routing
       if (req.method === 'GET' && p === '/api/panel/routing') {
@@ -6888,7 +8148,12 @@ export function createPanelHandler(ctx) {
           ...ctx.routingConfig,
           compatibility: canonicalPersonaCompat(ctx.routingConfig?.compatibility),
         }
-        return json(res, 200, panel.buildRouting({ routingConfig, stickyRouter }))
+        const rawCeiling = Number(cfg?.limits?.max_body_bytes)
+        const maxBodyBytes = Number.isFinite(rawCeiling) && rawCeiling > 0 ? rawCeiling : DEFAULT_MAX_REQUEST_BYTES
+        const payload = panel.buildRouting({ routingConfig, stickyRouter })
+        payload.data.max_body_bytes = maxBodyBytes
+        payload.data.max_body_mib = Math.floor(maxBodyBytes / (1024 * 1024))
+        return json(res, 200, payload)
       }
       // GET /api/panel/outbound-profile — read-only outbound reference for the global preset
       if (req.method === 'GET' && p === '/api/panel/outbound-profile') {
@@ -6910,8 +8175,12 @@ export function createPanelHandler(ctx) {
             validateOpenAIQuotaPatch(body.codex.quota)
           }
           validateInferenceWebsocketPatch(body)
+          validateGeminiRoutingPatch(body)
+          validateQuotaRoutingPatch(body, ctx.routingConfig?.quota)
+          validateLoggingRoutingPatch(body, ctx.routingConfig?.logging)
+          validateRedactionPatch(body)
         } catch (error) {
-          if (error instanceof TypeError || error instanceof RangeError) {
+          if (error instanceof TypeError || error instanceof RangeError || error?.status === 400) {
             return json(res, 400, {
               ok: false,
               error: {
@@ -6964,10 +8233,16 @@ export function createPanelHandler(ctx) {
         try {
           applied = appliedDuringSwitch ?? (await persistRoutingPatch(body))
         } catch (error) {
-          restoreRoutingRuntime(previousRoutingConfig)
-          return json(res, 503, {
+          await restoreRoutingRuntime(previousRoutingConfig)
+          const status =
+            Number.isInteger(error?.status) && error.status >= 400 && error.status < 600 ? error.status : 503
+          return json(res, status, {
             ok: false,
-            error: { code: 'routing_persist_failed', message: String(error?.message || error) },
+            error: {
+              ...(status === 400 ? { type: 'invalid_request_error' } : {}),
+              code: error?.code || (status === 400 ? 'invalid_redaction_config' : 'routing_persist_failed'),
+              message: String(error?.message || error),
+            },
           })
         }
         return json(
@@ -6975,11 +8250,13 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             ...publicRoutingNotify(ctx.routingConfig),
+            redaction_runtime: redactionStatus(),
             applied_concurrency: applied.concurrency,
             applied_rpm: applied.rpm,
             applied_session_slots: applied.session_slots,
             kernel_persona: applied.kernel_persona || null,
             telemetry_sync: applied.telemetry_sync || null,
+            gemini_sync: applied.gemini_sync || null,
             inference_runtime: publicEngineRuntime,
           }),
         )
@@ -7077,13 +8354,18 @@ export function createPanelHandler(ctx) {
       if (req.method === 'DELETE' && p === '/api/panel/refusal-device-blocks') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
         const repo = new RefusalDeviceBlocksRepo()
+        const sessionsRepo = new RefusalSessionBlocksRepo()
         const deviceId = String(body?.device_id || '').trim()
         if (deviceId) {
+          const existing = repo.get(deviceId)
           if (!repo.remove(deviceId)) {
             return json(res, 404, {
               ok: false,
               error: { type: 'not_found_error', code: 'refusal_device_not_found', message: 'device 不存在' },
             })
+          }
+          if (existing?.subject_kind === 'session' && existing.session_id) {
+            sessionsRepo.remove(existing.session_id)
           }
           return json(res, 200, panel.ok(refusalGuardSnapshot()))
         }
@@ -7098,6 +8380,7 @@ export function createPanelHandler(ctx) {
           })
         }
         repo.clear()
+        sessionsRepo.clear()
         return json(res, 200, panel.ok(refusalGuardSnapshot()))
       }
       if (req.method === 'GET' && p === '/api/panel/protocol-entry') {
@@ -7193,6 +8476,23 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+      }
+      if (req.method === 'POST' && p === '/api/panel/jev-intercept/resume') {
+        if (panelIdentity(req).role !== 'admin') {
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '仅管理员可恢复审核密钥' } })
+        }
+        const body = await readBody(req, 8192).catch(() => ({}))
+        const fingerprint = body?.key_fingerprint == null ? '' : String(body.key_fingerprint).trim()
+        if (fingerprint && !/^[a-f0-9]{12}$/.test(fingerprint)) {
+          return json(res, 400, {
+            ok: false,
+            error: { type: 'invalid_request_error', code: 'invalid_key_fingerprint', message: '无效的密钥指纹' },
+          })
+        }
+        const stored = readJevConfig((key, fallback) => new SettingsRepo().get(key, fallback))
+        const resumed = resumeJevKeys(stored, fingerprint)
+        const keys = publicJevKeys(stored)
+        return json(res, 200, panel.ok({ resumed, keys }))
       }
       if (req.method === 'GET' && p === '/api/panel/notify') {
         return json(
@@ -7309,7 +8609,7 @@ export function createPanelHandler(ctx) {
           port: body.port,
           username: body.username ?? body.user,
           password: body.password ?? body.pass,
-          ownerUserId: ident.role === 'user' ? req.panelUserId : null,
+          ownerUserId: ident.role === 'user' ? req.panelUserId : normalizeOwnerId(body.owner_user_id),
         })
         let bound = null
         let worker = null
@@ -7738,6 +9038,18 @@ export function createPanelHandler(ctx) {
     }
 
     return false
+  }
+
+  return async function handlePanel(req, res, url) {
+    const out = await handlePanelInner(req, res, url)
+    const status = res?.[PANEL_STATUS_SYM] ?? res?.statusCode ?? 200
+    if (out !== false && status < 400) {
+      invalidateCachesForPanelMutation(req.method, url.pathname)
+      if (shouldSyncSchedulerOnMutation(req.method, url.pathname)) {
+        notifySchedulerConfigChanged(`${req.method}:${url.pathname}`)
+      }
+    }
+    return out
   }
 }
 

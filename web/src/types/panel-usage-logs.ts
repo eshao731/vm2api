@@ -11,6 +11,18 @@
  * 仍服务于错误归集与导出，由 `types/panel-logs.ts` 描述。
  */
 
+/** 安全脱敏后的标量错误诊断字段（upstream_type / #1705 续传恢复字段 / 410 reason / 风控 JEV 分数）。 */
+export type LogErrorDetails = Record<string, string | number | boolean>
+
+/** 拦截网关单次裁决结构（usage_logs.intercept）。 */
+export type InterceptVerdict = {
+  kind: 'pass' | 'block'
+  by: string
+  keyword?: string
+  rule?: string
+  route?: { kind: string; target: string; score?: number }
+}
+
 /** 单次上游尝试，`request_attempts` 直出，按 `attemptNumber` 升序构成供应商链。 */
 export type ProviderChainItem = {
   attemptNumber: number
@@ -26,11 +38,20 @@ export type ProviderChainItem = {
   upstreamStatus: number | null
   /** 错误归属域：client / provider / platform。 */
   errorScope: string | null
+  errorCode?: string | null
+  upstreamType?: string | null
+  errorDetails?: LogErrorDetails | null
   /** 本次尝试的终态（success / exhausted / cooldown / …）。 */
   terminalState: string | null
   action: string | null
   /** 该次尝试是否已把响应提交给下游（= 最终服务方）。 */
   downstreamCommitted: boolean
+  /** 网关发给槽位内核的单跳 request_id，用于对照 `docker logs kin-NN`。 */
+  hopRequestId?: string | null
+  providerRunId?: string | null
+  providerTurnId?: string | null
+  providerAttemptId?: number | null
+  providerRequestId?: string | null
   /** 调度总耗时，包含实际排队；历史记录没有拆分。 */
   waitMs: number | null
   queueWaitMs: number | null
@@ -89,11 +110,33 @@ export type ReasoningEffort =
   | 'max'
   | 'ultra'
 
+/** 进行中请求（Redis 实时态）元数据。全部可选，向后兼容。 */
+export type UsageLogLiveMeta = {
+  phase?: string
+  attempt_count?: number
+  attemptCount?: number
+  started_at?: number
+  startedAt?: number
+  ttft_ms?: number | null
+  ttftMs?: number | null
+  vm_id?: string | null
+  vmId?: string | null
+  account_id?: string | null
+  accountId?: string | null
+  active_provider?: string | null
+  activeProvider?: string | null
+}
+
 /** 滚动日志的一行。`null` = 本行该字段为空（vm2api 不产出的 hub 字段已整体删去）。 */
 export type UsageLogRow = {
   /** `usage_logs.id`（`log_<12hex>`），游标 tiebreaker。 */
   id: string
   requestId: string | null
+  /** 是否仍在处理中（Redis 在飞请求合并到第 1 页顶部时为 true）。 */
+  in_flight?: boolean
+  inFlight?: boolean
+  /** 进行中请求的实时阶段与当前尝试节点。 */
+  _live?: UsageLogLiveMeta | null
   /** ISO-8601，请求完成时刻。 */
   createdAt: string
   userId: string | null
@@ -183,6 +226,10 @@ export type UsageLogRow = {
   errorOwner: 'client' | 'provider' | 'platform' | null
   errorCode: string | null
   errorMessage: string | null
+  upstreamType?: string | null
+  errorDetails?: LogErrorDetails | null
+  /** 网关裁决 JSON（via / keyword / rule / route）。 */
+  intercept?: InterceptVerdict | null
   /** classifyJev 实际 POST 的 state。送审上下文，不是模型指出的命中句。 */
   jevState: string | null
 
@@ -235,10 +282,18 @@ export type UsageLogFilters = {
   endpoint?: string
   /** (`protocol`) */
   protocol?: string
+  /** (`via`) 精确匹配路由/拦截器标签（如 jev / hard-regex / refusal-guard / distill-detect）。 */
+  via?: string
+  /** (`final_state`) 精确匹配终态（如 policy_blocked / refusal_device / refusal_session）。 */
+  finalState?: string
+  /** (`upstream_risk_errors=1`) 上游 400/401/403/422 风险与错误诊断行。 */
+  upstreamRiskErrors?: boolean
   /** (`status_code`) 精确状态码。 */
   statusCode?: number
   /** (`exclude_status_200=1`) 只看非 2xx；与 statusCode 互斥，后者优先。 */
   excludeStatus200?: boolean
+  /** (`failed_only=1`) 所有失败请求，包含非 2xx 与外层 2xx 但流内终态失败（如 rejected/incomplete/failed）。 */
+  failedOnly?: boolean
   /** (`model_mismatch=1`) */
   modelMismatch?: boolean
   /** (`min_attempt_count`) 只看 `attempt_count >= n`，「有重试」= 2。 */
@@ -296,7 +351,7 @@ export type UsageLogFilterOptions = {
 /** `GET /api/panel/usage-logs/session-suggestions?q=&limit=` 的 `data`：出站会话 id 前缀匹配，最新优先。 */
 export type UsageLogSessionSuggestions = string[]
 
-/** 近 N 分钟内有请求的出站会话（vm2api 只在请求完成时落库，没有「进行中」态）。 */
+/** 近 N 分钟内有请求（含进行中请求）的出站会话。 */
 export type ActiveSession = {
   sessionId: string
   /** 窗口内仅 1 次请求且无工具（旁路请求），不与其它会话合并。 */
@@ -317,6 +372,12 @@ export type ActiveSession = {
   lastDurationMs: number | null
   totalTokens: number
   totalCost: number
+  /** 该会话当前是否有进行中的请求。 */
+  in_progress?: boolean
+  inProgress?: boolean
+  /** 该会话当前在飞请求并发数。 */
+  inflight_count?: number
+  inflightCount?: number
 }
 
 /** `GET /api/panel/usage-logs/active-sessions?minutes=5&limit=50` 的 `data`。 */

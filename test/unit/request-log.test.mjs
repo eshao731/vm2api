@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -13,7 +14,10 @@ import {
   logsToJsonl,
 } from '../../src/lib/admin/request-log.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
+import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { createRespond } from '../../src/lib/http/respond.mjs'
 import { gateVerdict } from '../../src/lib/protocol/intercept-stats.mjs'
 import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 
@@ -220,6 +224,58 @@ test('backfillMissingCosts restores actual cost with the stored group multiplier
     ],
   )
   assert.equal(store.repo.backfillMissingCosts(), 0)
+})
+
+test('advisor iterations persist advisor_usage/advisor_cost, bill into total_cost/actual_cost, and survive reprice/backfill', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const sum = store.finish(ctx, {
+    status: 200,
+    model: 'claude-sonnet-5',
+    upstream_model: 'claude-sonnet-5',
+    rate_multiplier: 1.5,
+    usage: {
+      input_tokens: 1_000_000,
+      output_tokens: 0,
+      iterations: [
+        { type: 'message', model: 'claude-sonnet-5', input_tokens: 1_000_000, output_tokens: 0 },
+        { type: 'advisor_message', model: 'claude-opus-5-5', input_tokens: 1_000_000, output_tokens: 0 },
+      ],
+    },
+  })
+  // Sonnet 5 input = $2/MTok, Opus 5.5 input = $4/MTok -> advisor_cost = 4, total_cost = 6, actual_cost = 9
+  assert.equal(sum.input_cost, 2)
+  assert.equal(sum.advisor_cost, 4)
+  assert.equal(sum.total_cost, 6)
+  assert.equal(sum.actual_cost, 9)
+  assert.ok(sum.advisor_usage)
+  const parsed = JSON.parse(sum.advisor_usage)
+  assert.equal(parsed.length, 1)
+  assert.equal(parsed[0].model, 'claude-opus-5-5')
+  assert.equal(parsed[0].input_tokens, 1_000_000)
+
+  // Clearing cost columns and backfilling reproduces the exact advisor_cost/total_cost/actual_cost.
+  store.db
+    .prepare(
+      'UPDATE usage_logs SET pricing_model = NULL, advisor_cost = NULL, total_cost = NULL, actual_cost = NULL WHERE id = ?',
+    )
+    .run(sum.id)
+  assert.equal(store.repo.backfillMissingCosts(), 1)
+  const backfilled = store.db
+    .prepare('SELECT advisor_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id = ?')
+    .get(sum.id)
+  assert.equal(backfilled.advisor_cost, 4)
+  assert.equal(backfilled.total_cost, 6)
+  assert.equal(backfilled.actual_cost, 9)
+  assert.equal(backfilled.pricing_model, 'claude-sonnet-5')
+
+  // repriceRange is idempotent once priced.
+  const repriced = store.repo.repriceRange({})
+  assert.equal(repriced.changed, 0)
+  assert.equal(repriced.rows, 1)
 })
 
 function finishWith(store, model, usage) {
@@ -618,6 +674,36 @@ test('finish persists web_search_requests from server_tool_use', () => {
   assert.equal(row.web_search_requests, 3)
 })
 
+test('repricing Ultrafast rows uses their request dates and preserves actual cost', () => {
+  const store = tmpStore('normal')
+  const before = '2027-03-01T07:59:59.999Z'
+  const after = '2027-03-01T08:00:00.000Z'
+  store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, model, status, input_tokens,
+      output_tokens, service_tier, pricing_model, actual_cost
+    ) VALUES
+      ('ultra_promo', 'rid_ultra_promo', ?, 'gpt-6.2-sol', 200, 100000, 100000, 'ultrafast', 'unpriced', NULL),
+      ('ultra_list', 'rid_ultra_list', ?, 'gpt-6.2-sol', 200, 100000, 100000, 'ultrafast', 'unpriced', 4)
+  `)
+    .run(before, after)
+
+  assert.equal(store.repo.repriceRange({ since: before, until: after }).changed, 2)
+  const rows = store.db
+    .prepare(
+      "SELECT total_cost, actual_cost FROM usage_logs WHERE id IN ('ultra_promo', 'ultra_list') ORDER BY created_at",
+    )
+    .all()
+  assert.deepEqual(
+    rows.map((row) => [row.total_cost, row.actual_cost]),
+    [
+      [3.6, null],
+      [7.2, 4],
+    ],
+  )
+})
+
 test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost stays put', () => {
   const store = tmpStore('normal')
   const now = new Date().toISOString()
@@ -854,6 +940,55 @@ test('risk audit counts only routed hops and looks up upstream 400s by original 
   assert.equal(requests[0].inboundDeviceId, 'request-device')
   assert.equal(requests[0].clientSessionId, 'request-session')
   assert.equal(view.listBatch({ request_id: original.request_id }).logs[0].id, requests[0].id)
+})
+
+test('protocolEntryStats counts upstreamRefusals and UsageLogsView supports via/upstream_risk_errors + JEV details', () => {
+  const store = tmpStore()
+  logOne(store, {
+    status: 429,
+    via: 'jev',
+    final_state: 'policy_blocked',
+    error_code: 'policy_blocked',
+    error_details: {
+      reason: 'jev:abuse',
+      jev_score_usage_policy: 0.91,
+      jev_score_abuse: 0.14,
+      gate_miss: false,
+      risk_bucket: 'policy',
+    },
+    intercept: gateVerdict({ kind: 'block', by: 'jev', keyword: 'abuse' }),
+    jev_state: '[user message 1]\nbuild a cheat injector',
+  })
+  logOne(store, {
+    status: 400,
+    via: 'go-worker-pool',
+    attempt_count: 1,
+    error_code: 'content_filter_refusal',
+    audit_upstream_error_status: 403,
+    audit_upstream_400_message: 'Upstream content policy refused',
+    error_details: {
+      risk_bucket: 'policy',
+      gate_miss: true,
+      jev_score_abuse: 0.54,
+    },
+    intercept: gateVerdict({ kind: 'pass', by: 'jev' }),
+  })
+
+  const stats = store.protocolEntryStats({ since: '1970-01-01T00:00:00.000Z' })
+  assert.equal(stats.blocked, 1)
+  assert.equal(stats.upstreamRefusals, 1)
+
+  const view = new UsageLogsView(store.db)
+  const jevOnly = view.listBatch({ via: 'jev', include_muted: true }).logs
+  assert.equal(jevOnly.length, 1)
+  assert.equal(jevOnly[0].intercept?.by, 'jev')
+  assert.equal(jevOnly[0].errorDetails?.jev_score_abuse, 0.14)
+
+  const upstreamRisk = view.listBatch({ upstream_risk_errors: true, include_muted: true }).logs
+  assert.equal(upstreamRisk.length, 1)
+  assert.equal(upstreamRisk[0].upstreamStatus, 403)
+  assert.equal(upstreamRisk[0].errorDetails?.gate_miss, true)
+  assert.equal(upstreamRisk[0].errorDetails?.risk_bucket, 'policy')
 })
 
 test('queryNormal filters + pagination + total', () => {
@@ -1372,4 +1507,319 @@ test('repriceRange re-prices image usage from the stored JSON and keeps actual_c
   assert.equal(rows.log_img_only.pricing_model, 'gpt-image-2.5-sunburst')
   assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
   assert.equal(rows.log_img_only.actual_cost, 5)
+})
+
+// #1637 起 /v1beta/models 允许用 ?key= 携带凭据；start() 的 path 兜底必须剥掉查询串，
+// 否则漏传 pathName 的调用点会把真 key 写进 request-logs（redactSecrets 只作用于 body）。
+test('start(): path fallback strips the query string', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    {
+      method: 'POST',
+      headers: {},
+      socket: {},
+      url: '/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaSyTESTKEYVALUE&alt=sse',
+    },
+    { protocol: 'gemini' },
+  )
+  assert.equal(ctx.path, '/v1beta/models/gemini-2.5-pro:generateContent')
+  assert.ok(!ctx.path.includes('AIzaSyTESTKEYVALUE'))
+  assert.ok(!ctx.path.includes('?'))
+})
+
+test('start(): explicit pathName is used verbatim', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {}, url: '/v1/messages?key=leak' },
+    {
+      protocol: 'anthropic.messages',
+      pathName: '/v1/messages',
+    },
+  )
+  assert.equal(ctx.path, '/v1/messages')
+})
+
+test('start(): missing url yields an empty path, not undefined', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x' })
+  assert.equal(ctx.path, '')
+})
+
+test('tapResponse captures writeHead headers (x-request-id, x-should-retry) from real http.ServerResponse + createRespond().json (#1845)', async (t) => {
+  const store = tmpStore('debug')
+  const respond = createRespond({ rewrite: { enabled: false } })
+  const mapped = mapUpstreamError(409, {
+    error: {
+      type: 'partial_provider_output_nonretryable',
+      message: 'Provider output for this continuation was interrupted and cannot be replayed immediately.',
+      details: {
+        retryable: true,
+        prior_reason: 'client_cancelled',
+        interrupted_at: 1795495209,
+        retry_after_sec: 20,
+        recovery_attempts: 1,
+        max_recoveries: 2,
+        recovery_exhausted: false,
+      },
+    },
+  })
+
+  let capturedRequestId = null
+  const server = http.createServer((req, res) => {
+    const ctx = store.start(req, { protocol: 'anthropic.messages', pathName: '/v1/messages' })
+    capturedRequestId = ctx.request_id
+    res._kinRequestId = ctx.request_id
+    store.tapResponse(ctx, res)
+    res.setHeader('retry-after', '20')
+    res.once('finish', () => {
+      store.finish(ctx, {
+        status: mapped.status,
+        error_code: 'upstream_invalid_request',
+        upstream_type: 'partial_provider_output_nonretryable',
+        error_details: mapped.body.error.details,
+      })
+    })
+    respond.json(res, mapped.status, mapped.body)
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`, { method: 'POST' })
+  const payload = await response.json()
+  assert.equal(response.status, 409)
+  assert.equal(response.headers.get('x-request-id'), capturedRequestId)
+  assert.equal(response.headers.get('x-should-retry'), 'false')
+  assert.equal(response.headers.get('retry-after'), '20')
+  assert.equal(payload.error.details.retryable, false)
+
+  // Wait one tick for the server 'finish' listener to flush store.finish().
+  await new Promise((resolve) => setImmediate(resolve))
+  const dbg = store.getDebug(capturedRequestId)
+  assert.ok(dbg?.response)
+  assert.equal(dbg.response.status, 409)
+  assert.equal(dbg.response.headers['x-request-id'], capturedRequestId)
+  assert.equal(dbg.response.headers['x-should-retry'], 'false')
+  assert.equal(dbg.response.headers['retry-after'], '20')
+  assert.match(String(dbg.response.headers['content-type']), /application\/json/)
+})
+
+test('tapResponse handles all Node writeHead signatures, precedence over setHeader, and header redaction (#1845)', async (t) => {
+  const store = tmpStore('debug')
+  const ids = {}
+  const server = http.createServer((req, res) => {
+    const ctx = store.start(req, { protocol: 'anthropic.messages', pathName: req.url })
+    ids[req.url] = ctx.request_id
+    store.tapResponse(ctx, res)
+    res.once('finish', () => store.finish(ctx, { status: res.statusCode }))
+    if (req.url === '/reason-obj') {
+      res.setHeader('x-should-retry', 'true')
+      res.setHeader('x-only-setheader', 'kept')
+      res.writeHead(410, 'Gone', {
+        'X-Should-Retry': 'false',
+        'X-Request-ID': ctx.request_id,
+        'Set-Cookie': 'panel=secret-cookie',
+      })
+      res.end('{"gone":true}')
+      return
+    }
+    if (req.url === '/flat-array') {
+      res.writeHead(409, [
+        'X-Should-Retry',
+        'false',
+        'X-Request-ID',
+        ctx.request_id,
+        'Authorization',
+        'Bearer sk-ant-oat01-ABCDEFGH12345678',
+      ])
+      res.end('{"conflict":true}')
+      return
+    }
+    res.writeHead(409, 'Conflict', [
+      ['X-Should-Retry', 'false'],
+      ['X-Custom', 'tuple-val'],
+    ])
+    res.end('{"tuple":true}')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const base = `http://127.0.0.1:${server.address().port}`
+  for (const route of ['/reason-obj', '/flat-array', '/tuple-array']) {
+    const resp = await fetch(`${base}${route}`)
+    await resp.text()
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const reasonObj = store.getDebug(ids['/reason-obj'])
+  assert.equal(reasonObj.response.status, 410)
+  assert.equal(reasonObj.response.headers['x-should-retry'], 'false')
+  assert.equal(reasonObj.response.headers['x-only-setheader'], 'kept')
+  assert.equal(reasonObj.response.headers['x-request-id'], ids['/reason-obj'])
+  assert.equal(reasonObj.response.headers['set-cookie'], '***REDACTED***')
+
+  const flatArr = store.getDebug(ids['/flat-array'])
+  assert.equal(flatArr.response.status, 409)
+  assert.equal(flatArr.response.headers['x-should-retry'], 'false')
+  assert.equal(flatArr.response.headers['x-request-id'], ids['/flat-array'])
+  assert.equal(flatArr.response.headers.authorization, '***REDACTED***')
+
+  const tupleArr = store.getDebug(ids['/tuple-array'])
+  assert.equal(tupleArr.response.status, 409)
+  assert.equal(tupleArr.response.headers['x-should-retry'], 'false')
+  assert.equal(tupleArr.response.headers['x-custom'], 'tuple-val')
+})
+
+test('normal mode persists sanitized #1705 / 410 error_details, upstream_type, and attempt correlation IDs (#1845)', (t) => {
+  const store = tmpStore('normal')
+  t.after(() => {
+    try {
+      store.db.close()
+    } catch {}
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const ctx409 = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const attempts = new RequestAttemptsRepo(store.db)
+  attempts.begin({
+    requestId: ctx409.request_id,
+    attemptNo: 1,
+    vmId: 'vm-11',
+    accountId: 'acc-11',
+    model: 'claude-sonnet-4-6',
+    selectionReason: 'sticky',
+  })
+  attempts.complete(ctx409.request_id, 1, {
+    upstreamStatus: 409,
+    errorScope: 'request',
+    errorCode: 'upstream_invalid_request',
+    upstreamType: 'partial_provider_output_nonretryable',
+    errorDetails: {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      interrupted_at: 1795495209,
+      retry_after_sec: 20,
+      recovery_attempts: 1,
+      max_recoveries: 2,
+      recovery_exhausted: false,
+      secret_prompt: 'must-drop',
+      nested: { nope: true },
+    },
+    action: 'stop',
+    terminalState: 'rejected',
+    hopRequestId: '11111111-2222-4333-8444-555555555555',
+    providerRunId: 'run_abc123',
+    providerTurnId: 'turn_def456',
+    providerAttemptId: 2,
+    providerRequestId: 'req_upstream_789',
+  })
+
+  const sum409 = store.finish(ctx409, {
+    status: 409,
+    upstream_status: 409,
+    model: 'claude-sonnet-4-6',
+    vm_id: 'vm-11',
+    account_id: 'acc-11',
+    error_code: 'upstream_invalid_request',
+    error_message: 'Provider output interrupted',
+    upstream_type: 'partial_provider_output_nonretryable',
+    error_details: {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      interrupted_at: 1795495209,
+      retry_after_sec: 20,
+      recovery_attempts: 1,
+      max_recoveries: 2,
+      recovery_exhausted: false,
+      internal_secret: 'sk-ant-oat01-ABCDEFGH12345678',
+      raw_body: { prompt: 'secret' },
+    },
+  })
+
+  const ctx410 = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctx410, {
+    status: 410,
+    upstream_status: 410,
+    model: 'claude-sonnet-4-6',
+    error_code: 'upstream_invalid_request',
+    upstream_type: 'invalid_request_error',
+    error_details: {
+      retryable: false,
+      reason: 'handoff_expired',
+      unallowlisted: 'drop-me',
+    },
+  })
+
+  assert.equal(sum409.upstream_type, 'partial_provider_output_nonretryable')
+  assert.deepEqual(sum409.error_details, {
+    upstream_type: 'partial_provider_output_nonretryable',
+    retryable: false,
+    prior_reason: 'client_cancelled',
+    interrupted_at: 1795495209,
+    retry_after_sec: 20,
+    recovery_attempts: 1,
+    max_recoveries: 2,
+    recovery_exhausted: false,
+  })
+  // Normal mode writes no debug log, yet error_details & attempt IDs persist across reopen.
+  assert.equal(store.listDebug({ limit: 5 }).length, 0)
+
+  const reopened = new RequestLogStore({ dataDir: store.dataDir, mode: 'normal' })
+  t.after(() => reopened.db.close())
+  const q = reopened.queryNormal({ q: 'partial_provider_output_nonretryable' })
+  assert.equal(q.total, 1)
+  assert.equal(q.items[0].upstream_type, 'partial_provider_output_nonretryable')
+  assert.equal(q.items[0].error_details.prior_reason, 'client_cancelled')
+  assert.equal(q.items[0].error_details.recovery_attempts, 1)
+  assert.equal(q.items[0].error_details.internal_secret, undefined)
+
+  const view = new UsageLogsView(reopened.db)
+  const batch = view.listBatch({ q: 'partial_provider_output_nonretryable' })
+  assert.equal(batch.logs.length, 1)
+  const row = batch.logs[0]
+  assert.equal(row.upstreamType, 'partial_provider_output_nonretryable')
+  assert.deepEqual(row.errorDetails, sum409.error_details)
+  assert.equal(row.providerChain.length, 1)
+  assert.equal(row.providerChain[0].errorCode, 'upstream_invalid_request')
+  assert.equal(row.providerChain[0].upstreamType, 'partial_provider_output_nonretryable')
+  assert.equal(row.providerChain[0].errorDetails.prior_reason, 'client_cancelled')
+  assert.equal(row.providerChain[0].errorDetails.secret_prompt, undefined)
+  assert.equal(row.providerChain[0].hopRequestId, '11111111-2222-4333-8444-555555555555')
+  assert.equal(row.providerChain[0].providerRunId, 'run_abc123')
+  assert.equal(row.providerChain[0].providerTurnId, 'turn_def456')
+  assert.equal(row.providerChain[0].providerAttemptId, 2)
+  assert.equal(row.providerChain[0].providerRequestId, 'req_upstream_789')
+
+  const row410 = view.listBatch({ request_id: ctx410.request_id }).logs[0]
+  assert.equal(row410.upstreamType, 'invalid_request_error')
+  assert.deepEqual(row410.errorDetails, {
+    upstream_type: 'invalid_request_error',
+    retryable: false,
+    reason: 'handoff_expired',
+  })
+
+  const exported = view.exportRows({ limit: 10 })
+  const csv = logsToCsv(exported.items)
+  assert.match(csv, /upstream_type,error_details/)
+  assert.match(csv, /partial_provider_output_nonretryable/)
+  assert.match(csv, /handoff_expired/)
+  assert.doesNotMatch(csv, /ABCDEFGH12345678/)
+  const jsonl = logsToJsonl(exported.items)
+  assert.match(jsonl, /"prior_reason":"client_cancelled"/)
+  assert.doesNotMatch(jsonl, /ABCDEFGH12345678/)
 })

@@ -22,9 +22,13 @@ VM2API_DB_SECRET='再一串'
 
 | 容器 | 说明 |
 |---|---|
-| `vm2api` | 控制面。Compose **只起这一个** |
+| `vm2api` | 控制面（`network_mode: host`） |
+| `vm2api-postgres` | PostgreSQL 18 主库（仅绑定 `127.0.0.1:5432`，全新安装默认启用；使用外部云库时可 `--no-deps` 跳过） |
+| `vm2api-redis` | Redis 8 L2 缓存（仅绑定 `127.0.0.1:6379`，可选，不可用时自动降级 L1） |
 | `kin-<槽>` | 每个**已启动**的槽 1 个 |
-| 没有 | 未启动的槽；同机其它项目的 postgres 等 |
+| 没有 | 未启动的槽；同机其它项目的独立数据库 |
+
+> **PostgreSQL 一键安装与存量 SQLite 无缝迁移**：支持使用 `curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install-pg.sh | sudo bash` 自动补装缺失的 Docker / `postgresql-client` / Node(`pg`,`ioredis`) 依赖并完成全新部署或存量无缝迁移；普通 `upgrade` 与面板更新均会自动保留未迁移的 `data/kin.db`（不会误启空 PG 或抢占已有 5432/6379 端口），详情见 [PostgreSQL 迁移指南](POSTGRES_MIGRATION.md)。
 
 不是一个父容器里多个子进程。
 
@@ -253,15 +257,23 @@ location / {
 }
 ```
 
-`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
+`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node；若自定义反代拆分了 API 路由而非统一 `location /`，还需将 `/v1beta/` 一并转发到网关，避免 Google Gemini SDK 请求落到静态页返回 405/HTML。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
 ## 本机 Node（备选）
 
-`npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+`npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm run build:scheduler`（需本机安装 Rust / Cargo 1.86+，等价于 `cd scheduler && cargo build --release --locked --bin kin-scheduler` 并安装到 `bin/kin-scheduler`，也可用 `KIN_SCHEDULER_BIN` 指定路径）；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+
+> **注意**：`kin-scheduler` 仅随 Docker 控制面镜像预编译，不随 `deploy/payload.json` 或 GitHub Release 附件分发。本机 Node / systemd 部署若缺少可执行 `bin/kin-scheduler`，控制面虽能启动（`/health` 返回 `200`），但所有推理数据面将按 fail-closed 统一返回 `503`（`scheduler_unavailable`）。
+
+## 不停服升级（蓝绿）
+
+普通升级要重启控制面，期间请求挂住、长流可能被砍。单机可以改用蓝绿：haproxy 在前，两个颜色轮流接班，切换约 1 秒、旧实例在后台跑完长流。见 [BLUEGREEN.md](BLUEGREEN.md)。
+
+切到蓝绿后，升级一律用 `deploy/bluegreen/bg-deploy.sh`：`install.sh` 只更新文件、不再 `compose up`；直接 `docker compose up -d` 起来的单容器会拒绝启动（`vm2api_bluegreen_install`）。
 
 ## 一键安装 / 更新
 
-`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译，只下载 `docker-compose.yml`、`.env.example`、`VERSION`、`CHANGELOG.md`、`deploy/install.sh`（ARM64 另加 `deploy/prepare-arm64.py`）。`--from-source` 在目标机按 `Dockerfile` 多阶段构建：编 `web/dist` 与 Go helper，按 `deploy/payload.json` 下载 payload。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
+`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译，只下载 `docker-compose.yml`、`.env.example`、`VERSION`、`CHANGELOG.md`、`deploy/install.sh`（ARM64 另加 `deploy/prepare-arm64.py`）。`--from-source` 在目标机按 `Dockerfile` 多阶段构建：编 `web/dist`、Go helper 与 Rust `kin-scheduler`，按 `deploy/payload.json` 下载 payload。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
 
 ### 两类安装错误
 

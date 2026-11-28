@@ -13,6 +13,7 @@ const EP_COLS = [
   'protocol',
   'risk_review_enabled',
   'body_policy',
+  'owner_user_id',
   'created_at',
   'updated_at',
 ]
@@ -43,7 +44,8 @@ function rowEp(row) {
     kind: row.kind || 'custom',
     protocol: row.protocol || 'anthropic',
     risk_review_enabled: !!row.risk_review_enabled,
-    body_policy: row.body_policy === 'caller' ? 'caller' : 'persona',
+    body_policy: row.body_policy === 'persona' ? 'persona' : 'caller',
+    owner_user_id: row.owner_user_id ? String(row.owner_user_id).trim() || null : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -139,7 +141,8 @@ export class ApiEndpointsRepo {
       kind: rec.kind || 'custom',
       protocol: rec.protocol || 'anthropic',
       risk_review_enabled: bool01(rec.risk_review_enabled),
-      body_policy: rec.body_policy === 'caller' ? 'caller' : 'persona',
+      body_policy: rec.body_policy === 'persona' ? 'persona' : 'caller',
+      owner_user_id: rec.owner_user_id ? String(rec.owner_user_id).trim() || null : null,
       created_at: rec.created_at,
       updated_at: rec.updated_at,
     }
@@ -205,6 +208,7 @@ export class ApiEndpointsRepo {
       rec.cooldown_until,
       rec.id,
     )
+    return rowKey(this._getKey.get(rec.id))
   }
 
   setKeyCooldown(id, untilIso) {

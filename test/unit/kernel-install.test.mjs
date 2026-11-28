@@ -1684,3 +1684,77 @@ test('a start failure without runtime detail still reports the generic phase', a
   assert.equal(result.items[0].error, '内核重启或健康检查失败')
   assert.equal(getVm(root, vm.id).kernel_operation.failure.reason, null)
 })
+
+test('CRAG install preflight rejects a non-amd64 slot with crag_v2_arch_mismatch before stopping', async (t) => {
+  const { root, vm } = fixture(t)
+  fs.rmSync(path.join(root, 'share/crag/kernels/v2/arm64'), { recursive: true, force: true })
+  if (!fs.existsSync(path.join(root, 'share/crag/kernels/v2/amd64/manifest.json'))) {
+    seedEncryptedPackage(root, { arch: 'amd64' })
+  }
+  const armVmFile = path.join(root, 'vms', `${vm.id}.json`)
+  const armRecord = { ...JSON.parse(fs.readFileSync(armVmFile, 'utf8')), runtime: { type: 'docker', arch: 'arm64' } }
+  fs.writeFileSync(armVmFile, JSON.stringify(armRecord))
+  const before = fs.readFileSync(armVmFile)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('crag'),
+    ops: {
+      describeKernelCatalog: undefined,
+      stopSlot() {
+        assert.fail('arch mismatch preflight must not stop the slot')
+      },
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'crag_v2_arch_mismatch')
+  assert.equal(result.items[0].stopped, false)
+  assert.deepEqual(fs.readFileSync(armVmFile), before)
+})
+
+test('reinstalling CRAG preserves native telemetry settings when telemetry_disabled is false or true', async (t) => {
+  const { root, vm, home } = fixture(t, {
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    seed_policy: { telemetry_disabled: false, claude_setting: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1' },
+  })
+  activateFixture(root, vm)
+  const settingsFile = path.join(home, '.claude', 'settings.json')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify({
+      env: {
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        DISABLE_TELEMETRY: '1',
+        CLAUDE_CODE_DISABLE_TELEMETRY: '1',
+        CUSTOM: 'keep-across-reinstall',
+      },
+    }),
+  )
+  const seenOpts = []
+  const life = lifecycle(root, {
+    initializeSlotSeedFiles(project, candidate, _host, opts) {
+      seenOpts.push(opts)
+      return initializeSlotSeedFiles(project, candidate, slotHost({ ...candidate, node_id: null }), opts)
+    },
+  })
+  const onResult = await installKernelTargets({ projectRoot: root, targets: target('crag'), ops: life.ops })
+  assert.equal(onResult.ok, true, JSON.stringify(onResult))
+  assert.equal(seenOpts[0]?.cragNativeTelemetry, true)
+  const onSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+  assert.equal(onSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  assert.equal(onSettings.env.DISABLE_TELEMETRY, undefined)
+  assert.equal(onSettings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+  assert.equal(onSettings.env.DO_NOT_TRACK, undefined)
+  assert.equal(onSettings.env.CUSTOM, 'keep-across-reinstall')
+
+  // When telemetry_disabled is true, reinstalling CRAG must write CLAUDE_CODE_DISABLE_TELEMETRY='1'.
+  const updated = getVm(root, vm.id)
+  updated.seed_policy = { ...updated.seed_policy, telemetry_disabled: true }
+  fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(updated))
+  const offResult = await installKernelTargets({ projectRoot: root, targets: target('crag'), ops: life.ops })
+  assert.equal(offResult.ok, true, JSON.stringify(offResult))
+  const offSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+  assert.equal(offSettings.env.DISABLE_TELEMETRY, '1')
+  assert.equal(offSettings.env.CLAUDE_CODE_DISABLE_TELEMETRY, '1')
+  assert.equal(offSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+})

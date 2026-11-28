@@ -5,8 +5,159 @@ import os from 'node:os'
 import path from 'node:path'
 import { handleCodexProtocol } from '../../src/lib/protocol/handle-codex.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
 beforeEach(() => resetOpenAIAccountRuntime())
+
+const rejectedToolSchema = {
+  ok: false,
+  status: 400,
+  committed: false,
+  body: {
+    error: {
+      code: 'invalid_json_schema',
+      message:
+        "Invalid schema for 'tools[0].parameters': Unsatisfiable schema: required property 'id' is unsatisfiable.",
+    },
+  },
+}
+
+const toolParameters = {
+  type: 'object',
+  properties: { id: { $ref: '#/$defs/id' } },
+  required: ['id'],
+  $defs: { id: { type: 'string' } },
+}
+
+test('Codex schema recovery retries the same session once with the full tool set', async (t) => {
+  const tools = [
+    { type: 'function', function: { name: 'nested', parameters: toolParameters } },
+    { type: 'function', name: 'flat', parameters: toolParameters },
+    { type: 'function', name: 'explicit', parameters: toolParameters, strict: true },
+    { type: 'web_search' },
+  ]
+  const seen = []
+  const fx = fixture(t, {
+    body: { tools },
+    hop: async ({ body, exec, envelope, onEvent }) => {
+      seen.push({ body, slot: exec.vmId, session: envelope.session.session_id })
+      assert.equal(envelope.body, body)
+      if (seen.length === 1) return rejectedToolSchema
+      await onEvent(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`)
+      return { ok: true, status: 200, body: response, usage: response.usage, terminalState: 'verified' }
+    },
+  })
+  fx.args.captureOutbound = true
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.equal(seen.length, 2)
+  assert.equal(seen[0].slot, seen[1].slot)
+  assert.equal(seen[0].session, seen[1].session)
+  assert.deepEqual(seen[0].body.tools, tools)
+  assert.deepEqual(seen[1].body, {
+    ...seen[0].body,
+    tools: [
+      { type: 'function', ...tools[0].function, strict: false },
+      { ...tools[1], strict: false },
+      tools[2],
+      tools[3],
+    ],
+  })
+  assert.equal(fx.args.logBag.attempt_count, 2)
+  assert.equal(fx.args.logBag.outbound_body, seen[1].body)
+  assert.equal(fx.args.logBag.codex_failed_over, undefined)
+})
+
+test('Codex schema recovery returns the upstream error after one compatibility attempt', async (t) => {
+  let hops = 0
+  const fx = fixture(t, {
+    body: { tools: [{ type: 'function', name: 'implicit', parameters: toolParameters }] },
+    hop: async () => {
+      hops += 1
+      return rejectedToolSchema
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(hops, 2)
+  assert.equal(fx.res.statusCode, 400)
+  assert.deepEqual(fx.res.body, rejectedToolSchema.body)
+})
+
+test('Codex failover counts the schema recovery attempt', async (t) => {
+  const slots = []
+  const fx = fixture(t, {
+    body: { tools: [{ type: 'function', name: 'implicit', parameters: toolParameters }] },
+    hop: async ({ body, exec }) => {
+      slots.push(exec.vmId)
+      if (slots.length === 1) return rejectedToolSchema
+      assert.equal(body.tools[0].strict, false)
+      if (slots.length === 2) {
+        return { ok: false, status: 503, body: { error: { code: 'no_capacity', message: 'credential busy' } } }
+      }
+      return { ok: true, status: 200, body: response }
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.equal(slots.length, 3)
+  assert.equal(slots[0], slots[1])
+  assert.notEqual(slots[1], slots[2])
+  assert.equal(fx.args.logBag.attempt_count, 3)
+})
+
+test('Codex Responses accepts a messages body while preserving explicit tool strictness', async (t) => {
+  const tools = [
+    { type: 'function', function: { name: 'implicit', parameters: toolParameters } },
+    { type: 'function', function: { name: 'strict', parameters: toolParameters, strict: true } },
+    { type: 'function', name: 'non_strict', parameters: toolParameters, strict: false },
+  ]
+  const sent = []
+  const fx = fixture(t, {
+    body: { input: undefined, messages: [{ role: 'user', content: 'hello' }], tools },
+    hop: async ({ body }) => {
+      sent.push(body)
+      return sent.length === 1 ? rejectedToolSchema : { ok: true, status: 200, body: response }
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.deepEqual(
+    sent.map((body) => body.tools.map((tool) => tool.strict)),
+    [
+      [undefined, true, false],
+      [false, true, false],
+    ],
+  )
+  assert.deepEqual(sent[1].input, sent[0].input)
+  assert.ok(sent[1].tools.every((tool) => tool.parameters === toolParameters))
+})
+
+for (const boundary of ['explicit strict', 'event', 'committed', 'attempt budget']) {
+  test(`Codex schema recovery skips retry with ${boundary}`, async (t) => {
+    let hops = 0
+    const fx = fixture(t, {
+      body: {
+        stream: true,
+        tools: [
+          {
+            type: 'function',
+            name: 'tool',
+            parameters: toolParameters,
+            ...(boundary === 'explicit strict' && { strict: true }),
+          },
+        ],
+      },
+      hop: async ({ onEvent }) => {
+        hops += 1
+        if (boundary === 'event') await onEvent('data: {"type":"response.created"}\n\n')
+        return { ...rejectedToolSchema, committed: boundary === 'committed' }
+      },
+    })
+    if (boundary === 'attempt budget') fx.args.routing.failover = { max_total_attempts: 1 }
+    await handleCodexProtocol(fx.args)
+    assert.equal(hops, 1)
+  })
+}
 
 const response = {
   id: 'resp_test',
@@ -51,6 +202,28 @@ function fixture(t, { body = {}, headers = {}, protocol = 'openai.responses', ho
     },
     end() {},
   }
+  let leaseSeq = 0
+  const slotIds = ['gpt-a', 'gpt-b']
+  const mockSchedulerRuntime = {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      const picked = slotIds.find((id) => !excluded.has(`codex_vm:${id}`) && !excluded.has(id))
+      if (!picked) {
+        throw new SchedulerApiError({ status: 503, code: 'pool_exhausted', message: 'No codex slot available' })
+      }
+      return {
+        lease_id: `codex-lease-${++leaseSeq}`,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_codex__',
+        selected_node: { node_type: 'codex_vm', node_id: picked, node_key: `codex_vm:${picked}` },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
   const args = {
     req: { headers, apiKeyKind: 'user' },
     res,
@@ -69,6 +242,7 @@ function fixture(t, { body = {}, headers = {}, protocol = 'openai.responses', ho
     },
     projectRoot: root,
     routing: {},
+    schedulerRuntime: mockSchedulerRuntime,
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),
@@ -271,3 +445,77 @@ for (const [name, cfg, routing, expected] of [
     assert.equal(fx.res.statusCode, 200)
   })
 }
+
+test('upstream_sent=unknown halts both same-account retry and cross-slot failover', async (t) => {
+  let hops = 0
+  const fx = fixture(t, {
+    body: { stream: false },
+    hop: async () => {
+      hops++
+      return {
+        ok: false,
+        status: 502,
+        committed: false,
+        transportError: true,
+        upstreamSent: 'unknown',
+        hopRequestId: 'kreq-unknown-1',
+        turnTiming: { transport: 'http', setup_ms: 3 },
+        body: { error: { type: 'api_error', code: 'upstream_transport', message: 'broken pipe' } },
+      }
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(hops, 1)
+  assert.equal(fx.args.logBag.attempt_count, 1)
+  assert.equal(fx.res.statusCode, 502)
+  assert.equal(fx.args.logBag.hop_meta?.codex_vm_timing?.attempts?.length, 1)
+  assert.equal(fx.args.logBag.hop_meta.codex_vm_timing.attempts[0].upstream_sent, 'unknown')
+})
+
+test('handleCodexProtocol forwards ws_replay, workerStatus, onInterruptReady, and records codex_vm_timing attempts', async (t) => {
+  let captured = null
+  const readyPayloads = []
+  const fx = fixture(t, {
+    body: { stream: true },
+    hop: async (args) => {
+      captured = args
+      args.onInterruptReady?.({
+        requestId: 'kreq-ws-1',
+        interruptMode: 'websocket',
+        interrupt: async () => ({ ok: true, accepted: true, status: 204 }),
+      })
+      await args.onEvent(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`)
+      return {
+        ok: true,
+        status: 200,
+        body: response,
+        usage: response.usage,
+        terminalState: 'verified',
+        hopRequestId: 'kreq-ws-1',
+        upstreamSent: '1',
+        turnTiming: { transport: 'websocket', setup_ms: 2, first_byte_ms: 9, first_text_ms: 12 },
+        udsPacked: { used: true, delta: true, retriedFull: false },
+        nodeTiming: {
+          firstGeneratedEventType: 'response.completed',
+          firstReleaseType: 'response.completed',
+          clientFirstWriteSourceType: 'response.completed',
+        },
+      }
+    },
+  })
+  fx.args.ops.ensureCodexKernel = async () => ({ ok: true, health: { ok: true, uds_packed_v1: true } })
+  fx.args.req._responsesWsReplay = { previous_response_id: 'resp_prev_9' }
+  fx.args.req._onCodexInterruptReady = (info) => readyPayloads.push(info)
+
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.deepEqual(captured?.exec?.workerStatus, { ok: true, uds_packed_v1: true })
+  assert.deepEqual(captured?.envelope?.options?.ws_replay, { previous_response_id: 'resp_prev_9' })
+  assert.equal(readyPayloads.length, 1)
+  assert.equal(readyPayloads[0].interruptMode, 'websocket')
+  const attempt = fx.args.logBag.hop_meta?.codex_vm_timing?.attempts?.[0]
+  assert.equal(attempt?.kernel_request_id, 'kreq-ws-1')
+  assert.equal(attempt?.upstream?.first_text_ms, 12)
+  assert.deepEqual(attempt?.uds_packed, { used: true, delta: true, retriedFull: false })
+  assert.equal(attempt?.node?.first_generated_event_type, 'response.completed')
+})

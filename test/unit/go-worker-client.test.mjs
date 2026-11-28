@@ -7,7 +7,9 @@ import path from 'node:path'
 import {
   callGoWorker,
   finalizeWorkerPayload,
+  prepareWorkerPayload,
   streamGoWorker,
+  workerEnvelope,
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
@@ -24,6 +26,7 @@ import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-clie
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
@@ -235,7 +238,15 @@ test('worker canonicalizes passthrough bodies before either kernel', () => {
       cragPrint,
     })
     assert.equal(out.body.settings, undefined)
-    assert.deepEqual(out.body.output_config?.format, { type: 'json_schema', schema: { type: 'object' } })
+    // Only the CRAG boundary rectifier closes object schemas (a schema without
+    // `additionalProperties: false` is rejected upstream with a 400); the cli-node
+    // path keeps the converted schema as is.
+    assert.deepEqual(
+      out.body.output_config?.format,
+      cragPrint
+        ? { type: 'json_schema', schema: { type: 'object', additionalProperties: false } }
+        : { type: 'json_schema', schema: { type: 'object' } },
+    )
     assert.deepEqual(out.body.messages[0].content, [{ type: 'text', text: 'hello' }])
     assert.deepEqual(out.body.crag_prompt, cragPrint ? body.crag_prompt : undefined)
   }
@@ -2063,17 +2074,19 @@ unixTest('redaction 413 stops failover before any worker dispatch for call and s
         ? { input: 'fixture' }
         : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
     let selections = 0
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          selections++
-          assert.equal(selections, 1, 'a local size error must not select another account')
-          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
-        },
-        markCooldown() {
-          assert.fail('a local size error must not cool down an account')
-        },
+    const scheduler = {
+      async selectAndReserve() {
+        selections++
+        assert.equal(selections, 1, 'a local size error must not select another account')
+        return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
       },
+      markCooldown() {
+        assert.fail('a local size error must not cool down an account')
+      },
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     })
     const result = await runner.run({
       requestId: `redaction-size-${call.name}`,
@@ -2220,6 +2233,55 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
   }
 })
 
+test('workerEnvelope falls back to body.crag_options.cache_ttl before routing default', async () => {
+  const exec = {
+    vmId: 'vm-crag',
+    vm: { id: 'vm-crag', dataplane: 'crag', crag_kernel_version: 'v2' },
+    workerStatus: {
+      runtime_variant: 'crag-v2',
+      capabilities: ['generation_controls_v3', 'linux_tui_native_queue'],
+    },
+  }
+  const routing = { compatibility: { cache_ttl: '1h' } }
+  const baseBody = {
+    model: 'claude-opus-4-6',
+    max_tokens: 128,
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+
+  const fromOptions = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: { ...baseBody, crag_options: { cache_ttl: '5m' } },
+  })
+  assert.equal(fromOptions.envelope.cache_ttl, '5m')
+  assert.equal(fromOptions.envelope.body.cache_ttl, undefined)
+  assert.equal(fromOptions.envelope.body.crag_options?.cache_ttl, '5m')
+
+  const fromBody = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: { ...baseBody, cache_ttl: '5m', crag_options: { cache_ttl: '1h' } },
+  })
+  assert.equal(fromBody.envelope.cache_ttl, '5m')
+
+  const fromRouting = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: baseBody,
+  })
+  assert.equal(fromRouting.envelope.cache_ttl, '1h')
+})
+
 unixTest('streamGoWorker preserves refusal details when an empty response becomes an error', async () => {
   const details = {
     type: 'refusal',
@@ -2257,4 +2319,333 @@ unixTest('streamGoWorker preserves refusal details when an empty response become
   } finally {
     await fx.close()
   }
+})
+
+unixTest('streamGoWorker and callGoWorker do not post cancel after terminal message delivery', async () => {
+  const cancels = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (req.url === '/internal/v1/cancel') {
+      cancels.push(payload.request_id)
+      res.setHeader('content-type', 'application/json')
+      res.end('{"ok":true,"cancelled":true}')
+      return
+    }
+    if (payload.stream === false) {
+      res.setHeader('content-type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'msg_json_tool',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-5',
+          content: [{ type: 'tool_use', id: 'toolu_json', name: 'lookup', input: { k: 'v' } }],
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 3 },
+        }),
+      )
+      return
+    }
+    res.setHeader('content-type', 'text/event-stream')
+    if (payload.gateway_policy?.native_handoff_v1) {
+      res.write(
+        `event: kin_provider_result\ndata: ${JSON.stringify({
+          type: 'kin_provider_result',
+          schema_version: 2,
+          run_id: 'run-1',
+          turn_id: 1,
+          attempt_id: 1,
+          message_id: 'msg_native_tool',
+          model: 'claude-sonnet-5',
+          http_status: 200,
+          provider_complete: true,
+          usage_complete: true,
+          handoff_complete: true,
+          response_valid: true,
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 3 },
+        })}\n\n`,
+      )
+      writeData(res, {
+        type: 'message_start',
+        message: { id: 'msg_native_tool', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [] },
+      })
+      writeData(res, {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_native', name: 'lookup', input: {} },
+      })
+      writeData(res, {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"k":"v"}' },
+      })
+      writeData(res, { type: 'content_block_stop', index: 0 })
+      writeData(res, {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use', stop_sequence: null },
+        usage: { output_tokens: 3 },
+      })
+      writeData(res, { type: 'message_stop' })
+      res.end()
+      return
+    }
+    writeData(res, {
+      type: 'message_start',
+      message: { id: 'msg_sse_tool', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [] },
+    })
+    writeData(res, {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_sse', name: 'lookup', input: {} },
+    })
+    writeData(res, {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{"k":"v"}' },
+    })
+    writeData(res, { type: 'content_block_stop', index: 0 })
+    writeData(res, {
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use', stop_sequence: null },
+      usage: { output_tokens: 3 },
+    })
+    writeData(res, { type: 'message_stop' })
+    res.end()
+  })
+  try {
+    for (const nativeHandoff of [false, true]) {
+      const controller = new AbortController()
+      const exec = nativeHandoff
+        ? {
+            ...fx.exec,
+            vm: {
+              ...fx.exec.vm,
+              runtime: {
+                ...fx.exec.vm?.runtime,
+                capabilities: ['native_handoff_v1', 'provider_result_v2'],
+              },
+            },
+          }
+        : fx.exec
+      const result = await streamGoWorker({
+        exec,
+        managedCrag: nativeHandoff,
+        body: { model: 'claude-sonnet-5', stream: true, messages: [{ role: 'user', content: 'use lookup' }] },
+        signal: controller.signal,
+        onEvent: (line) => {
+          if (String(line).includes('"message_stop"')) controller.abort()
+        },
+      })
+      assert.equal(result.ok, true)
+      assert.equal(result.body.stop_reason, 'tool_use')
+    }
+    const jsonController = new AbortController()
+    const jsonResult = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-sonnet-5', stream: false, messages: [{ role: 'user', content: 'use lookup' }] },
+      signal: jsonController.signal,
+    })
+    jsonController.abort()
+    assert.equal(jsonResult.ok, true)
+    assert.equal(jsonResult.body.stop_reason, 'tool_use')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.deepEqual(cancels, [])
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest(
+  'callGoWorker and streamGoWorker return per-hop hopRequestId and pass gatewayRequestId only as internal header (#1845)',
+  async (t) => {
+    const seen = []
+    const fx = await fixture(async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const envelope = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      seen.push({
+        gatewayHeader: req.headers['x-gateway-request-id'] || null,
+        requestId: envelope.request_id,
+        envelopeHeaders: envelope.headers || null,
+        bodyKeys: Object.keys(envelope.body || {}),
+      })
+      if (seen.length === 3) {
+        res.writeHead(409, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'partial_provider_output_nonretryable',
+              message: 'interrupted',
+              details: { prior_reason: 'client_cancelled', retry_after_sec: 20 },
+            },
+          }),
+        )
+        return
+      }
+      if (envelope.stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        writeData(res, {
+          type: 'message_start',
+          message: { id: 'msg_hop', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [] },
+        })
+        writeData(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+        writeData(res, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } })
+        writeData(res, { type: 'content_block_stop', index: 0 })
+        writeData(res, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } })
+        writeData(res, { type: 'message_stop' })
+        res.end()
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+      res.end(
+        JSON.stringify({
+          type: 'message',
+          id: 'msg_hop_json',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+      )
+    })
+    t.after(() => fx.close())
+
+    const gatewayRequestId = 'gw-req-1845-test'
+    const r1 = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      gatewayRequestId,
+    })
+    const r2 = await streamGoWorker({
+      exec: fx.exec,
+      envelope: {
+        body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+        headers: { 'x-gateway-request-id': 'forged-in-envelope', 'x-app': 'cli' },
+        stream: true,
+      },
+      gatewayRequestId,
+    })
+    const r3 = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      gatewayRequestId,
+    })
+
+    assert.equal(r1.ok, true)
+    assert.equal(r2.ok, true)
+    assert.equal(r3.ok, false)
+    assert.equal(r3.status, 409)
+    assert.equal(seen.length, 3)
+
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    for (const [idx, res] of [r1, r2, r3].entries()) {
+      assert.match(res.hopRequestId, uuidRe)
+      assert.equal(res.hopRequestId, seen[idx].requestId)
+      assert.equal(seen[idx].gatewayHeader, gatewayRequestId)
+      assert.equal(seen[idx].bodyKeys.includes('gateway_request_id'), false)
+      assert.equal(seen[idx].envelopeHeaders?.['x-gateway-request-id'], undefined)
+    }
+    assert.equal(new Set([r1.hopRequestId, r2.hopRequestId, r3.hopRequestId]).size, 3)
+  },
+)
+
+test('V4: CRAG V4 happy-path and repaired retries never forward spoofed caller headers unless verified officialTraffic', async () => {
+  const exec = {
+    vmId: 'vm-v4',
+    homeDir: '/tmp/vm-v4-nonexistent',
+    vm: { id: 'vm-v4', dataplane: 'crag', crag_kernel_version: 'v2', claude: {} },
+    workerStatus: {
+      runtime_variant: 'crag-v2',
+      capabilities: ['generation_controls_v3', 'headless_claude_bridge_v1', 'native_handoff_v1'],
+    },
+  }
+  const spoofedHeaders = {
+    'user-agent': 'claude-cli/9.9.9 (external, local-agent)',
+    'x-app': 'cli-bg',
+    'x-client-request-id': 'spoof-req-1',
+    'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+    'x-claude-code-request-class': 'subagent',
+    'anthropic-beta': 'structured-outputs-2025-11-13,evil-beta-2026',
+  }
+  const baseBody = {
+    model: 'claude-sonnet-5-5',
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+
+  // 1. Happy path (nativeOwnsHeaders === true) with officialTraffic=false -> envelope.headers is omitted completely
+  const happySpoof = await workerEnvelope({
+    body: baseBody,
+    reqHeaders: spoofedHeaders,
+    exec,
+    routing: {},
+    stream: true,
+    cliHop: true,
+    cragPrint: true,
+    officialTraffic: false,
+    officialPassthrough: false,
+  })
+  assert.equal(happySpoof.envelope.headers, undefined)
+
+  // 2. Happy path when officialTraffic omitted -> fails closed (envelope.headers is undefined)
+  const happyDefault = await workerEnvelope({
+    body: baseBody,
+    reqHeaders: spoofedHeaders,
+    exec,
+    routing: {},
+    stream: true,
+    cliHop: true,
+    cragPrint: true,
+  })
+  assert.equal(happyDefault.envelope.headers, undefined)
+
+  // 3. Repaired retry (nativeOwnsHeaders === false) with officialTraffic=false -> never leaks spoofed UA/x-app/x-claude-code-*/beta
+  const repairedSpoof = prepareWorkerPayload({
+    body: baseBody,
+    reqHeaders: spoofedHeaders,
+    exec,
+    routing: {},
+    cliHop: true,
+    cragPrint: true,
+    repaired: true,
+    officialTraffic: false,
+    officialPassthrough: false,
+  })
+  assert.notEqual(repairedSpoof.headers['user-agent'], spoofedHeaders['user-agent'])
+  assert.notEqual(repairedSpoof.headers['x-app'], 'cli-bg')
+  assert.equal(repairedSpoof.headers['x-client-request-id'], undefined)
+  assert.equal(repairedSpoof.headers['x-claude-code-session-id'], undefined)
+  assert.equal(repairedSpoof.headers['x-claude-code-request-class'], undefined)
+  assert.doesNotMatch(String(repairedSpoof.headers['anthropic-beta'] || ''), /structured-outputs-2025-11-13|evil-beta/)
+
+  // 4. Verified officialTraffic=true -> forwards allowlisted caller trace headers cleanly through workerEnvelope
+  const verifiedOfficial = await workerEnvelope({
+    body: baseBody,
+    reqHeaders: {
+      'user-agent': 'claude-cli/2.1.321 (external, cli-bg)',
+      'x-app': 'cli-bg',
+      'x-client-request-id': 'creq-ok',
+      'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+      authorization: 'Bearer secret',
+    },
+    exec,
+    routing: {},
+    stream: true,
+    cliHop: true,
+    cragPrint: true,
+    officialTraffic: true,
+    officialPassthrough: true,
+  })
+  assert.deepEqual(verifiedOfficial.envelope.headers, {
+    'user-agent': 'claude-cli/2.1.321 (external, cli-bg)',
+    'x-app': 'cli-bg',
+    'x-client-request-id': 'creq-ok',
+    'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+  })
 })

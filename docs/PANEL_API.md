@@ -105,14 +105,15 @@
 | POST | `/vms/:id/schedulable` | 操作员开关 `{ schedulable }`，不改容器。`false` = 调度关；`true` = 调度开，同时清除不可调度。凭证已失效或吊销时开启返回 409 `credential_unavailable`（先重新导入凭证） |
 | POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标；GPT 槽同时清除可恢复的 `codex.extra.codex_limited_until`，再重算调度，重新入池 |
 | POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master 可钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
-| GET/PUT/DELETE | `/vms/:id/test-schedule` | 每 VM 一条真实对话定时计划，回 `{ schedule }`。PUT 保存结构化调度 `{ enabled?, frequency, minute?, time?, weekdays?, timezone, model, prompt, max_tokens?, reasoning_effort? }`（`frequency`=`hourly`/`daily`/`weekly`；服务端内部编译五字段 cron，响应不回 `cron` 字符串）。`enabled` 缺省 `false`；Claude 用 `max_tokens`，Codex 用 `reasoning_effort`。GET/PUT 含最近结果、下次运行时间与运行状态；到点 `runVmTestChat` 并计用量；重启恢复计划但不补跑停机错过；删 VM 时清计划。租户可读写自己槽的计划 |
-| GET/PUT | `/test-schedule/default` | 全局默认调度模板（仅调度时间结构）。GET 所有已登录角色可读；**PUT 仅 admin/master**（body `{ schedule: { frequency, … } }`，`schedule: null` 清除） |
-| POST | `/test-schedule/sync` | 覆盖写调度时间：`{ scope: "all" \| "ids", vm_ids?, schedule }`。MVP **只**同步 `frequency`/时刻/星期/分钟/`timezone`，**不同步** prompt、模型、token·effort、`enabled`。无计划槽创建且 `enabled=false`（模型/Prompt 取该槽已有计划或 test-chat 默认 `hello` + 首个可测模型）。租户 `scope=all` 仅自己的槽；逐槽权限同 test-schedule |
+| GET/PUT/DELETE | `/vms/:id/test-schedule` | 每 VM 一条真实对话定时计划，回 `{ schedule }`。PUT 保存结构化调度 `{ enabled?, mode?, auto_renew?, frequency, minute?, time?, weekdays?, timezone, model, prompt, max_tokens?, reasoning_effort? }`（`frequency`=`hourly`/`daily`/`weekly`；`mode`=`test`/`preheat`，`auto_renew` 仅 `preheat` 可为 `true`；服务端内部编译五字段 cron，响应不回 `cron` 字符串）。`enabled` 缺省 `false`；Claude 用 `max_tokens`，Codex 用 `reasoning_effort`。GET/PUT 含最近结果、下次运行时间与运行状态；到点 `runVmTestChat` 并计用量；重启恢复计划但不补跑停机错过；删 VM 时清计划。租户可读写自己槽的计划 |
+| GET/PUT | `/test-schedule/default` | 全局默认调度模板（时间结构 + 可选 `mode`/`auto_renew`）。GET 所有已登录角色可读；**PUT 仅 admin/master**（body `{ schedule: { frequency, …, mode?, auto_renew? } }`，非法组合与单槽 PUT 一样 400；`schedule: null` 清除） |
+| POST | `/test-schedule/sync` | 覆盖写调度：`{ scope: "all" \| "ids", vm_ids?, schedule, test? }`。**`scope=ids`**：同步 `schedule` 中的时间结构与显式提供的 `mode`/`auto_renew`（未提供则保留槽内原值），**不同步** prompt、模型、token·effort、`enabled`。**`scope=all`** 且带 `test`：另同步 `enabled`、模型/Prompt/token·effort（同类槽）及显式 `test.mode`/`test.auto_renew`；异类槽（Claude↔Codex）仍保留本槽模型与 Prompt，但同步开关、时间与 `mode`/`auto_renew`。无计划槽创建且 `enabled=false`（模型/Prompt 取该槽已有计划或 test-chat 默认）。租户 `scope=all` 仅自己的槽；逐槽权限同 test-schedule |
+| POST | `/vms/:id/count-tokens` | Setup Token / Console API Key 经槽 Go worker SOCKS 打官方 `POST /v1/messages/count_tokens`。body `{ model, messages, system?, tools? }`。完整 OAuth 400 `count_tokens_unsupported`。成功 `{ input_tokens, model, credential_mode, vm_id }`。受 `routing.compatibility.count_tokens` 控制，**默认关时返回 404 `not_found`**（与公开入口同一个开关） |
 | POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
 | POST | `/vms/:id/oauth/generate-auth-url` | CAI / Setup Token PKCE 授权链接；要求绑定可用出口。`claude_code` 返回 409 `native_login_required`，请使用专用终端 |
 | POST | `/vms/:id/oauth/exchange-code` | CAI / Setup Token 提交会话 ID 和授权码；导入并同步后才返回成功。Claude Code 的回调由专用终端处理 |
-| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token。远程槽保留节点已轮换凭证并修复客户端链接 |
+| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token，并排除凭证内邮箱字段。远程槽保留节点已轮换凭证、剔除遗留邮箱并修复客户端链接 |
 | GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
@@ -206,6 +207,10 @@
 记录字段：`schedule_off`、`unschedulable{reason,detail,at}`、`schedule_hold{reason,detail,at}`（系统暂停：`maintenance` / `proxy_cooldown`，由写入方自己解除）。`schedulable` / `schedule_disabled_reason` / `schedule_manual` 每次写入时派生，保留给旧读者与回滚。升级后首次启动把旧记录迁到新字段，原文件备份到 `backups/schedule-migration-<ts>/`；上线前可用 `node scripts/replay-schedule-state.mjs --project <dir>` 预览迁移结果。设置 `routing.pool.manual_schedule_wins` 已移除（调度关不会被任何自动路径打开）。
 
 ### 平台独立的槽位限额
+
+Claude 的 `PATCH /api/panel/vms/:id` 接受 `max_primary_sessions` (1-20) 和 `max_subagents_per_session` (0-20). 每项单独传 `null` 恢复继承, 非法值返回 400 `invalid_scheduling_value`. 全局默认由 `PUT /api/panel/routing` 的 `pool` 对象设置. 两项均默认 `null`, 前者跟随本 VM 物理席位上限, 后者关闭家族模式. 列表和详情返回两项生效值、对应的 `_override` 标记及 `scheduling_inherited` 中的继承值.
+
+家族模式下, `seats_used` 统计本 VM 占用的根席位, `seats_max` 为生效的主会话上限 n. 每个 `seat_sessions` 成员及 SSE 对应的 `sessions` 成员另带 `subagents_running` (含已放行请求), `subagents_queued` 和 `subagents_max`. 根迁移后, 当前根席位保留到整个家族的在跑和排队请求结束, 旧 VM 在本地最后一份预约结束时交还席位. 热更新的 n 和 m 用于新进调度的请求. 所有执行预约 (含旧票和免席位探测) 在放行时按 VM 当时的家族模式检查物理位. 关闭模式的快照显示最近观察到的物理容量.
 
 `max_concurrency` / `max_rpm` 传数字钉住本槽，传 `null` 清除覆盖并立即使用本平台全局值。Claude 跟随 `tiers`；OpenAI 跟随 `codex.quota`，不受 Claude 分档保存影响。
 
@@ -357,7 +362,7 @@ H1 删除已绑定槽时，控制面保留最小私有回收记录，只有严�
 | `websocket.enabled` | `true` | 全局推理 WS 总闸，不影响面板终端或集群连接 |
 | `codex.websocket.enabled` | `true` | GPT 推理 WS 子闸；必须与总闸同时开启 |
 | `codex.upstream_transport` | `prefer_websocket` | `prefer_websocket` 或 `http`；入站与上游传输不是同一段连接 |
-| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息；originator/version 由内核按该画像生成，调用方不能覆盖 |
+| `codex.user_agent` | `codex_cli_rs/0.170.0 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息；originator/version 由内核按该画像生成，调用方不能覆盖 |
 | `codex.catalog_client_version` | `auto` | 模型目录同步的客户端版本，与推理 UA 分开 |
 | `codex.client_features.enabled` | `false` | 显式开启后上送槽位独立安装 UUID 与官方 `client_metadata`；不使用 VM/硬件指纹 |
 | `codex.analytics.enabled` | `false` | 显式开启后独立上报运行环境 Analytics，不是推理成功的前提 |
@@ -385,9 +390,7 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 
 `failover.max_accounts_per_request`（正整数，默认 `0` 不限制）：单请求实际执行过的不同账号数达到上限后，不再向新账号发起推理；没执行的准入失败不计入。无配额、模型或重试时间证据的上游 429 不直接冷却账号或 Fable；同一请求在两个账号收到此类 429 时保留上游错误并停止调度。
 
-`compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
-
-`compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
+`compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`，缺省 `official_full`）是 Claude 系统提示词的唯一权威配置（SSOT），统一作用于 `cli-node`、CRAG V4 及直连路径，并按 `prompt_spec` v1 IR 编译投递给各内核。旧键 `compatibility.crag_persona_preset` 已废弃（仅保留读写兼容，保存 `persona_preset` 时自动清理旧键漂移）。`official`（官方提示词）默认仅注入计费头与官方身份句（核心提示词 `harness`、行为指引 `guidance`、环境注入 `env` 均默认关闭并可独立开关）；`official_full`（完整官方提示词）保持完整官方逻辑；`zero`（0注入）将官方身份句写入计费头 `prompt_version`、剔除 `system[]` 中的官方身份句并原样保留调用方业务 `system`。保存 `persona_preset` 和 `cache_ttl`（`5m` / `1h`）后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
 `compatibility.crag_fold_history_system`（缺省开，写 `false` 关闭）：CRAG print 前把历史里的 `role: "system"` 消息改成 `<system-reminder>` 文本，并入前一条 user 消息（前一条是 assistant 时并入下一条 user，放在 tool_result 之后）；带图片等非文本内容的、找不到 user 可并的保持原样。Claude Code 几乎每轮都追加一条这类消息，不折叠时 CRAG `--resume` 重放出的请求每轮只命中 tools + system，整段对话按 1h 重写。
 

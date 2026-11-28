@@ -131,7 +131,7 @@ function parseProviderResult(raw) {
     usage: value.usage ?? null,
     usage_complete: value.usage_complete,
   }
-  for (const key of ['stop_details', 'error', 'http_status', 'request_id']) {
+  for (const key of ['stop_details', 'error', 'http_status', 'request_id', 'run_id', 'turn_id', 'attempt_id']) {
     if (Object.hasOwn(value, key)) result[key] = value[key]
   }
   return result
@@ -163,8 +163,24 @@ function mergeProviderResult(previous, next) {
   return merged
 }
 
+function mergeAuthoritativeUsage(observed, authoritative) {
+  if (!authoritative || typeof authoritative !== 'object') return observed || null
+  if (!observed || typeof observed !== 'object') return authoritative
+  const hasCacheBreakdown =
+    authoritative.cache_creation == null && observed.cache_creation && typeof observed.cache_creation === 'object'
+  const hasIterations =
+    (!Array.isArray(authoritative.iterations) || authoritative.iterations.length === 0) &&
+    Array.isArray(observed.iterations) &&
+    observed.iterations.length > 0
+  if (!hasCacheBreakdown && !hasIterations) return authoritative
+  const out = { ...authoritative }
+  if (hasCacheBreakdown) out.cache_creation = { ...observed.cache_creation }
+  if (hasIterations) out.iterations = observed.iterations
+  return out
+}
+
 /** One response's authenticated observations only; never a continuation/history ledger. */
-export function createNativeHandoffState({ nativeHandoff = true } = {}) {
+export function createNativeHandoffState({ nativeHandoff = true, strictPassthrough = false } = {}) {
   let providerResult = null
   let failure = null
   let observedUsage = null
@@ -205,8 +221,14 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
     },
     get errorBody() {
       // V1 metadata already contains the public provider error and outranks
-      // later CLI diagnostics. V2 observations remain private to the gateway.
-      if (!failure && nativeHandoff && providerResult?.schema_version !== 2 && providerResult?.error)
+      // later CLI diagnostics. Under strictPassthrough, V2 providerResult.error
+      // is also exposed verbatim instead of being masked as native_handoff_incomplete.
+      if (
+        !failure &&
+        nativeHandoff &&
+        (providerResult?.schema_version !== 2 || strictPassthrough) &&
+        providerResult?.error
+      )
         return {
           type: 'error',
           error: providerResult.error,
@@ -239,7 +261,9 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
       return {
         nativeHandoff: true,
         providerResult: validated,
-        usage: validated?.usage_complete ? validated.usage : mergeUsage(observedUsage, validated?.usage),
+        usage: validated?.usage_complete
+          ? mergeAuthoritativeUsage(observedUsage, validated.usage)
+          : mergeUsage(observedUsage, validated?.usage),
         model: validated?.model ?? observedModel,
         stopReason: validated?.stop_reason ?? observedStop,
       }
@@ -341,8 +365,12 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
       ) {
         throw protocolError('native_handoff_incomplete', 'Native provider response ended before its message terminal')
       }
+      const keepCommittedMaxTokensTools =
+        committed && stream && providerResult.stop_reason === 'max_tokens' && body.content.some(toolBlock)
       const content =
-        providerResult.stop_reason === 'tool_use' ? body.content : body.content.filter((block) => !toolBlock(block))
+        providerResult.stop_reason === 'tool_use' || keepCommittedMaxTokensTools
+          ? body.content
+          : body.content.filter((block) => !toolBlock(block))
       if (providerResult.stop_reason === 'tool_use' && !content.some(toolBlock)) {
         throw protocolError('native_handoff_conflict', 'Native tool_use stop has no complete tool batch')
       }
@@ -366,7 +394,13 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
       ) {
         throw protocolError('native_handoff_invalid', 'Native tool batch has invalid identity or arguments')
       }
-      if (committed && providerResult.stop_reason !== 'tool_use' && stream && body.content.some(toolBlock)) {
+      if (
+        committed &&
+        providerResult.stop_reason !== 'tool_use' &&
+        providerResult.stop_reason !== 'max_tokens' &&
+        stream &&
+        body.content.some(toolBlock)
+      ) {
         return {
           type: 'error',
           error: {
@@ -382,7 +416,7 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
         model: providerResult.model,
         stop_reason: providerResult.stop_reason,
         stop_sequence: providerResult.stop_sequence,
-        usage: providerResult.usage,
+        usage: mergeAuthoritativeUsage(observedUsage, providerResult.usage),
         ...(Object.hasOwn(providerResult, 'stop_details') ? { stop_details: providerResult.stop_details } : {}),
       }
     },
@@ -431,7 +465,7 @@ export async function consumeNativeHandoffStream(
   const commit = async () => {
     if (committed) return
     committed = true
-    onCommit?.()
+    onCommit?.({ ...response.headers, ...headers })
     for (const event of publicPending) await dispatch(event)
     publicPending.length = 0
   }
@@ -609,6 +643,12 @@ export async function consumeNativeHandoffStream(
       }
       if (!pending.some((event) => event.type === 'message_delta')) {
         throw protocolError('native_handoff_incomplete', 'Native stream has no terminal message_delta')
+      }
+      if (committed && state.providerResult.stop_reason === 'max_tokens' && openBlocks.size) {
+        for (const index of [...openBlocks].sort((a, b) => a - b)) {
+          await emit({ type: 'content_block_stop', index })
+        }
+        openBlocks.clear()
       }
       for (const event of pending) {
         if (Number.isInteger(event.index) && tools.has(event.index) && state.providerResult.stop_reason !== 'tool_use')

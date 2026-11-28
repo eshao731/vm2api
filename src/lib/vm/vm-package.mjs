@@ -25,7 +25,9 @@ import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
 import { VM_ORIGIN, canBindProxyToVm, normalizeOwnerId } from '../admin/resource-owner.mjs'
 import { readCodexAccounts, writeCodexAccounts } from './codex-slot.mjs'
 import { hasBoundExit, isLocalEgressProxy } from './egress.mjs'
-import { OS_CATALOG, STANDARD_LOCALE, nextNumericIndex, padVm, parseVmIndex } from './vm-runtime.mjs'
+import { isCragDebian13Kernel } from './custom-os-runtime.mjs'
+import { normalizeOsKernel } from './os-catalog.mjs'
+import { STANDARD_LOCALE, nextNumericIndex, padVm, parseVmIndex } from './vm-runtime.mjs'
 import { parseSocks5Fields } from './proxy-pool.mjs'
 import { seedFreshCliHome } from './vm-recreate.mjs'
 import { atomicWriteJson, isValidVmId } from './vm-file.mjs'
@@ -106,6 +108,22 @@ function policyFromVm(vm, codex) {
     out.sessionSlots = policy.sessionSlots
     out.sessionSlotsOverride = policy.sessionSlotsOverride === true
   }
+  if (!codex) {
+    if (policy.maxPrimarySessionsOverride === true && integer(policy.maxPrimarySessions, 1, SESSION_SLOT_MAX)) {
+      out.maxPrimarySessions = policy.maxPrimarySessions
+      out.maxPrimarySessionsOverride = true
+    } else {
+      out.maxPrimarySessions = null
+      out.maxPrimarySessionsOverride = false
+    }
+    if (policy.maxSubagentsPerSessionOverride === true && integer(policy.maxSubagentsPerSession, 0, SESSION_SLOT_MAX)) {
+      out.maxSubagentsPerSession = policy.maxSubagentsPerSession
+      out.maxSubagentsPerSessionOverride = true
+    } else {
+      out.maxSubagentsPerSession = null
+      out.maxSubagentsPerSessionOverride = false
+    }
+  }
   if (policy.priority != null) out.priority = policy.priority
   if (policy.quota && typeof policy.quota === 'object') out.quota = policy.quota
   if (Array.isArray(policy.allowed_models)) out.allowed_models = policy.allowed_models
@@ -167,7 +185,7 @@ export function buildVmPackage({
       name: vm.name || vm.id,
       platform: kind.platform,
       family: kind.family,
-      kernel: OS_CATALOG[vm.kernel] ? vm.kernel : DEFAULT_KERNEL,
+      kernel: normalizeOsKernel(vm.kernel) || DEFAULT_KERNEL,
       timezone: vm.timezone || null,
       timezone_source: vm.timezone_source || 'auto',
       locale: vm.locale || STANDARD_LOCALE,
@@ -235,6 +253,28 @@ function parsePolicy(raw, codex) {
     } else {
       value.sessionSlots = raw.sessionSlots
       value.sessionSlotsOverride = raw.sessionSlotsOverride !== false
+    }
+  }
+  if (!codex && has(raw, 'maxPrimarySessions')) {
+    if (raw.maxPrimarySessions == null) {
+      value.maxPrimarySessions = null
+      value.maxPrimarySessionsOverride = false
+    } else if (!integer(raw.maxPrimarySessions, 1, SESSION_SLOT_MAX)) {
+      return fail('invalid_package', 'maxPrimarySessions 超出范围')
+    } else {
+      value.maxPrimarySessions = raw.maxPrimarySessions
+      value.maxPrimarySessionsOverride = raw.maxPrimarySessionsOverride !== false
+    }
+  }
+  if (!codex && has(raw, 'maxSubagentsPerSession')) {
+    if (raw.maxSubagentsPerSession == null) {
+      value.maxSubagentsPerSession = null
+      value.maxSubagentsPerSessionOverride = false
+    } else if (!integer(raw.maxSubagentsPerSession, 0, SESSION_SLOT_MAX)) {
+      return fail('invalid_package', 'maxSubagentsPerSession 超出范围')
+    } else {
+      value.maxSubagentsPerSession = raw.maxSubagentsPerSession
+      value.maxSubagentsPerSessionOverride = raw.maxSubagentsPerSessionOverride !== false
     }
   }
   if (has(raw, 'weight')) {
@@ -328,8 +368,13 @@ export function parseVmPackage(doc) {
   if (!isValidVmId(id)) return fail('invalid_id', 'vm.id 无效')
   const probe = { platform: vm.platform, family: vm.family }
   const codex = isCodexVm(probe)
-  if (vm.kernel != null && vm.kernel !== '' && !OS_CATALOG[vm.kernel]) {
+  const requestedKernel = vm.kernel != null && vm.kernel !== '' ? normalizeOsKernel(vm.kernel) : DEFAULT_KERNEL
+  if (vm.kernel != null && vm.kernel !== '' && !requestedKernel) {
     return fail('invalid_kernel', '未知系统')
+  }
+  const cragDebian13Package = isCragDebian13Kernel(requestedKernel)
+  if (codex && cragDebian13Package) {
+    return fail('invalid_create_dataplane', 'crag-debian13 仅支持 Anthropic CRAG 槽位')
   }
   let timezone = null
   if (vm.timezone != null && String(vm.timezone).trim() !== '') {
@@ -348,6 +393,8 @@ export function parseVmPackage(doc) {
   if (!dataplane.ok) return fail('invalid_package', dataplane.error || 'dataplane 无效')
   const cragVersion = parseCragKernelVersionPatch(vm.crag_kernel_version)
   if (!cragVersion.ok) return fail('invalid_package', cragVersion.error || 'crag_kernel_version 无效')
+  const effectiveDataplane = !codex && cragDebian13Package ? 'crag' : dataplane.value
+  const effectiveCragVersion = !codex && cragDebian13Package ? cragVersion.value || 'v2' : cragVersion.value
   const policy = parsePolicy(vm.policy, codex)
   if (!policy.ok) return policy
   const proxy = parseProxy(doc.proxy)
@@ -365,7 +412,7 @@ export function parseVmPackage(doc) {
         name: cleanText(vm.name, 80),
         platform: codex ? 'openai' : 'anthropic',
         family: codex ? 'codex' : 'claude',
-        kernel: OS_CATALOG[vm.kernel] ? vm.kernel : DEFAULT_KERNEL,
+        kernel: requestedKernel,
         timezone,
         timezone_source: source || (timezone ? 'manual' : 'auto'),
         locale: cleanText(vm.locale, 64) || STANDARD_LOCALE,
@@ -373,8 +420,8 @@ export function parseVmPackage(doc) {
         note: cleanText(vm.note, 240),
         persona_preset: persona,
         inference_engine: engine,
-        dataplane: dataplane.value,
-        crag_kernel_version: cragVersion.value,
+        dataplane: effectiveDataplane,
+        crag_kernel_version: effectiveCragVersion,
         auth_scheme: auth,
         proxy_cli_enabled: vm.proxy_cli_enabled === true,
         schedulable: vm.schedulable !== false,
@@ -409,6 +456,14 @@ function applyPolicy(vm, policy, codex) {
   if (!codex && has(policy, 'sessionSlots')) {
     vm.policy.sessionSlots = policy.sessionSlots
     vm.policy.sessionSlotsOverride = policy.sessionSlotsOverride === true
+  }
+  if (!codex && has(policy, 'maxPrimarySessions')) {
+    vm.policy.maxPrimarySessions = policy.maxPrimarySessions
+    vm.policy.maxPrimarySessionsOverride = policy.maxPrimarySessionsOverride === true
+  }
+  if (!codex && has(policy, 'maxSubagentsPerSession')) {
+    vm.policy.maxSubagentsPerSession = policy.maxSubagentsPerSession
+    vm.policy.maxSubagentsPerSessionOverride = policy.maxSubagentsPerSessionOverride === true
   }
   if (has(policy, 'weight')) vm.policy.weight = policy.weight
   if (has(policy, 'priority')) {

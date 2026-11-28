@@ -10,7 +10,7 @@ import {
 import { extraUsageText } from '@/lib/fable-status'
 import { fmtExpiresAt, fmtNum, pct } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isCodexVm, slotRawEmail } from '@/lib/vm-kind'
 import { claudeTier, credExpiry } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -95,7 +95,13 @@ export function VmAccountTab(props: VmAccountTabProps) {
   )
 
   return (
-    <TabsContent value='account' className='space-y-3 pt-3'>
+    // forceMount：授权链接等面板状态跨 tab 保活——生成授权链接后可自由切到
+    // 「桌面」tab 完成浏览器登录，切回来链接与回调输入不丢
+    <TabsContent
+      value='account'
+      forceMount
+      className='space-y-3 pt-3 data-[state=inactive]:hidden'
+    >
       <div
         className={cn(
           'grid gap-3',
@@ -194,10 +200,10 @@ export function VmAccountTab(props: VmAccountTabProps) {
               )}
               <Field label={gpt ? 'ChatGPT 账号' : 'UUID'} compact>
                 {gpt ? (
-                  <span className='text-sm'>
-                    {String(
-                      vm.email || vm.account_uuid || acc.account_id || '—'
-                    )}
+                  // 详情面管理员审阅用：完整邮箱，不做脱敏
+                  <span className='text-sm break-all'>
+                    {slotRawEmail(vm) ||
+                      String(vm.account_uuid || acc.account_id || '—')}
                   </span>
                 ) : (
                   <span className='font-mono text-xs'>

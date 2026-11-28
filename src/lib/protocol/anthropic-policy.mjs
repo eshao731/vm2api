@@ -6,6 +6,7 @@ import {
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
+  stripEmptyEffort,
   stripIllegalContentFields,
   sanitizeAnthropicBody,
 } from './sanitize.mjs'
@@ -25,9 +26,15 @@ import {
   validateBetweenToolsThinking,
 } from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
-import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
+import {
+  DEFAULT_CACHE_TTL,
+  applyCacheBreakpoints,
+  repairCacheBreakpointsInPlace,
+  stripCacheScopeFields,
+} from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
+import { isOfficialClaudeToolName } from '../identity/official-cc-verifier.mjs'
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
@@ -61,48 +68,12 @@ function cleanContent(content, { keepEmptyIdentity = false } = {}) {
     )
 }
 
-function cacheControlLocations(body) {
-  const locations = []
-  const add = (block, section, index) => {
-    if (block?.cache_control) locations.push({ block, section, index })
-  }
-  for (const [index, tool] of (body.tools || []).entries()) add(tool, 'tools', index)
-  for (const [index, block] of (Array.isArray(body.system) ? body.system : []).entries()) add(block, 'system', index)
-  for (const [messageIndex, message] of (body.messages || []).entries()) {
-    if (!Array.isArray(message?.content)) continue
-    for (const [blockIndex, block] of message.content.entries()) {
-      if (block?.cache_control)
-        locations.push({
-          block,
-          section: 'messages',
-          index: messageIndex,
-          blockIndex,
-        })
-    }
-  }
-  return locations
-}
-
 function normalizeCacheTTL(_body) {
   // Official 2.1.241 uses ephemeral 1h. Do not coerce 1h back to 5m.
 }
 
 export function enforceCacheLimit(body, maximum = 4) {
-  const locations = cacheControlLocations(body)
-  // Anthropic rejects the marker on a thinking block regardless of the budget.
-  for (const location of locations) {
-    if (location.block?.type === 'thinking') delete location.block.cache_control
-  }
-  const live = locations.filter((location) => location.block?.cache_control)
-  if (live.length <= maximum) return
-  // Keep the message anchors: they advance the cache prefix on every turn.
-  // Tools are the cheapest to sacrifice, while system breakpoints preserve the
-  // stable persona prefix shared by the whole session.
-  const bySection = (name) => live.filter((location) => location.section === name)
-  const order = [...bySection('tools').reverse(), ...bySection('system').reverse(), ...bySection('messages')]
-  for (const location of order.slice(0, live.length - maximum)) {
-    delete location.block.cache_control
-  }
+  repairCacheBreakpointsInPlace(body, { limit: maximum })
 }
 
 const CLEAR_THINKING_EDIT = Object.freeze({
@@ -251,6 +222,19 @@ export function alignSamplingWithThinking(body = {}, { drop = false } = {}) {
  * block without a usable signature (missing, empty, shorter than 24, dummy)
  * is dropped instead of forwarded with an empty signature.
  */
+function thinkingBlockDedupeKey(block) {
+  if (block?.type === 'thinking') {
+    const signature = typeof block.signature === 'string' ? block.signature.trim() : ''
+    if (!signature) return null
+    return `t\0${signature}\0${typeof block.thinking === 'string' ? block.thinking : ''}`
+  }
+  if (block?.type === 'redacted_thinking') {
+    const data = typeof block.data === 'string' ? block.data.trim() : ''
+    return data ? `r\0${data}` : null
+  }
+  return null
+}
+
 export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
   const betweenTools = body.thinking?.type === 'between_tools'
@@ -261,7 +245,18 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
   const messages = body.messages.map((message) => {
     if (!Array.isArray(message?.content)) return message
     const content = []
+    const seenThinking = new Set()
     let filteredThis = false
+    const pushUniqueThinking = (block) => {
+      const key = thinkingBlockDedupeKey(block)
+      if (key && seenThinking.has(key)) {
+        changed = true
+        filteredThis = true
+        return
+      }
+      if (key) seenThinking.add(key)
+      content.push(block)
+    }
     for (const block of message.content) {
       const type = block?.type
       if (type === 'thinking' || type === 'redacted_thinking') {
@@ -269,7 +264,7 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
           // Omitted thinking keeps empty text; redacted thinking keeps encrypted data.
           if (preserveThinkingBlocks) {
             if (type === 'redacted_thinking' || hasUsableThinkingSignature(block.signature)) {
-              content.push(block)
+              pushUniqueThinking(block)
             } else {
               changed = true
               filteredThis = true
@@ -282,14 +277,14 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
             continue
           }
           if (type === 'redacted_thinking' && chainModel && String(block.data || '').trim()) {
-            content.push(block)
+            pushUniqueThinking(block)
             continue
           }
           const signed = chainModel
             ? hasNonDummyThinkingSignature(block.signature)
             : hasUsableThinkingSignature(block.signature)
           if (signed) {
-            content.push(block)
+            pushUniqueThinking(block)
             continue
           }
           if (chainModel) chainBroken = true
@@ -362,7 +357,7 @@ export function modelSupportsContextManagement(modelId = '') {
 }
 
 /**
- * Docs list: Fable 5 / 5.1, Mythos 5 / 5.1, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
+ * Docs list: Fable 5 / 5.1 / 5.2, Mythos 5 / 5.1 / 5.2, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
  * Sonnet 5, Haiku 4.5 and other Claude 4.x reject mid-conversation `role=system` (400).
  */
 export function modelSupportsMidConversationSystem(modelId = '') {
@@ -370,7 +365,9 @@ export function modelSupportsMidConversationSystem(modelId = '') {
     .trim()
     .toLowerCase()
     .replace(/\[1m\]$/i, '')
-  return /^claude-(?:(?:fable|mythos)-5(?:[-.]1)?|opus-(?:5(?:[-.]5)?|4[-.]8)|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
+  return /^claude-(?:(?:fable|mythos)-5(?:[-.](?:1|2))?|opus-(?:5(?:[-.]5)?|4[-.]8)|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(
+    id,
+  )
 }
 
 /**
@@ -513,7 +510,10 @@ export function prepareAnthropicRequest(
     out = ensureUnofficialEffortHigh(out)
     validateBetweenToolsThinking(out)
     out = rectifyUnofficialRequest(out)
-  } else out = ensureOutputConfigSchema(out)
+  } else {
+    out = stripEmptyEffort(out)
+    out = ensureOutputConfigSchema(out)
+  }
   if (Array.isArray(out.system)) {
     out.system = cleanContent(out.system, { keepEmptyIdentity: true })
   }
@@ -683,8 +683,8 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   } catch {
     return line
   }
-  if (payload?.content_block?.type === 'tool_use' && reverse[payload.content_block.name]) {
-    payload.content_block.name = reverse[payload.content_block.name]
+  if (payload?.content_block) {
+    payload.content_block = restoreToolNameBlock(payload.content_block, reverse)
   }
   if (payload?.delta?.type === 'tool_use' && reverse[payload.delta.name]) {
     payload.delta.name = reverse[payload.delta.name]
@@ -700,20 +700,40 @@ const CLIENT_PROSE = [
 ]
 const CLIENT_SLUG = /(?<![\w./:@'"`-])hermes-agent(?![\w/@-]|\.\w)/g
 
-function scrubClientProse(text) {
+const TOOL_CLIENT_PROSE = [
+  ...CLIENT_PROSE,
+  ['Oh My Pi', 'Claude Code'],
+  ['OpenCode', 'Claude Code'],
+  ['Cherry Studio', 'Claude Code'],
+  ['Roo Code', 'Claude Code'],
+  ['Kilo Code', 'Claude Code'],
+  ['DeepSeek Harness', 'Claude Code'],
+]
+const TOOL_CLIENT_SLUG = /(?<![\w./:@'"`-])(?:hermes-agent|oh-my-pi)(?![\w/@-]|\.\w)/g
+
+function scrubClientProse(text, { includeThirdPartyBrands = false } = {}) {
   let out = String(text ?? '')
-  for (const [from, to] of CLIENT_PROSE) {
+  const pairs = includeThirdPartyBrands ? TOOL_CLIENT_PROSE : CLIENT_PROSE
+  for (const [from, to] of pairs) {
     if (out.includes(from)) out = out.split(from).join(to)
   }
-  return out.replace(CLIENT_SLUG, 'claude-code')
+  return out.replace(includeThirdPartyBrands ? TOOL_CLIENT_SLUG : CLIENT_SLUG, 'claude-code')
 }
 
-/** Third-party tool names Anthropic bills as extra usage. Official CC names stay. */
-export function wireToolName(name, { official = false, rewriteTools = true } = {}) {
+/**
+ * Third-party tool names Anthropic bills as extra usage.
+ * V5: even when `official === true`, ALWAYS verify `isOfficialClaudeToolName(raw, tool)`
+ * so non-CC tools (`_bash`, `fs_read`, `automation_repl`, `bash`, `read`) get `mcp__` prefixed.
+ */
+export function wireToolName(
+  name,
+  { official = false, rewriteTools = true, tool = null, allowClassifierTool = false } = {},
+) {
   const raw = String(name || '')
   if (!raw || raw.startsWith('mcp__')) return raw
   if (raw.startsWith('mcp_')) return `mcp__${raw.slice(4)}`
-  if (official || rewriteTools === false) return raw
+  if (rewriteTools === false) return raw
+  if (official && isOfficialClaudeToolName(raw, tool, { allowClassifierTool })) return raw
   return `mcp__${raw}`
 }
 
@@ -721,27 +741,56 @@ export function wireToolName(name, { official = false, rewriteTools = true } = {
  * Hermes calls this gateway as a third-party Messages client and does not apply
  * its own OAuth identity transform. Rewrite the outbound body before either hop:
  * product strings leave system and tool text, and tool names land on mcp__.
- * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
+ * Official Claude Code keeps its own verified built-in/MCP tool names; non-CC
+ * tools and stray `mcp_` names are always prefixed to `mcp__`.
  */
 export function scrubUpstreamClientBody(
   body,
-  { official = false, rewriteTools = true, preserveToolNames = false, shareUnchanged = false } = {},
+  {
+    official = false,
+    rewriteTools = true,
+    preserveToolNames = false,
+    preserveSystem = false,
+    shareUnchanged = false,
+  } = {},
 ) {
   if (!body || typeof body !== 'object') return { body, reverse: {} }
   const out = shareUnchanged && !isSmallTextTurn(body) ? { ...body } : clone(body)
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
+  const toolByName = new Map()
+  if (Array.isArray(out.tools)) {
+    for (const tool of out.tools) {
+      if (tool && typeof tool === 'object' && typeof tool.name === 'string') {
+        toolByName.set(tool.name, tool)
+      }
+    }
+  }
   const declared = new Set(
     !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
   )
-  const rename = (name) => {
+  if (Array.isArray(out.messages)) {
+    for (const message of out.messages) {
+      if (!Array.isArray(message?.content)) continue
+      for (const block of message.content) {
+        const def =
+          block?.type === 'tool_addition' && block.tool?.type === 'tool_definition' ? block.tool.definition : null
+        if (def && typeof def === 'object' && !Array.isArray(def) && typeof def.name === 'string' && def.name) {
+          if (!toolByName.has(def.name)) toolByName.set(def.name, def)
+          if (!preserveToolNames) declared.add(def.name)
+        }
+      }
+    }
+  }
+  const rename = (name, toolObj = null) => {
     if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
-    let wire = wireToolName(name, { official, rewriteTools })
+    const resolvedTool = toolObj || toolByName.get(name) || null
+    let wire = wireToolName(name, { official, rewriteTools, tool: resolvedTool })
     if (!wire) return name
     if (wire !== name) {
-      const base = wireToolName(name, { official, rewriteTools })
+      const base = wireToolName(name, { official, rewriteTools, tool: resolvedTool })
       let suffix = 2
       while (used.has(wire) || declared.has(wire)) {
         const tail = `_${suffix++}`
@@ -753,25 +802,29 @@ export function scrubUpstreamClientBody(
     assigned.set(name, wire)
     return wire
   }
-  if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
-  else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  if (!preserveSystem) {
+    if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
+    else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  }
   if (Array.isArray(out.tools)) {
     out.tools = out.tools.map((tool) => {
       if (!tool || typeof tool !== 'object' || isAnthropicServerTool(tool)) return tool
       const next = { ...tool }
-      if (typeof next.name === 'string') next.name = rename(next.name)
-      if (typeof next.description === 'string') next.description = scrubClientProse(next.description)
+      if (typeof next.name === 'string') next.name = rename(next.name, tool)
+      if (typeof next.description === 'string') {
+        next.description = scrubClientProse(next.description, { includeThirdPartyBrands: true })
+      }
       return next
     })
-  }
-  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
-    const name = assigned.get(out.tool_choice.name)
-    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) =>
       preserveToolNames && message?.role !== 'system' ? message : scrubMessage(message, rename),
     )
+  }
+  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   return { body: out, reverse }
 }
@@ -788,6 +841,36 @@ function scrubTextBlock(block) {
 
 function scrubToolReferenceFields(block, rename) {
   if (!block || typeof block !== 'object') return { block, changed: false }
+  if (
+    block.type === 'tool_addition' &&
+    block.tool?.type === 'tool_definition' &&
+    block.tool.definition &&
+    typeof block.tool.definition === 'object' &&
+    !Array.isArray(block.tool.definition) &&
+    !isAnthropicServerTool(block.tool.definition)
+  ) {
+    const def = block.tool.definition
+    let nextDef = def
+    let defChanged = false
+    if (typeof def.name === 'string') {
+      const name = rename(def.name, def)
+      if (name !== def.name) {
+        nextDef = { ...nextDef, name }
+        defChanged = true
+      }
+    }
+    if (typeof def.description === 'string') {
+      const description = scrubClientProse(def.description, { includeThirdPartyBrands: true })
+      if (description !== def.description) {
+        nextDef = { ...nextDef, description }
+        defChanged = true
+      }
+    }
+    if (defChanged) {
+      return { block: { ...block, tool: { ...block.tool, definition: nextDef } }, changed: true }
+    }
+    return { block, changed: false }
+  }
   if (
     (block.type === 'tool_addition' || block.type === 'tool_removal') &&
     block.tool?.type === 'tool_reference' &&

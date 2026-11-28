@@ -70,6 +70,22 @@ export type CragRuntime = {
 export type CragHostStatus = {
   ready: boolean
   target_probe_failed?: true
+  /** 64 位十六进制宿主机唯一标识（CRAG 订阅与云端历史订单的唯一主身份）。 */
+  host_id?: string
+  /** 本机的设备标识，面板展示用。授权协议里走的仍是它派生出的 64 位 host id；
+   * 这个 UUID 是同一标识的可读形式，供运维复制、报障时引用。
+   *
+   * 缺失表示这台机器的原始标识来源已不在（见 crag-subscription.mjs 的
+   * `storedUuid`），此时不编一个出来 —— 编出来的 UUID 推不回本机 host id。 */
+  device_uuid?: string
+  /** 标识取自哪里：已保存的绑定、环境覆盖、网卡、挂载或 machine-id。
+   * 标识类故障只有带上来源才诊断得动。 */
+  identity_source?: 'saved' | 'override' | 'mac' | 'mount' | 'machine-id'
+  /** The Authority rejected this host's credential and the automatic recovery
+   * did not clear it. Unlike an outage, this needs the operator: most often
+   * `host_id_collision`, where another machine -- typically a VPS cloned from
+   * the same image, keeping its machine-id -- holds the same host id. */
+  credential_recovery?: 'host_id_collision' | 'failed' | 'not_activated'
   state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
   slot_limit?: number | 'unlimited'
   expires_at?: number
@@ -87,10 +103,74 @@ export type CragHostStatus = {
   }>
   available_slots?: number | null
   available_seats?: number | 'unlimited' | null
+  /** The purchased windows behind the aggregate, soonest expiry first. Each
+   * voucher runs its own term and its seats add to the total, so a host holds
+   * one entry per redemption plus, on an H1 host, an unlabelled baseline with
+   * no `code_id`.
+   *
+   * Only present when it reconciles with the signed aggregate (see
+   * `quotaGrants` in crag-subscription.mjs), and absent once the subscription
+   * has lapsed. Note `expires_at` on the subscription is where the *soonest*
+   * window ends, i.e. when the entitlement is re-signed -- not when access
+   * stops: the remaining windows stay valid, the seat total just drops. */
+  quota_grants?: Array<{
+    code_id?: string
+    expires_at: number
+    /** Absent means this window is unlimited. */
+    slot_limit?: number
+  }>
   reclaim_pending_count?: number
   reclaim_supported?: boolean
   upgrade_available?: boolean
   runtime?: CragRuntime
+}
+
+export type CragCloudOrder = {
+  order_id: string
+  product: string
+  sku: string
+  order_kind: 'purchase' | 'renewal'
+  slot_limit: number | 'unlimited'
+  months: number
+  amount_minor: number
+  subtotal_minor: number
+  discount_minor: number
+  payment_method: string
+  gateway_trade_no?: string | null
+  code_id?: string | null
+  renewed_from_order_id?: string | null
+  original_host_id: string
+  current_host_id: string
+  status?: string
+  active?: boolean
+  paid_at: number
+  granted_at?: number
+  grant_expires_at?: number
+  expires_at: number
+  created_at: number
+}
+
+export type CragCloudVoucher = {
+  code_id: string
+  sku?: string | null
+  slot_limit: number | 'unlimited'
+  months?: number | null
+  redeemed_at?: number | null
+  expires_at?: number | null
+  revoked_at?: number | null
+  order_id?: string | null
+  status?: string
+  active?: boolean
+}
+
+export type CragCloudOrdersResponse = {
+  host_id: string
+  product: string
+  orders: CragCloudOrder[]
+  vouchers: CragCloudVoucher[]
+  total: number
+  limit: number
+  offset: number
 }
 
 export function cragHostStatusQueryOptions() {
@@ -98,6 +178,72 @@ export function cragHostStatusQueryOptions() {
     queryKey: ['crag-host-subscription'] as const,
     queryFn: ({ signal }) =>
       api<CragHostStatus>('/api/panel/crag-subscription', { signal }),
+    retry: false,
+  })
+}
+
+export function cragHostOrdersQueryOptions(limit = 50, offset = 0) {
+  return queryOptions({
+    queryKey: ['crag-host-subscription', 'orders', limit, offset] as const,
+    queryFn: ({ signal }) =>
+      api<CragCloudOrdersResponse>(
+        `/api/panel/crag-subscription/orders?limit=${limit}&offset=${offset}`,
+        { signal }
+      ),
+    retry: false,
+  })
+}
+
+export type GeminiHostStatus = {
+  configured: boolean
+  active: boolean
+  product: string
+  host_id: string | null
+  sync_pending: boolean
+  issuer_public_key_id?: string | null
+  payload_key_id?: string | null
+  version: number | null
+  revision: number | null
+  issued_at: number | null
+  expires_at: number | null
+  slot_limit: number | 'unlimited'
+  used_slots: number | null
+  available_slots: number | null
+  reclaim_supported: boolean
+  quota_grants?: Array<{
+    code_id?: string
+    expires_at: number
+    slot_limit?: number | null
+  }>
+  credential_recovery?: 'host_id_collision' | 'failed' | 'not_activated'
+}
+
+export function geminiCragSubscriptionQueryOptions(sync = false) {
+  return queryOptions({
+    queryKey: ['panel', 'gemini-environments', 'crag-subscription'] as const,
+    queryFn: ({ signal }) =>
+      api<GeminiHostStatus>(
+        `/api/panel/gemini/crag-subscription${sync ? '?sync=1' : ''}`,
+        { signal }
+      ),
+    retry: false,
+  })
+}
+
+export function geminiCragOrdersQueryOptions(limit = 50, offset = 0) {
+  return queryOptions({
+    queryKey: [
+      'panel',
+      'gemini-environments',
+      'crag-orders',
+      limit,
+      offset,
+    ] as const,
+    queryFn: ({ signal }) =>
+      api<CragCloudOrdersResponse>(
+        `/api/panel/gemini/crag-subscription/orders?limit=${limit}&offset=${offset}`,
+        { signal }
+      ),
     retry: false,
   })
 }
@@ -251,13 +397,37 @@ export type VmHealthPayload = {
 }
 
 /** 展开明细的请求健康：按需取，30 秒内复用。 */
-export function vmHealthQueryOptions(id: string, range: VmHealthRange) {
+export function vmHealthQueryOptions(
+  id: string,
+  range: VmHealthRange,
+  isGemini = false
+) {
   return queryOptions({
-    queryKey: ['panel', 'vm', id, 'health', range] as const,
+    queryKey: [
+      'panel',
+      isGemini ? 'gemini' : 'vm',
+      id,
+      'health',
+      range,
+    ] as const,
     queryFn: () =>
       api<VmHealthPayload>(
-        `/api/panel/vms/${encodeURIComponent(id)}/health?range=${range}`
+        isGemini
+          ? `/api/panel/gemini/environments/${encodeURIComponent(id)}/health?range=${range}`
+          : `/api/panel/vms/${encodeURIComponent(id)}/health?range=${range}`
       ),
     staleTime: 30_000,
+  })
+}
+
+export function vmStatsDetailQueryOptions(id: string, isGemini = false) {
+  return queryOptions({
+    queryKey: ['panel', isGemini ? 'gemini-stats' : 'vm', id] as const,
+    queryFn: () =>
+      api<VmDetailPayload>(
+        isGemini
+          ? `/api/panel/gemini/environments/${encodeURIComponent(id)}/stats`
+          : `/api/panel/vms/${encodeURIComponent(id)}`
+      ),
   })
 }

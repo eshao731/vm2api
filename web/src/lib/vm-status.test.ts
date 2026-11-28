@@ -20,6 +20,8 @@ import {
   vmRequestingCount,
   vmCircuit,
   vmCircuitTitle,
+  vmFailedAt,
+  vmRunning,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -565,7 +567,7 @@ describe('unit circuit', () => {
     })
     expect(vmCircuit(vm, now)).toMatchObject({ state: 'open', left: 12_000 })
     expect(vmCircuitTitle(vm, now)).toBe(
-      '熔断中 · 连续 3/3 次 5xx · 12s 后放行探测'
+      '熔断中 · 连续 3/3 次 400/403/5xx · 12s 后放行探测'
     )
     expect(
       poolStatus({
@@ -920,5 +922,71 @@ describe('vmRequestingCount', () => {
   it('falls back to VM inflight when the row has no per-session book', () => {
     expect(vmRequestingCount({ inflight: 2 })).toBe(2)
     expect(vmRequestingCount({ inflight: 0, seat_sessions: null })).toBe(0)
+  })
+})
+
+describe('vmFailedAt', () => {
+  it('uses the recorded unschedulable time, not the latest probe', () => {
+    const revokedAt = '2026-11-21T16:17:18.882Z'
+    const vm = liveVm({
+      unschedulable_at: revokedAt,
+      last_probe: { at: '2026-11-22T05:10:00.000Z' },
+      refreshed_at: '2026-11-21T14:52:07.253Z',
+    } as Partial<Vm>)
+    expect(vmFailedAt(vm)).toBe(Date.parse(revokedAt))
+  })
+
+  it('falls back to the latest probe/refresh stamp when none is recorded', () => {
+    const vm = liveVm({
+      last_probe: { at: '2026-11-22T05:10:00.000Z' },
+      refreshed_at: '2026-11-21T14:52:07.253Z',
+    } as Partial<Vm>)
+    expect(vmFailedAt(vm)).toBe(Date.parse('2026-11-22T05:10:00.000Z'))
+  })
+})
+
+describe('custom quota window restriction labels (#1744)', () => {
+  it('formats quota_24h_header as 24h 限制', () => {
+    const slot = {
+      id: 'vm-24h',
+      platform: 'openai',
+      has_token: true,
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_24h_header',
+    } as Vm
+    expect(restrictionCopy(slot)).toContain('24h 限制')
+  })
+})
+
+describe('vmRunning', () => {
+  it('reports running for a live container even when no credential is bound', () => {
+    expect(
+      vmRunning({ id: 'vm-07', status: 'running', has_token: false })
+    ).toBe(true)
+    expect(vmRunning({ id: 'vm-07', status: 'ok', has_token: false })).toBe(
+      true
+    )
+  })
+
+  it('reports stopped for stopped, dead, or disabled slots even with a token', () => {
+    expect(vmRunning({ id: 'vm-06', status: 'stopped', has_token: true })).toBe(
+      false
+    )
+    expect(vmRunning({ id: 'vm-06', status: 'dead', has_token: true })).toBe(
+      false
+    )
+    expect(
+      vmRunning({ id: 'vm-06', status: 'disabled', has_token: true })
+    ).toBe(false)
+    expect(vmRunning(undefined)).toBe(false)
+  })
+
+  it('falls back to active or has_token only when status is omitted', () => {
+    expect(vmRunning({ id: 'vm-legacy', has_token: true })).toBe(true)
+    expect(vmRunning({ id: 'vm-empty', has_token: false })).toBe(false)
+    expect(vmRunning({ id: 'vm-active', active: true, has_token: false })).toBe(
+      true
+    )
   })
 })

@@ -50,10 +50,13 @@ for (const preset of ['official', 'official_full']) {
             assert.equal(hop.stream, stream)
             const anchors = messageMarkers(body)
             assert.ok(listCacheMarkers(body).every((marker) => marker.ttl === '1h'))
-            assert.equal(anchors.length, turn === 0 ? 1 : 2)
+            // Mode 1 (`official`, env=false) has 3 messages on turn 1 (below the 4-message threshold for a second anchor);
+            // Mode 2 (`official_full`, env=true) has 4 messages on turn 1 because of the mid-conversation Environment block.
+            const expectedAnchors = preset === 'official' ? (turn < 2 ? 1 : 2) : turn === 0 ? 1 : 2
+            assert.equal(anchors.length, expectedAnchors)
             const lastUser = body.messages.findLastIndex((m) => m.role === 'user')
             assert.equal(anchors.at(-1).index, lastUser)
-            if (previousUser) assert.deepEqual(body.messages[anchors[0].index], previousUser)
+            if (expectedAnchors === 2 && previousUser) assert.deepEqual(body.messages[anchors[0].index], previousUser)
             previousUser = body.messages[lastUser]
             validateCacheBreakpoints(body)
             assert.deepEqual(prepareCliHopBody(hop, { cacheTtl: '1h', stream, repaired: true }), hop)
@@ -79,7 +82,8 @@ for (const count of [0, 1, 2, 3, 4]) {
 }
 
 for (const [prefix, requested, expected] of [
-  [[marker()], '1h', '5m'],
+  [[marker()], '1h', '1h'],
+  [[marker()], '5m', '5m'],
   [[marker('5m')], '1h', '5m'],
   [[marker('1h')], '1h', '1h'],
   [[marker('1h')], '5m', '5m'],
@@ -88,7 +92,14 @@ for (const [prefix, requested, expected] of [
   test(`shaped TTL order: ${JSON.stringify(prefix)} + ${requested}`, () => {
     const input = shaped(prefix)
     const out = prepareCliHopBody(input, { cacheTtl: requested })
-    assert.deepEqual(out.system, input.system)
+    assert.deepEqual(
+      out.system,
+      input.system.map((block) =>
+        block.cache_control && !block.cache_control.ttl
+          ? { ...block, cache_control: { ...block.cache_control, ttl: requested } }
+          : block,
+      ),
+    )
     assert.deepEqual(
       messageMarkers(out).map((m) => m.ttl),
       [expected, expected],
@@ -163,3 +174,21 @@ for (const options of [{ preserveSystem: true }, { requestContext: { purpose: 'a
     })
   }
 }
+
+test('shaped preserveCacheTtl keeps omitted caller TTLs intact without skipping shaped fallback', () => {
+  const withCallerMessage = shaped([marker()])
+  withCallerMessage.messages[4].content = [{ type: 'text', text: 'turn 4', cache_control: marker() }]
+  const kept = prepareCliHopBody(withCallerMessage, { cacheTtl: '1h', preserveCacheTtl: true })
+  assert.deepEqual(kept.system[0].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(kept.messages[4].content[0].cache_control, { type: 'ephemeral' })
+  validateCacheBreakpoints(kept)
+
+  const withoutCallerMessage = shaped([marker()])
+  const filled = prepareCliHopBody(withoutCallerMessage, { cacheTtl: '1h', preserveCacheTtl: true })
+  assert.deepEqual(filled.system[0].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(
+    messageMarkers(filled).map((m) => m.ttl),
+    ['5m', '5m'],
+  )
+  validateCacheBreakpoints(filled)
+})

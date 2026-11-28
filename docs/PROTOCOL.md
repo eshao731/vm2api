@@ -6,17 +6,40 @@
 
 上游 hop 始终 `stream:true`。客户端 SSE 透传；非流或 `x-kin-delivery: verified` 则缓冲到 `message_stop` 再聚合。
 
-## CRAG native V2 部署边界
+## CRAG Native V4 部署与协议边界
 
-`dataplane: "crag"` 一律采用 native V2 与官方 Claude；省略版本和已存的 `legacy` 也走 v2，不再安装 `cc-node` 或 `share/crag/kin-kernel`。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude；不接受旧 Node、明文 native V2 或未 bundled 的独立部署变体。
+`dataplane: "crag"` 一律采用 native CRAG（当前标准为 **Native V4 Headless Bridge**，`transport: "headless_bridge"`，兼容接收 `"tui"` 别名）与官方 Claude；省略版本和已存的 `legacy` 也走 `crag-v2` 通道，不再安装 `cc-node` 或 `share/crag/kin-kernel`。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude（或 Custom OS 只读共享仓中经 `CRAG-OFFICIAL-CLAUDE-V1` 验签的 `claude`）；不接受旧 Node、明文 native 核心或未验签的独立部署变体。
 
-物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，Claude 位于 `.kin/crag-v2/claude-code-2.1.321/claude`；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart 流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
+物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，内嵌 Claude 位于 `.kin/crag-v2/claude-code-2.1.321/claude`（Custom OS KVM/Docker 槽复用只读共享仓 `/opt/kin/store/claude/current -> versions/2.1.321/claude`）；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart / `restart_crag` 热重载流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
 
-所有 CRAG 选择与正常 hop 都要求该 VM 的离线注册码；V2 原生网关再次校验签名、设备绑定和当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 注册码。
+所有 CRAG 选择与正常 hop 都要求该 VM 的有效授权（离线 `CRAGL1` / 宿主 `CRAGH2` / 槽位 `CRAGS1` / 包绑定 `CRAGK1`）；原生网关再次校验签名、设备绑定、包密钥 ID 与当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 授权。
 
 槽详情「推理内核」提供机器码复制、注册码激活/替换，以及签名内的期限、生效时间和到期时间；无授权点击 CRAG 会进入激活，不提前改 VM 配置或停内核。期限只能由供应方签发为 1个月/半年/1年（UTC 自然月 1/6/12，月底收敛），客户不能直接改过期时间。错误替换码不破坏现有有效授权，续期只换授权，不隐式切换内核。
 
 设备私钥/注册码保存在与现有 worker run 映射一致的 Linux 私有目录；保留运行数据与 machine-id 的普通容器重建保留授权，复制到不同 VM/设备无效。不要把 `license_dir` 放在 WSL DrvFS。启动器只在 sealed memfd 解密业务程序，不写明文；客户包不含供应方私钥/产品 AES key。离线授权不支持远程吊销，不能可靠阻止 root 回拨时间或复制全部设备材料。
+
+### `vm2api` ↔ CRAG 协议与整流边界（Claude Code `2.1.321`）
+
+两仓严格分工，避免同一职责双边重复实现或非法载荷穿透到上游：
+
+- **`vm2api` 负责（网关控制面与 CRAG 入口整流）**：
+  - 负责协议转译（OpenAI/Gemini → Anthropic）、第三方 `system` / `messages[].role=system|developer` 纯文本搬迁、工具名重写与响应/SSE 反向还原、模型策略、封控、限流、多租户计费、账号池调度与故障转移。
+  - **CRAG 最终出口 `2.1.321` 结构整流（SSOT：`src/lib/protocol/crag-321-rectifier.mjs`）**：在 `kernel-request.mjs::prepareCragRequest`（`/v1/messages`，覆盖 `strictPassthrough: true` 与非严格双分支）以及 `user-count-tokens.mjs` / `go-worker-client.mjs::countTokensViaKernel`（`/v1/messages/count_tokens`，覆盖官方与第三方）统一执行：
+    - **合法零修改快路径**：已满足 Claude Code `2.1.321` 结构与 `cache_control` 不变量的请求原引用返回（0 分配、0 改动，保留官方缓存前缀、续传哈希、未来官方扩展字段与 `scope`/`evict_on_complete`）。
+    - **非法/版本漂移载荷就地修复为合法 `2.1.321` 结构**（即使开启 `crag_strict_passthrough: true` 也强制检查，应对入站官方客户端版本与槽内 `2.1.321` 不一致的场景）：
+      1. `messages[0]` 携带非指令 `role: "system"`：`tool_addition(tool_definition)` 提升至顶层 `tools[]`（按 `name` 去重，重名覆盖项延后至首条 `user` 后）；无 `clear_at` 前导文本提升至顶层 `system[]`；`tool_removal` / `tool_reference` / `clear_at` 延后至首条 `user` 后。
+      2. 普通 `assistant`（未以 `*_tool_result` 服务端工具结果结尾）后的非指令 `role: "system"`：若后续存在 `user` 则延后至该 `user` 后（`assistant → user → system`）；若位于尾部或紧接另一条 `assistant` 则前置 `user("continue")` 锚点；连续非指令 `role: "system"` 合并为单条合法 `role: "system"`；保留任意位置的 directive-only `{ role: "system", content: [], output_config }`（旧模型自动降级提升尾部 `effort`）。
+      3. 非 `system`（`user`/`assistant`）中非法内嵌的 `tool_addition`/`tool_removal` 抽离到合法 `role: "system"` 轮次；`role: "developer"` 归一为 `system`；空 `system` 壳（含空 `clear_at`）丢弃（全空消息集仍 fail-closed 400）。
+      4. `thinking.budgetTokens` → 整型 `budget_tokens`、清理/小写化 `output_config.effort`、补齐 `output_config.format` `additionalProperties: false`、剥离 `annotations`，并在消息重排后执行 `repairCacheBreakpoints` 消除 `thinking` 断点、超 4 断点与 `5m → 1h` 倒挂。
+- **`CRAG`（`crag-v2`）负责（槽内原生执行与线协议合成）**：
+  - 负责槽内许可验签、官方 `claude-code-2.1.321` Headless Bridge 桥接、`PromptSpec v1` 渲染与 Self-Probe、**唯一 `anthropic-beta` 合成真值源（`wire.rs`）**（覆盖 `/v1/messages` 与 `/v1/messages/count_tokens`，含 `inline-tools-2026-09-15`、顶层 `cache_control`、Haiku 5.5、`diagnostics`/`fast-mode`/`compact`/`prompt-caching-scope` 门控与防 `extra_betas` 污染）、工具续接已校验快照恢复与 `native_handoff_v1` / `provider_result_v2`。
+  - CRAG **不做**跨轮次消息角色重排、不做第三方提示词搬迁或工具改名、不做账号池故障转移；对未通过 `protocol.rs` 硬约束的字段保持 fail-closed 400。
+
+### 历史 CRAG V4 载荷升级策略（`3.1.26`–`3.1.30` → `3.1.31`）
+
+- V3 历史基线（`<= 3.1.25`，对应 `vm2api <= v1.4.239`）运行官方 CLI 子进程，不受 V4 `409` 工具续接死锁与 `wire.rs` beta 缺陷影响。
+- V4 历史载荷 `payload-2026.11.28-crag-3.1.26`（`v1.4.240`–`v1.4.244`）、`3.1.27`（`v1.4.245`–`v1.4.249`）、`3.1.29`（`v1.4.250`–`v1.4.253`）与 `3.1.30`（`v1.4.254`–`v1.4.258`）在对应历史镜像的 `deploy/payload.json` 与 `CRAG_PINNED_RELEASES` 中均硬编码校验 `size + sha256 + manifestSha256`，因此**禁止覆写旧 tag 附件**。
+- 新版 [`payload-2026.11.28-crag-3.1.31`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.28-crag-3.1.31) 采用**零密钥轮换**签名并向后兼容 `v1.4.240`–`v1.4.258`（缺省 `crag_prompt_spec` 时自动兼容旧 `crag_persona_preset`/`crag_prompt`）；任意 `v1.4.240+` 控制面可直接拉取 `payload-2026.11.28-crag-3.1.31` 替换槽位内核（或升级至 `v1.4.259+`）。
 
 
 ## 官方 Claude Code 判定
@@ -41,7 +64,7 @@
 | `persona_preset` | `official_full` | 使用独立的完整官方模板；`official` 保留原有官方提示词 |
 | `overlay_preset` | `off` | 不向首条 user 注入 overlay |
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
-| `cache_ttl` | `1h` | 平台新增 marker 的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择。调用方合法 `1h`、`5m`、`1h → 5m` 及省略 TTL 均保留，不按菜单值统一改写 |
+| `cache_ttl` | `1h` | 非透传请求缺失 TTL 与平台新增 marker 的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择。调用方显式 `1h`、`5m`、`1h → 5m` 保留；官方透传保留调用方缺失 TTL |
 
 **official / official_full 模板**统一采用 2.1.303 OAuth 抓包中的 harness + guidance；顶层 `system` 只装提示词与调用方 `caller_system`。Environment 放入 `messages[].role=system`，不打缓存点，不混入顶层提示词。身份和 billing 入口跟随 `cc_entrypoint`。所有档位均使用 2.1.303，不再提供单独的 `official_303` 选项；旧值读写时归一为 `official_full`，旧开关和模板迁移到完整版，已有明确的完整版配置优先。
 
@@ -58,6 +81,7 @@
 - `persona_env_instructions_presets`：完整版长环境说明，缺 map/key 视为关。
 - `persona_timezone_presets` / `persona_locale_presets`：独立加载槽位时区 / locale，缺 map/key 视为关。`persona_env_presets=false` 同时停用所有生成的环境消息，包括模型附加句；调用方已有 `role=system` 原文保留。
 - `persona_hide_presets`：整档 usage 遮罩（billing / identity / agent / Environment 等 `hide:true` 块）。缺 key 时依次回落旧全局 `persona_hides`、该档模板的 `hide` 标记（默认 zero 开、其余关）。槽位单独指定人设时读该槽位档的开关；cli-hop 0注入 关掉后 CLI billing + Environment 计入 usage。
+- `usage_passthrough_presets`：对外完整透传上游 usage，开启后不扣除人设、环境、常驻约束或网关注入工具 token，适合经 NewAPI 等下游面向客户计费；缺 map/key 默认关闭。按档及槽位生效档分别设置。
 
 native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system，不在后面重加槽内 Environment。Node 关闭当前档 Environment 时，CLI 预处理保留调用方环境原文，HTTP 出站也跳过槽位时区刷新；没有调用方环境就不发送 Environment 块。启用时沿用原有槽位环境规则。调用方真正的 `You are an agent for Claude Code...` 和 `Notes:` 不会被当作自产内容删除。无 Node billed wire system 的独立 CLI fallback 仍沿用自己的布局，不在本次修改范围；槽位必须使用支持 wire-system 保留的 CLI 产物，旧 ELF 不会因修改控制面配置而自动更新。
 
@@ -69,20 +93,21 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该值仅是默认值，不覆盖请求头、请求显式 TTL、已有会话锁定值或 system 模板显式 TTL；官方透传的调用方 marker 及缺失 TTL 保持原样。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
-### CRAG v2 print
+### 统一系统提示词（`prompt_spec` v1，跨 `cli-node` 与 CRAG）
 
-CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.321`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。是否走 print 只看这台 VM 实际启用的内核：运行中的 health `runtime_variant=crag-v2` 优先，其次是槽位自己写明的 `dataplane` / `crag_kernel_version`，再其次是该槽 `run/kernel.json`。全局 `routing.inference` 不能把 wrap、cc 或未写内核的槽送上 print。legacy CRAG 仍走 cli-node。
+Claude 系统提示词统一由 `compatibility.persona_preset`（以及槽位 `vm.persona_preset`、池级策略 `M1b`）作为唯一真值源，解析为抽象 IR `prompt_spec` v1 后按目标内核编译投递：
 
-system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认 `compatibility.crag_persona_preset`：
+- **`cli-node`（免费内核）**：通过内部请求 envelope 顶层 `prompt_spec` 透传给 `kin-kernel` / `cli-node`（绝不混入发往 Anthropic 上游的 `envelope.body`），同时投影 `persona_preset` / `system_layout` 到 `kernel.json`。
+- **CRAG V4**：能力包含 `prompt_spec_v1` 时通过 `body.crag_prompt_spec` 下发完整 IR，并附带对齐的 `crag_persona_preset`（`official` / `official_full` / `zero` / `custom`）、`crag_prompt_version`、`crag_env`；对未升级旧版 CRAG 自动回退到 `crag_prompt` replace/append 协议。遗留 `compatibility.crag_persona_preset` 仅在 `persona_preset` 缺省时作为兼容回退读取。
 
-| 值 | 清洗 |
-|----|------|
-| `official_full`（缺省） | 不把官方四块 system 再贴进去。调用方剩余文本走 `crag_prompt.mode=append`（裸 `system` 在 v2 里也是 append）。≤ 64 KiB 才是 `--append-system-prompt`；更长由 helper 写进用户消息，不是 system 缓存块。没有尾巴就不发 system 旗标。 |
-| `zero` | 必须 `crag_prompt.mode=replace`。超过 64 KiB 直接 400，不假装替换成功。没有调用方文本时发不出 replace。`--system-prompt` 是否换掉 identity/harness/guidance，2.1.303 没复抓，未证实。 |
+| 档位 | 默认行为 |
+|------|----------|
+| `official`（官方提示词） | 仅保留计费头与官方身份句（`You are Claude Code, Anthropic's official CLI for Claude.`）；核心提示词（`harness`）、行为指引（`guidance`）、环境注入（`env` 及子项）均默认关闭并可独立开关。 |
+| `official_full`（完整官方提示词） | 保持现有完整官方 CC 提示词逻辑（默认开启核心提示词与环境注入；行为指引及环境子项独立可控）。 |
+| `zero`（0注入） | 剔除全部官方系统提示词与官方身份句，将官方身份句写入计费头 `prompt_version`；原样保留调用方业务 `system[]` 与缓存断点，不向 `messages[0]` 迁移，不注入任何环境段。 |
+| `custom`（自定义） | 由 `vm2api` 编译用户自定义模板块并统一下发到 `cli-node` 或 CRAG。 |
 
-槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
-
-官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，沿用独立执行会话、席位与父会话粘性隔离。CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
+官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，使用独立执行会话, stickyKey 为空. 默认独占席位. 家族模式下, 有效根登记使摘要共享根席位并计入 m, 可与父请求并行执行. 根 VM 不可用时, 已验证的摘要用独立摘要 ID 在其他 VM 申请普通席位, 包括外形与短探测相同的单轮 Haiku 摘要. CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
 
 
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
@@ -97,7 +122,13 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 `routing.compatibility.preserve_pruned_tool_results: true` 可为槽位推理开启 DSH 工具结果裁剪保护；缺省关闭，API 直连端点不启用。它不会修改客户端配置或路由粘性。
 
-`routing.compatibility.crag_drop_foreign_thinking: true` 让 CRAG print 在发出前丢掉不是本账号签发的 thinking 块（`thinking_signature_owners` 里没有记录或记在别的账号上）；命中进行中的工具循环时清掉循环内 thinking 并关闭 thinking，结果记在 `hop_meta.thinking_owner_crag`。缺省关闭：签名记录不完整时（清库、记录开始前的老会话）会误丢本账号的 thinking，并让提示缓存失效。
+`routing.compatibility.crag_drop_foreign_thinking` 让 CRAG print 在发出前丢掉不是本账号签发的 thinking 块，三态：
+
+- `false`（缺省）：不丢，原样重放调用方历史，等上游回 thinking 签名 400 再修。
+- `'foreign_only'`：只丢 `thinking_signature_owners` 里**记在别账号**上的块；没有记录的保留。换槽后不必先撞一次签名 400，也不会因签名记录不完整（清库、记录开始前的老会话）误丢本账号的 thinking。
+- `true`：记在别账号上的、以及**没有记录**的块一并丢。记录不完整时会误丢本账号的 thinking 并让提示缓存失效。
+
+命中进行中的工具循环时清掉循环内 thinking 并关闭 thinking。结果记在 `hop_meta.thinking_owner_crag`（`mode` 为生效档位，`unknown_kept` 为 `foreign_only` 下保留的无记录块数）。面板在「协议 → thinking 显示」里三档可切。
 
 DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pruned标记和后1024码点。开启后，网关在同一认证密钥、严格的DSH `session-UUID`、模型和完整历史前缀内，仅恢复精确等于该裁剪结果的旧文本。必须有此前完整verified且未重试的请求作为原文基线；仅收到keepalive、取消、失败或不完整流不会提交原文。真正的历史编辑、删消息、工具参数变化及摘要替换不还原。
 
@@ -182,13 +213,13 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 3. 更早的型号仍逐块过滤：签名短于 24、空签名、dummy 签名删掉，合法签名块留下。`redacted_thinking` 不看 `data`，只在签名达到 24 字符时留。
 4. 保留路径（cli-hop 首跳，以及默认 HTTP hop）不走上面的拆链，只在 `stripInvalidThinkingBlocks` 的这一支里处理：`redacted_thinking` 不看 `data` 和签名，原样留。`thinking` 只有签名可用（非空、不少于 24、非 dummy）才留，空正文也留；缺失、空、短于 24、dummy 的删掉，不再补 `signature: ""`。不走保留路径时，`redacted_thinking` 仍按上面第 2、3 条删。当前没有按账号归属过滤签名的步骤。
 
-HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
+HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，合法的 caller marker、显式 TTL、缺失 TTL 和位置原样保留；若出现超过四点、thinking marker、嵌套 `tool_result.content` 断点、非法 TTL 或 `5m`（含缺失）后出现 `1h`，由统一缓存整流（`repairCacheBreakpoints` / `protofront`）自动纠错而不直接返回 `400 invalid_cache_control`。若 CRAG 内核在调度前因原生历史锚点或系统块不匹配拒绝（`CRAG_CACHE_CONTROL`），策略层触发 `cache_control_repairable` 单次同账号修复重试：剥离调用方 `cache_control`、保留 thinking 块，由 CRAG 按会话 TTL 重新打点。
 
-关闭透传或非官方请求仍按所选人设组装。保留的 caller marker 不再统一改写 TTL：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 TTL 的已有 marker 保持省略，语义为隐式 `5m`。HTTP hop 的 `preserve_client=true` 也保留已有 message marker；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
+关闭透传或非官方请求仍按所选人设组装。调用方显式 TTL 保留：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 `ttl` 的缺省 marker 在渲染与入核前按 Web `compatibility.cache_ttl`（会话 pin 值）补齐（前面已有显式 `5m` 时补 `5m`，避免 `5m → 1h` 逆序）。HTTP hop 的 `preserve_client=true` 保留已有 message marker 位置并补齐缺失 TTL；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
 
-平台新增的缺省 marker 使用入站会话 pin 值（菜单选 `5m` 且请求没有另选时，新增点使用 `5m`），不覆盖 caller 或模板显式 TTL。按 `tools → system → messages → 顶层自动缓存` 检查顺序；Node 整流只把非法 TTL 修正为本次缺省值，并把 `5m`（含省略 TTL）之后非法出现的 `1h` 降为 `5m`，此前合法 marker 不动。模板自产点仍遵守剩余预算；非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
+平台新增的缺省 marker 使用入站会话 pin 值（菜单选 `5m` 且请求没有另选时，新增点使用 `5m`），不覆盖 caller 或模板显式 TTL。按 `tools → system → messages → 顶层自动缓存` 检查顺序；Node 整流将缺失或非法 TTL 补为本次缺省值，并把 `5m` 之后非法出现的 `1h` 降为 `5m`，此前合法显式 marker 不动。模板自产点仍遵守剩余预算；非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
 
-识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。人设组装保留下来的 caller marker 适用上述 TTL 规则，不再把缺失 TTL 当作菜单选择后补齐。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
+识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。凡经重写的入站（官方家族与第三方客户端一样），不写 `ttl` 的 marker 都表示未选择，渲染前按会话 pin 值（Web `compatibility.cache_ttl`）补齐，CRAG V3 同时发送 `preserve_cache_breakpoints: false` 与 `cache_ttl`，cli-hop、CRAG、HTTP hop 与 API 直连一致。只有协议页打开透传（或 API 端点显式启用 `body_policy=caller`），才跳过补齐并按 `official_cc_passthrough` 保留调用方缺失 TTL。入站请求头不能跳过剥离。
 
 native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式 TTL 和省略 TTL，wire tools / messages 同样保留。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。HTTP hop 与 native envelope 的日志/计费保留上游真实 5m/1h 分桶；仅缺少分桶的用量或 message_delta 超过既有分桶的增量使用缺省 TTL 归类。Node 对象不等于最终 wire，源码验证也不等于已发布或部署新 CLI 二进制。
 
@@ -200,7 +231,7 @@ native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式
 
 ## Codex 模型与运行环境
 
-Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.169.0`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
+Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.170.0`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
 
 GPT 模型以账号返回的 `/backend-api/codex/models` 为准，新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。静态回退目录补齐官方参考目录中的 `gpt-6.2-astra`、`gpt-6.2-sol`、`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`，这些 ID 默认启用，账号目录确认后立即可调度；回退目录之外、同步新发现的陌生 ID 仍默认关闭，管理员启用后才调度。回退目录的新增代次由 `gpt_model_policy.seed_version` 守护，对已同步过的实例一次性补齐，不整体合并回退目录，以免复活上游已下线的旧型号。6.2 两款尚无官方公布价目，内置价表不臆造，其用量按未计价处理。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
 
@@ -232,6 +263,7 @@ GPT 模型以账号返回的 `/backend-api/codex/models` 为准，新增 ID 不�
 | 头 | 作用 |
 |----|------|
 | `x-kin-delivery: verified` | 缓冲到终态 |
+| `x-kin-queue: off` | Claude 号池不排队等席位：能立刻拿到席位与内核槽位就照常接；席位被占（含自己会话的席位，或开启 `failover.keep_session_home` 时原账号内核无空槽）即回 529 `pool_overloaded`，不换号、不等待（会话轮次串行不受影响） |
 | `x-kin-cache-ttl: 1h` | Node 重写模式的首次会话 TTL 选择；不覆盖 native 透传 caller / 模板显式 TTL |
 | `x-kin-vm` | 仅 master：钉槽（虚拟机测试 loopback） |
 | `x-session-id` 等 | sticky 键，见 `routing.sticky` |

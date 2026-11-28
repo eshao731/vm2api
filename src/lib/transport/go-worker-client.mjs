@@ -2,10 +2,12 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { alignSamplingWithThinking, sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { prepareCliNodeRequest, prepareCragRequest } from '../protocol/kernel-request.mjs'
+import { rectifyCrag321Request } from '../protocol/crag-321-rectifier.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
@@ -13,6 +15,7 @@ import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
 import { cacheTtlFromRouting } from '../protocol/cache-ttl.mjs'
 import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { isPromptSpecV1Caps, sanitizePromptSpec } from '../identity/system-prompt-spec.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { canRefreshCredential, credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -26,14 +29,18 @@ import {
   readWorkerCredentialFile,
   refreshErrorCodeOf,
   REFRESH_SKEW_MS,
+  stripWorkerCredentialEmail,
+  withCredentialRefreshLock,
   writeWorkerCredentialFile,
   ensureOfficialCredentialLink,
   slotUidGidFromHomeDir,
 } from '../oauth/oauth-credentials.mjs'
-import { runSlotOauth } from './slot-oauth.mjs'
+export { withCredentialRefreshLock }
+import { probeAttemptGuard, runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
-import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
+import { isHeadlessBridgeCaps, isNativeCragV3Plus, normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
+export { isNativeCragV3Plus }
 import {
   cragConsumesModelDirective,
   cragV2KernelActive,
@@ -52,6 +59,7 @@ import {
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { correlationIdForLog } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 import { inferenceCodec } from './inference-codec.mjs'
@@ -67,27 +75,6 @@ import {
 const MAX_BODY = 64 * 1024 * 1024
 const MAX_GATEWAY_CLOCK_MS = 86_400_000
 const CRAG_HEADER_ALLOWANCE_MS = 5_000
-const credentialRefreshTail = new Map()
-
-function withCredentialRefreshLock(key, fn) {
-  const prev = credentialRefreshTail.get(key) || Promise.resolve()
-  let release
-  const gate = new Promise((resolve) => {
-    release = resolve
-  })
-  const tail = prev.catch(() => {}).then(() => gate)
-  credentialRefreshTail.set(key, tail)
-  return prev
-    .catch(() => {})
-    .then(async () => {
-      try {
-        return await fn()
-      } finally {
-        release()
-        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
-      }
-    })
-}
 
 export function workerPaths(exec = {}) {
   const slotRoot = exec.homeDir ? path.dirname(exec.homeDir) : null
@@ -135,6 +122,7 @@ async function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    logicalSize = 0,
     inference = false,
     onRequestStarted,
     beforeInferencePost,
@@ -149,15 +137,18 @@ async function workerRequest(
   const payload =
     body == null
       ? null
-      : inference
-        ? await inferenceCodec.encode(body, { signal })
-        : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+      : Buffer.isBuffer(body)
+        ? body
+        : inference
+          ? await inferenceCodec.encode(body, { signal })
+          : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
   // Non-managed inference may serialize on an async codec. Authorize after it, before opening HTTP.
   if (beforeInferencePost && !signal?.aborted) await checkInferencePost(beforeInferencePost)
   if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
   return new Promise((resolve, reject) => {
+    const checkedBytes = logicalSize > 0 ? logicalSize : payload?.length || 0
     // Include the headers, session metadata and request_id added around the caller's body.
-    if (maxRequestBytes > 0 && payload?.length > maxRequestBytes) {
+    if (maxRequestBytes > 0 && checkedBytes > maxRequestBytes) {
       reject(
         Object.assign(new Error(`Request envelope exceeds ${maxRequestBytes} bytes`), {
           status: 413,
@@ -173,7 +164,8 @@ async function workerRequest(
     }
     const requestHeaders = { ...headers }
     if (payload) {
-      requestHeaders['content-type'] = 'application/json'
+      const hasContentType = Object.keys(requestHeaders).some((key) => key.toLowerCase() === 'content-type')
+      if (!hasContentType) requestHeaders['content-type'] = 'application/json'
       requestHeaders['content-length'] = String(payload.length)
     }
     if (internalToken) {
@@ -240,6 +232,7 @@ async function inferenceRequest(
   {
     envelope,
     requestId,
+    gatewayRequestId = null,
     stream,
     deliveryMode,
     managedCrag,
@@ -255,6 +248,8 @@ async function inferenceRequest(
   },
 ) {
   const headers = stream ? { te: 'trailers' } : {}
+  const safeGatewayRequestId = correlationIdForLog(gatewayRequestId)
+  if (safeGatewayRequestId) headers['x-gateway-request-id'] = safeGatewayRequestId
   const body = { ...envelope, request_id: requestId }
   const authenticatedPolicy = managedCrag && requestPath === '/internal/v1/messages'
   // Managed CRAG serializes synchronously. Check first so the worker receives only the remaining queue budget.
@@ -297,6 +292,158 @@ async function inferenceRequest(
   })
 }
 
+export async function interruptWorker(exec, { requestId, responseId, timeoutMs = 3000 } = {}) {
+  if (!requestId || !responseId) return { ok: false, status: 400 }
+  try {
+    const res = await workerRequest(exec, {
+      method: 'POST',
+      requestPath: '/internal/v1/interrupt',
+      body: { request_id: requestId, response_id: responseId },
+      requireInternalToken: true,
+      timeoutMs,
+    })
+    await readAll(res, 64 * 1024).catch(() => Buffer.alloc(0))
+    const status = res.statusCode || 0
+    return { ok: status === 204, status }
+  } catch (error) {
+    return { ok: false, status: 0, code: error?.code || 'interrupt_failed' }
+  }
+}
+
+function codexReceiptFromHeaders(headers = {}, trailers = {}) {
+  const pick = (name) => {
+    const raw = trailers?.[name] ?? headers?.[name]
+    if (raw == null) return null
+    const text = String(Array.isArray(raw) ? raw[0] : raw).trim()
+    return text || null
+  }
+  const jsonObj = (raw) => {
+    const parsed = raw ? parseJson(raw) : null
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  }
+  const sentRaw = pick('x-kin-upstream-sent')
+  const interruptRaw = pick('x-tap-interrupt')
+  const udsRecvRaw = pick('x-kin-uds-received')
+  return {
+    turnTiming: jsonObj(pick('x-tap-turn-timing')),
+    interruptTransport: interruptRaw ? interruptRaw.toLowerCase() : null,
+    upstreamSent: sentRaw ? sentRaw.toLowerCase() : null,
+    upstreamError: jsonObj(pick('x-kin-upstream-error')),
+    modelsEtag: pick('x-models-etag'),
+    udsBase: pick('x-kin-uds-base'),
+    udsMiss: pick('x-kin-uds-miss') === '1',
+    udsReceived: udsRecvRaw != null && Number.isFinite(Number(udsRecvRaw)) ? Number(udsRecvRaw) : null,
+  }
+}
+
+async function sendPreparedInference(
+  exec,
+  {
+    envelope,
+    requestId,
+    gatewayRequestId = null,
+    stream,
+    deliveryMode,
+    managedCrag,
+    nativeHandoff = false,
+    tenantId,
+    slotWaitDeadlineMs,
+    timeoutMs,
+    idleTimeoutMs,
+    routing,
+    requestPath,
+    maxRequestBytes = 0,
+    beforeInferencePost,
+    packedCodec = null,
+    signal,
+    armAttemptCancel,
+    disarmAttemptCancel,
+  },
+) {
+  if (!packedCodec || typeof packedCodec.prepare !== 'function') {
+    const response = await inferenceRequest(exec, {
+      stream,
+      managedCrag,
+      nativeHandoff,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
+      requestPath,
+      envelope,
+      requestId,
+      gatewayRequestId,
+      maxRequestBytes,
+      inference: true,
+      beforeInferencePost,
+      onRequestStarted: armAttemptCancel,
+      signal,
+      timeoutMs,
+    })
+    return { response, packedMeta: null }
+  }
+  const rawBuf = await inferenceCodec.encode({ ...envelope, request_id: requestId }, { signal })
+  if (maxRequestBytes > 0 && rawBuf.length > maxRequestBytes) {
+    throw Object.assign(new Error(`Request envelope exceeds ${maxRequestBytes} bytes`), {
+      status: 413,
+      code: 'body_too_large',
+    })
+  }
+  const sessionId = envelope?.session?.session_id || envelope?.headers?.['session-id'] || ''
+  const baseHeaders = stream ? { te: 'trailers' } : {}
+  const safeGatewayRequestId = correlationIdForLog(gatewayRequestId)
+  if (safeGatewayRequestId) baseHeaders['x-gateway-request-id'] = safeGatewayRequestId
+  const sendPacked = (packed, gate) =>
+    workerRequest(exec, {
+      method: 'POST',
+      requestPath: '/internal/v1/codex/responses/packed',
+      body: packed.wireBody,
+      headers: { ...baseHeaders, ...packed.headers },
+      maxRequestBytes,
+      logicalSize: packed.rawBytes,
+      timeoutMs,
+      timeoutMode: stream ? 'first-byte' : 'overall',
+      signal,
+      beforeInferencePost: gate,
+      onRequestStarted: armAttemptCancel,
+    })
+  const first = packedCodec.prepare({ exec, rawBuf, sessionId })
+  let attempt = first
+  let response = await sendPacked(first, beforeInferencePost)
+  let cacheMissRetried = false
+  if (
+    first.baseSent &&
+    response.statusCode === 409 &&
+    String(response.headers?.['x-kin-uds-miss'] || '') === '1' &&
+    String(response.headers?.['x-kin-upstream-sent'] || '') === '0'
+  ) {
+    await readAll(response, 64 * 1024).catch(() => {})
+    disarmAttemptCancel?.()
+    packedCodec.evict?.(exec, first.baseSent)
+    attempt = packedCodec.prepareFull({ exec, rawBuf })
+    cacheMissRetried = true
+    response = await sendPacked(attempt, undefined)
+  }
+  const returnedBase = String(response.headers?.['x-kin-uds-base'] || '').trim()
+  if ((response.statusCode || 0) >= 200 && (response.statusCode || 0) < 300 && /^[0-9a-f]{64}$/.test(returnedBase)) {
+    packedCodec.remember?.(exec, { sessionId, baseSha: returnedBase, rawBuf })
+  }
+  const recv = response.headers?.['x-kin-uds-received']
+  return {
+    response,
+    packedMeta: {
+      endpoint: '/internal/v1/codex/responses/packed',
+      stored: attempt.stored === true,
+      delta: Boolean(attempt.baseSent),
+      cacheMissRetried,
+      baseSha: attempt.baseSent || returnedBase || null,
+      rawBytes: attempt.rawBytes,
+      wireBytes: attempt.wireBytes,
+      receivedBytes: recv != null && Number.isFinite(Number(recv)) ? Number(recv) : null,
+    },
+  }
+}
+
 function classifyManagedQueueRejection(result, managedCrag) {
   const error = result.body?.error
   if (!managedCrag || result.ok || result.body?.type !== 'error') return result
@@ -320,13 +467,125 @@ function classifyManagedQueueRejection(result, managedCrag) {
  * the CLI still owned the job. Best effort: the kernel also sees the drop,
  * and an old worker without the route just answers 404.
  */
-function cancelOnAbort(exec, signal, requestId) {
+function createHopAbortScope(signal) {
+  if (!signal) return { signal: undefined, disarm: () => {} }
+  const controller = new AbortController()
+  let disarmed = false
+  const onAbort = () => {
+    if (disarmed) return
+    controller.abort(signal.reason)
+  }
+  if (signal.aborted) {
+    controller.abort(signal.reason)
+    return { signal: controller.signal, disarm: () => {} }
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  return {
+    signal: controller.signal,
+    disarm: () => {
+      if (disarmed) return
+      disarmed = true
+      signal.removeEventListener('abort', onAbort)
+    },
+  }
+}
+
+const OFFICIAL_CALLER_UA_RE =
+  /^claude-cli\/(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)(?:\s*\(([A-Za-z0-9., _/+:-]{1,128})\))?$/i
+const SAFE_X_APP_RE = /^[A-Za-z0-9._-]{1,64}$/
+const SAFE_CLAUDE_CODE_HEADER_RE = /^x-claude-code-[a-z0-9-]+$/
+const MAX_CALLER_CLAUDE_CODE_HEADERS = 32
+
+function sanitizeCallerHeaderValue(raw, maxLen = 512) {
+  const first = Array.isArray(raw) ? raw[0] : raw
+  if (typeof first !== 'string') return null
+  const trimmed = first.trim()
+  if (!trimmed || trimmed.length > maxLen || /[\x00-\x1f\x7f]/.test(trimmed)) return null
+  return trimmed
+}
+
+/**
+ * Sanitize an official Claude CLI `User-Agent` entrypoint hint (`cli`, `cli-bg`,
+ * `sdk-cli`, etc.) for CRAG bridge detection while rejecting non-official UAs.
+ */
+export function sanitizeCallerUserAgentHint(rawUa) {
+  const clean = sanitizeCallerHeaderValue(rawUa, 256)
+  if (!clean) return null
+  return OFFICIAL_CALLER_UA_RE.test(clean) ? clean : null
+}
+
+/**
+ * Extract allowlisted, non-secret caller identity & trace headers to forward
+ * inside the internal CRAG `kernel.sock` envelope `headers`.
+ * Credentials (`authorization`, `x-api-key`, `cookie`) and hop-by-hop headers
+ * are never accepted here.
+ */
+export function extractCragCallerHeaders(reqHeaders, { includeUserAgent = true } = {}) {
+  if (!reqHeaders || typeof reqHeaders !== 'object') return undefined
+  const out = {}
+  let ccCount = 0
+  for (const [key, raw] of Object.entries(reqHeaders)) {
+    const lower = String(key || '')
+      .trim()
+      .toLowerCase()
+    if (!lower) continue
+    if (lower === 'x-app') {
+      const value = sanitizeCallerHeaderValue(raw, 64)
+      if (value && SAFE_X_APP_RE.test(value)) out[lower] = value
+      continue
+    }
+    if (lower === 'x-client-request-id') {
+      const value = sanitizeCallerHeaderValue(raw, 256)
+      if (value) out[lower] = value
+      continue
+    }
+    if (includeUserAgent && lower === 'user-agent') {
+      const value = sanitizeCallerUserAgentHint(raw)
+      if (value) out[lower] = value
+      continue
+    }
+    if (lower.startsWith('x-claude-code-') && lower.length <= 96 && SAFE_CLAUDE_CODE_HEADER_RE.test(lower)) {
+      const value = sanitizeCallerHeaderValue(raw, 512)
+      if (!value) continue
+      if (!Object.hasOwn(out, lower)) {
+        if (ccCount >= MAX_CALLER_CLAUDE_CODE_HEADERS) continue
+        ccCount++
+      }
+      out[lower] = value
+    }
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+function headerValueCaseInsensitive(headers, targetLower) {
+  if (!headers || typeof headers !== 'object') return null
+  if (Object.hasOwn(headers, targetLower)) return headers[targetLower]
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() === targetLower) return value
+  }
+  return null
+}
+
+function resolveCancelSessionId(cancelSessionId, reqHeaders, envelopeHeaders) {
+  for (const candidate of [
+    cancelSessionId,
+    headerValueCaseInsensitive(reqHeaders, 'x-claude-code-session-id'),
+    headerValueCaseInsensitive(envelopeHeaders, 'x-claude-code-session-id'),
+  ]) {
+    const clean = sanitizeCallerHeaderValue(candidate, 256)
+    if (clean) return clean
+  }
+  return ''
+}
+
+function cancelOnAbort(exec, signal, requestId, sessionId = '') {
   if (!signal) return () => {}
   const onAbort = () => {
+    const body = sessionId ? { request_id: requestId, session_id: sessionId } : { request_id: requestId }
     workerRequest(exec, {
       method: 'POST',
       requestPath: '/internal/v1/cancel',
-      body: { request_id: requestId },
+      body,
       timeoutMs: 3000,
     })
       .then((res) => res.resume())
@@ -354,18 +613,33 @@ async function readAll(stream, limit = MAX_BODY) {
   return Buffer.concat(chunks)
 }
 
+const INTERNAL_CODEX_HEADERS = new Set([
+  'x-tap-turn-timing',
+  'x-tap-interrupt',
+  'x-kin-upstream-error',
+  'x-kin-upstream-sent',
+  'x-kin-uds-base',
+  'x-kin-uds-miss',
+  'x-kin-uds-received',
+  'x-kin-uds-store',
+  'x-kin-uds-copy',
+])
+
 function publicHeaders(headers = {}) {
   const result = {}
   for (const [key, value] of Object.entries(headers || {})) {
     if (value == null) continue
     const lower = String(key).toLowerCase()
     if (lower === 'set-cookie' || lower === 'authorization' || lower === 'x-api-key') continue
-    if (lower === 'x-kin-provider-result') continue
+    if (lower === 'x-kin-provider-result' || INTERNAL_CODEX_HEADERS.has(lower)) continue
     if (lower === 'trailer') {
       const visible = String(value)
         .split(',')
         .map((name) => name.trim())
-        .filter((name) => name.toLowerCase() !== 'x-kin-provider-result')
+        .filter((name) => {
+          const item = name.toLowerCase()
+          return item !== 'x-kin-provider-result' && !INTERNAL_CODEX_HEADERS.has(item)
+        })
       if (visible.length) result[lower] = visible.join(', ')
       continue
     }
@@ -385,12 +659,31 @@ function mergeRateLimitHeaders(headers = {}) {
     for (const [key, value] of Object.entries(parsed)) {
       if (value == null || value === '') continue
       const lower = String(key).toLowerCase()
-      if (lower.startsWith('anthropic-ratelimit-') || lower === 'retry-after' || lower === 'request-id') {
+      if (
+        lower.startsWith('anthropic-ratelimit-') ||
+        lower === 'retry-after' ||
+        lower === 'request-id' ||
+        lower === 'x-should-retry' ||
+        lower === 'anthropic-organization-id' ||
+        lower === 'anthropic-should-fallback' ||
+        lower === 'cf-ray'
+      ) {
         out[lower] = String(value)
       }
     }
   } catch {}
   return out
+}
+
+/** Merge `providerResult.response_headers` into hop headers without overwriting hop's own headers. */
+function mergeProviderHeaders(baseHeaders = {}, providerHeaders = null) {
+  if (!providerHeaders || typeof providerHeaders !== 'object' || Array.isArray(providerHeaders)) return baseHeaders
+  const ownKeys = new Set(Object.keys(baseHeaders || {}).map((key) => String(key).toLowerCase()))
+  const merged = { ...baseHeaders }
+  for (const [key, value] of Object.entries(publicHeaders(providerHeaders))) {
+    if (!ownKeys.has(key)) merged[key] = value
+  }
+  return merged
 }
 
 /** Parse the X-Usage / X-Model / X-Stop-Reason worker metadata. */
@@ -454,13 +747,16 @@ import { semanticStatusForStreamError } from '../protocol/stream-error-status.mj
 
 export { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
 
-function nativeErrorStatus(handoff, body) {
+function nativeErrorStatus(handoff, body, { strictPassthrough = false } = {}) {
   const facts = handoff?.providerResult
   for (const status of [facts?.public_status, facts?.http_status]) {
     if (Number.isInteger(status) && status >= 400 && status < 600) return status
   }
   // A real HTTP 200 on an SSE error is an observation, never an error status.
-  // V3's structured facts must not be reinterpreted from error prose.
+  // V3's structured facts must not be reinterpreted from error prose, except
+  // under strict passthrough where official Anthropic SSE error types map
+  // directly to their canonical HTTP status.
+  if (strictPassthrough) return semanticStatusForStreamError(body)
   return facts?.schema_version === 2 ? 502 : semanticStatusForStreamError(body)
 }
 
@@ -471,6 +767,7 @@ function nativeErrorStatus(handoff, body) {
 export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {}) {
   if (!result || result.ok || Number(result.status) !== 502) return result
   if (result.providerResult?.schema_version === 2) return result
+  if (String(result.upstreamSent ?? result.headers?.['x-kin-upstream-sent'] ?? '') === 'unknown') return result
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
   const status = semanticStatusForStreamError(body)
@@ -559,27 +856,78 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
-function gateCragBody(body, print, health, isolated = false, dropSampling = false) {
+function gateCragBody(body, print, health, isolated = false, dropSampling = false, strictPassthrough = false) {
   if (!body || typeof body !== 'object') return body
-  if (print) alignSamplingWithThinking(body, { drop: dropSampling })
+  if (print && !strictPassthrough) alignSamplingWithThinking(body, { drop: dropSampling })
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
+  const headlessBridge = print && isHeadlessBridgeCaps(caps)
+  const promptSpecV1 = print && isPromptSpecV1Caps(caps, health)
   const prompt = body.crag_prompt
   const model =
     print && !isolated && body.thread == null && cragConsumesModelDirective(health)
       ? modelDirectiveForCrag(body.model)
       : null
   const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
-  if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
+  const stripHeadlessFields =
+    !headlessBridge &&
+    (Object.hasOwn(body, 'crag_persona_preset') ||
+      Object.hasOwn(body, 'crag_prompt_version') ||
+      Object.hasOwn(body, 'crag_env'))
+  const stripPromptSpec = !promptSpecV1 && Object.hasOwn(body, 'crag_prompt_spec')
+  const stripNonLegacyPreset =
+    headlessBridge &&
+    !promptSpecV1 &&
+    (body.crag_persona_preset === 'official' || body.crag_persona_preset === 'custom')
+  if (
+    !model &&
+    !Object.hasOwn(body, 'crag_prompt') &&
+    !Object.hasOwn(body, 'crag_model') &&
+    !hasAlias &&
+    !stripHeadlessFields &&
+    !stripPromptSpec &&
+    !stripNonLegacyPreset
+  ) {
     return body
   }
   const out = { ...body }
-  if (!['append', 'replace'].includes(prompt?.mode) || !caps.includes(`prompt_${prompt.mode}`)) delete out.crag_prompt
+  if (!['append', 'replace'].includes(prompt?.mode) || (!headlessBridge && !caps.includes(`prompt_${prompt.mode}`))) {
+    delete out.crag_prompt
+  }
+  if (stripHeadlessFields) {
+    delete out.crag_persona_preset
+    delete out.crag_prompt_version
+    delete out.crag_env
+  }
+  if (stripPromptSpec) {
+    delete out.crag_prompt_spec
+  }
+  if (stripNonLegacyPreset) {
+    delete out.crag_persona_preset
+  }
   if (model) out.crag_model = model
   else delete out.crag_model
   if (out.crag_options && typeof out.crag_options === 'object' && !Array.isArray(out.crag_options)) {
     const { prompt: _prompt, ...rest } = out.crag_options
     if (Object.keys(rest).length) out.crag_options = rest
     else delete out.crag_options
+  }
+  return out
+}
+
+function stripClientNonCcHeaders(reqHeaders) {
+  if (!reqHeaders || typeof reqHeaders !== 'object') return reqHeaders
+  const out = {}
+  for (const [key, value] of Object.entries(reqHeaders)) {
+    const lower = String(key || '').toLowerCase()
+    if (
+      lower === 'anthropic-beta' ||
+      lower === 'user-agent' ||
+      lower === 'x-app' ||
+      lower === 'x-client-request-id' ||
+      lower.startsWith('x-claude-code-')
+    )
+      continue
+    out[key] = value
   }
   return out
 }
@@ -604,38 +952,66 @@ export function prepareWorkerPayload({
   requestContext = null,
   repaired = false,
   dropSampling = false,
+  strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
+  safeguardsSanitized = false,
 } = {}) {
   const health = exec?.workerStatus
   const print = nativeCragRequest(exec, cragPrint)
-  const canonicalBody = print ? prepareCragRequest(body, health) : prepareCliNodeRequest(body)
+  const strictCrag = strictPassthrough === true && print
+  const canonicalBody = print
+    ? prepareCragRequest(body, health, { requestContext, strictPassthrough: strictCrag, safeguardsSanitized })
+    : prepareCliNodeRequest(body, { requestContext })
   const displayed =
-    requestContext?.purpose === 'auto_mode_classifier' || repaired
+    strictCrag || requestContext?.purpose === 'auto_mode_classifier' || repaired
       ? canonicalBody
       : ensureOfficialPrintThinking(
           applyThinkingDisplay(canonicalBody, thinkingDisplayMode(routing)),
           ccEntrypointFromRouting(routing),
         )
-  const main = stripSubagentBilling(displayed)
+  const main = strictCrag ? displayed : stripSubagentBilling(displayed)
   // V3's official CC owns beta selection. Its strict request contract does not
   // accept the panel's legacy cli-node beta body extension.
   const officialBetas = print && health?.capabilities?.includes('generation_controls_v3')
+  const headlessBridge = print && isHeadlessBridgeCaps(health?.capabilities)
+  const verifiedOfficial = officialTraffic === true || officialPassthrough === true || strictCrag
+  const callerHeaders =
+    print && verifiedOfficial ? extractCragCallerHeaders(reqHeaders, { includeUserAgent: headlessBridge }) : undefined
   const nativeOwnsHeaders =
     cliHop &&
     cragPrint === true &&
-    officialBetas &&
-    health.capabilities.includes('linux_tui_native_queue') &&
-    !requestContext &&
-    !repaired &&
-    main.thread == null
+    print &&
+    isNativeCragV3Plus(health?.capabilities) &&
+    (strictCrag || (!requestContext && !repaired && main.thread == null))
   let headers
   let turn = null
   let gated = main
-  if (!nativeOwnsHeaders) {
-    headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, canonicalBody?.model || '', {
+  if (nativeOwnsHeaders) {
+    if (callerHeaders) headers = callerHeaders
+  } else {
+    const nonPassthroughHeadless =
+      headlessBridge &&
+      !strictCrag &&
+      (!verifiedOfficial ||
+        officialPassthrough === false ||
+        body?.crag_persona_preset != null ||
+        body?.crag_prompt != null ||
+        body?.crag_env != null ||
+        (body?.crag_prompt_spec != null && body.crag_prompt_spec?.passthrough !== true))
+    const headerReq = !verifiedOfficial || nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
+    headers = prepareOutboundHeaders(headerReq, exec?.homeDir, identity, canonicalBody?.model || '', {
       credentialMode: credentialModeFromOauth(exec?.vm?.claude || {}),
       routing,
       want1m: want1m === true,
+      officialTraffic: verifiedOfficial && !nonPassthroughHeadless,
     })
+    if (callerHeaders) {
+      for (const [k, v] of Object.entries(callerHeaders)) {
+        if (nonPassthroughHeadless && k === 'user-agent') continue
+        headers[k] = v
+      }
+    }
     const thread = pinThreadBetas(
       main,
       withRequestProtocolBetas(String(headers['anthropic-beta'] || '').split(','), main),
@@ -645,18 +1021,33 @@ export function prepareWorkerPayload({
     if (!cliHop) gated = sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
     else if (!officialBetas) gated = { ...main, betas: thread.betas }
   }
-  const directed = gateCragBody(gated, print, health, requestContext?.purpose === 'auto_mode_classifier', dropSampling)
+  const directed = gateCragBody(
+    gated,
+    print,
+    health,
+    requestContext?.purpose === 'auto_mode_classifier',
+    dropSampling,
+    strictCrag,
+  )
   return {
     headers,
     gated: directed,
     cliHop,
     routing,
+    strictPassthrough: strictCrag,
     acceptsCallerCwd: print && Array.isArray(health?.capabilities) && health.capabilities.includes('caller_cwd'),
     thread: turn,
   }
 }
 
 function sealPreparedPayload(prepared, gated) {
+  if (prepared.strictPassthrough && prepared.cliHop) {
+    return {
+      headers: prepared.headers,
+      body: gated,
+      thread: prepared.thread,
+    }
+  }
   return {
     headers: prepared.headers,
     body: sealClaudeCodeCch(gated, {
@@ -672,7 +1063,7 @@ export function finalizeWorkerPayload(args = {}) {
   return sealPreparedPayload(prepared, prepared.gated)
 }
 
-async function workerEnvelope({
+export async function workerEnvelope({
   requestContext = null,
   body,
   reqHeaders,
@@ -686,9 +1077,14 @@ async function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   dropSampling = false,
+  strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
+  safeguardsSanitized = false,
   redactionPrincipal = '',
   redactionSession = '',
 } = {}) {
@@ -704,6 +1100,10 @@ async function workerEnvelope({
     requestContext,
     repaired,
     dropSampling,
+    strictPassthrough,
+    officialPassthrough,
+    officialTraffic,
+    safeguardsSanitized,
   })
   const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
   // Mask the separated path with the same policy as the original system text.
@@ -712,18 +1112,30 @@ async function workerEnvelope({
   const gated = redaction ? masked.body : prepared.gated
   const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
-  const nativeV3 =
-    nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  const print = nativeCragRequest(exec, cragPrint)
+  const nativeV3 = print && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  // Top-level `prompt_spec` rides on the worker envelope for cli-node (never inside `envelope.body`).
+  const cleanPromptSpec = !print && promptSpec ? sanitizePromptSpec(promptSpec) : null
   // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
-  const defaultCacheTtl = cacheTtl ?? (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
+  const defaultCacheTtl = prepared.strictPassthrough
+    ? (cacheTtl ?? null)
+    : (cacheTtl ??
+      finalized.body?.cache_ttl ??
+      finalized.body?.crag_options?.cache_ttl ??
+      (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null))
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
+    ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
     body: finalized.body,
     ...(finalized.headers ? { headers: finalized.headers } : {}),
     stream: !!stream,
     delivery_mode: deliveryMode || 'realtime',
-    preserve_cache_breakpoints: preserveCacheBreakpoints == null ? cacheTtl == null : preserveCacheBreakpoints === true,
+    preserve_cache_breakpoints: prepared.strictPassthrough
+      ? true
+      : preserveCacheBreakpoints == null
+        ? cacheTtl == null
+        : preserveCacheBreakpoints === true,
     cache_ttl: defaultCacheTtl == null ? null : String(defaultCacheTtl),
   }
   dumpSessionEnvelope(envelope)
@@ -744,19 +1156,23 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
     delete out.gateway_policy
     const print = nativeCragRequest(exec, cragPrint)
     out.body = gateCragBody(
-      print ? prepareCragRequest(out.body, exec?.workerStatus) : prepareCliNodeRequest(out.body),
+      print
+        ? prepareCragRequest(out.body, exec?.workerStatus, { requestContext: out.request_context || null })
+        : prepareCliNodeRequest(out.body, { requestContext: out.request_context || null }),
       print,
       exec?.workerStatus,
       out.request_context?.purpose === 'auto_mode_classifier',
     )
     if (out.headers && typeof out.headers === 'object') {
       out.headers = Object.fromEntries(
-        Object.entries(out.headers).filter(([name]) => name.toLowerCase() !== 'x-tenant-id'),
+        Object.entries(out.headers).filter(
+          ([name]) => name.toLowerCase() !== 'x-tenant-id' && name.toLowerCase() !== 'x-gateway-request-id',
+        ),
       )
     }
   }
-  if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
-    const { caller_cwd: _bodyCwd, ...body } = out.body
+  if (out.body && (Object.hasOwn(out.body, 'caller_cwd') || Object.hasOwn(out.body, 'prompt_spec'))) {
+    const { caller_cwd: _bodyCwd, prompt_spec: _bodyPromptSpec, ...body } = out.body
     out.body = body
   }
   if (redaction && out.body) out.body = await maskJson(out.body, redaction)
@@ -820,10 +1236,11 @@ function mockScenario(exec) {
   }
 }
 
-function restoreInferenceFailure(result, requestPath = '/internal/v1/messages') {
+function restoreInferenceFailure(result, requestPath = '/internal/v1/messages', { strictPassthrough = false } = {}) {
   if (requestPath === '/internal/v1/messages' && isClaudeSlotOAuthError(result?.body)) {
     return slotOAuthUnavailable(result)
   }
+  if (strictPassthrough) return result
   if (!result || result.ok || result.committed || isClientCancelledResult(result)) return result
   const facts = result.providerResult
   if (
@@ -839,6 +1256,7 @@ function restoreInferenceFailure(result, requestPath = '/internal/v1/messages') 
     status: 502,
     terminalState: 'rejected',
     cragPolicyBlock: true,
+    cragCacheControlBlocked: true,
     body: {
       type: 'error',
       error: {
@@ -888,15 +1306,24 @@ async function callGoWorkerRaw({
   preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
+  packedCodec = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
+  strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
+  safeguardsSanitized = false,
   onEnvelope = null,
   redactionPrincipal = '',
   redactionSession = '',
+  cancelSessionId = '',
+  gatewayRequestId = null,
   beforeInferencePost,
 } = {}) {
+  const requestId = randomUUID()
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
@@ -909,8 +1336,17 @@ async function callGoWorkerRaw({
       cragPrint,
       requestContext,
       repaired,
+      strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
+      safeguardsSanitized,
     })
-    reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
+    reportEnvelope(onEnvelope, {
+      ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
+      body: outboundBody,
+      headers,
+    })
     const rejection = await beforeInferencePost?.()
     if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: false })
@@ -922,15 +1358,23 @@ async function callGoWorkerRaw({
       usage: mock.body?.usage || null,
       model: mock.body?.model || null,
       stopReason: mock.body?.stop_reason || null,
+      hopRequestId: requestId,
     }
   }
-  const requestId = randomUUID()
-  let stopCancel = () => {}
+  const hopSignal = createHopAbortScope(signal)
+  let stopAttemptCancel = () => {}
+  const disarmAttemptCancel = () => {
+    stopAttemptCancel()
+    stopAttemptCancel = () => {}
+  }
+  let stopCancel = disarmAttemptCancel
   const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
   let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
+  let observedReceipt = codexReceiptFromHeaders()
+  let packedMeta = null
   const nativeMetadata = () =>
     handoff ? { ...handoff.metadata, nativeHandoff } : { nativeHandoff: false, providerResult: null }
   try {
@@ -959,9 +1403,14 @@ async function callGoWorkerRaw({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          promptSpec,
           callerCwd,
           requestContext,
           repaired,
+          strictPassthrough,
+          officialPassthrough,
+          officialTraffic,
+          safeguardsSanitized,
           redactionPrincipal,
           redactionSession,
         })
@@ -973,8 +1422,18 @@ async function callGoWorkerRaw({
       envelope: prepared.envelope,
     })
     if (useNativeHandoff || negotiateProviderResult(exec, { managedCrag, requestPath }))
-      handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff })
-    const response = await inferenceRequest(exec, {
+      handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff, strictPassthrough })
+    const resolvedCancelSessionId = resolveCancelSessionId(cancelSessionId, reqHeaders, prepared.envelope?.headers)
+    const armAttemptCancel = () => {
+      requestStarted = true
+      nativeHandoff = useNativeHandoff
+      const stopRemoteCancel = cancelOnAbort(exec, hopSignal.signal, requestId, resolvedCancelSessionId)
+      stopAttemptCancel = () => {
+        hopSignal.disarm()
+        stopRemoteCancel()
+      }
+    }
+    const sent = await sendPreparedInference(exec, {
       stream: false,
       managedCrag,
       nativeHandoff: useNativeHandoff,
@@ -985,21 +1444,25 @@ async function callGoWorkerRaw({
       requestPath,
       envelope: prepared.envelope,
       requestId,
+      gatewayRequestId,
       maxRequestBytes,
-      inference: true,
       beforeInferencePost,
-      onRequestStarted: () => {
-        requestStarted = true
-        nativeHandoff = useNativeHandoff
-        stopCancel = cancelOnAbort(exec, signal, requestId)
-      },
-      signal,
+      packedCodec,
+      armAttemptCancel,
+      disarmAttemptCancel,
+      signal: hopSignal.signal,
       timeoutMs,
     })
+    const response = sent.response
+    packedMeta = sent.packedMeta
+    observedReceipt = codexReceiptFromHeaders(response.headers)
     observedHeaders = mergeRateLimitHeaders(publicHeaders(response.headers))
     handoff?.observeHeaders(response.headers)
     const data = await readAll(response)
-    const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+    stopCancel()
+    const receipt = codexReceiptFromHeaders(response.headers, response.trailers)
+    observedReceipt = receipt
+    const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal: hopSignal.signal })
     let parsed = handoff ? handoff.consumeBody(parsedRaw) : parsedRaw
     if (prepared.redaction) parsed = await restoreJsonValue(parsed, prepared.redaction)
     if (handoff) {
@@ -1007,8 +1470,11 @@ async function callGoWorkerRaw({
       handoff.observeMessage(parsed?.type === 'error' ? null : parsed)
       parsed = handoff.finish(parsed)
     }
-    const headers = mergeRateLimitHeaders(
-      publicHeaders(nativeHandoff ? { ...response.headers, ...response.trailers } : response.headers),
+    const headers = mergeProviderHeaders(
+      mergeRateLimitHeaders(
+        publicHeaders(nativeHandoff ? { ...response.headers, ...response.trailers } : response.headers),
+      ),
+      handoff?.providerResult?.response_headers,
     )
     const ok =
       response.statusCode >= 200 &&
@@ -1019,7 +1485,7 @@ async function callGoWorkerRaw({
       ok,
       status:
         nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
-          ? nativeErrorStatus(handoff, parsed)
+          ? nativeErrorStatus(handoff, parsed, { strictPassthrough })
           : response.statusCode || 0,
       upstreamStatus: response.statusCode ?? null,
       via: 'go-worker',
@@ -1032,14 +1498,31 @@ async function callGoWorkerRaw({
       clusterDeliveryUnconfirmed: clusterSlot && !handoff && ok && !isCompleteAssistantMessage({ body: parsed }),
       transportError: false,
       threadBetas: prepared.thread,
+      hopRequestId: requestId,
+      ...(receipt.turnTiming ? { turnTiming: receipt.turnTiming } : {}),
+      ...(receipt.interruptTransport ? { interruptTransport: receipt.interruptTransport } : {}),
+      ...(receipt.upstreamSent ? { upstreamSent: receipt.upstreamSent } : {}),
+      ...(receipt.upstreamError ? { upstreamError: receipt.upstreamError } : {}),
+      ...(receipt.modelsEtag ? { modelsEtag: receipt.modelsEtag } : {}),
+      ...(packedMeta ? { udsPacked: packedMeta } : {}),
       ...nativeMetadata(),
     })
     return classifyManagedQueueRejection(result, managedCrag)
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return { ...blocked, ...nativeMetadata() }
-    if (error.code === 'invalid_kernel_request') return { ...invalidKernelResult(error), ...nativeMetadata() }
-    if (signal?.aborted) return clientCancelledResult({ via: 'go-worker', ...nativeMetadata() })
+    if (blocked) return { ...blocked, hopRequestId: requestId, ...nativeMetadata() }
+    if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
+      return { ...invalidKernelResult(error), hopRequestId: requestId, ...nativeMetadata() }
+    if (hopSignal.signal?.aborted)
+      return clientCancelledResult({
+        via: 'go-worker',
+        hopRequestId: requestId,
+        ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+        ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+        ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        ...nativeMetadata(),
+      })
     if (error instanceof InferencePostDenied) return error.result
     return {
       ok: false,
@@ -1063,6 +1546,11 @@ async function callGoWorkerRaw({
       },
       headers: observedHeaders,
       clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
+      hopRequestId: requestId,
+      ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+      ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+      ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+      ...(packedMeta ? { udsPacked: packedMeta } : {}),
       ...nativeMetadata(),
       terminalState:
         nativeHandoff && String(error.code).startsWith('native_handoff_')
@@ -1070,7 +1558,10 @@ async function callGoWorkerRaw({
           : error.status === 413
             ? 'rejected'
             : 'transport_error',
-      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
+      transportError:
+        observedReceipt.upstreamSent !== 'unknown' &&
+        error.status !== 413 &&
+        !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
@@ -1099,16 +1590,27 @@ async function streamGoWorkerRaw({
   preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
+  packedCodec = null,
+  onInterruptReady = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
+  dropSampling = false,
+  strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
+  safeguardsSanitized = false,
   onEnvelope = null,
   onOutboundHeaders = null,
   redactionPrincipal = '',
   redactionSession = '',
+  cancelSessionId = '',
+  gatewayRequestId = null,
   beforeInferencePost,
 } = {}) {
+  const requestId = randomUUID()
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
@@ -1121,8 +1623,18 @@ async function streamGoWorkerRaw({
       cragPrint,
       requestContext,
       repaired,
+      dropSampling,
+      strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
+      safeguardsSanitized,
     })
-    reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
+    reportEnvelope(onEnvelope, {
+      ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
+      body: outboundBody,
+      headers,
+    })
     const rejection = await beforeInferencePost?.()
     if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: true })
@@ -1138,6 +1650,7 @@ async function streamGoWorkerRaw({
           headers: {},
           terminalState: 'incomplete',
           committed: false,
+          hopRequestId: requestId,
         }
       }
       if (typeof onCommit === 'function') onCommit()
@@ -1160,6 +1673,7 @@ async function streamGoWorkerRaw({
         headers: {},
         terminalState: 'incomplete',
         committed: true,
+        hopRequestId: requestId,
       }
     }
     const payload = mockCrsPayload({ scenario })
@@ -1169,6 +1683,7 @@ async function streamGoWorkerRaw({
         via: 'go-worker-mock-stream',
         terminalState: 'rejected',
         committed: false,
+        hopRequestId: requestId,
       }
     }
     const mockTiming = createStreamTiming(mockStartedAt)
@@ -1189,18 +1704,34 @@ async function streamGoWorkerRaw({
       usage: payload.body?.usage || null,
       model: payload.body?.model || null,
       stopReason: payload.body?.stop_reason || null,
+      hopRequestId: requestId,
       ...mockTiming.snapshot(),
     }
   }
   let committed = false
   const timing = createStreamTiming()
-  const requestId = randomUUID()
-  let stopCancel = () => {}
+  const hopSignal = createHopAbortScope(signal)
+  let stopAttemptCancel = () => {}
+  const disarmAttemptCancel = () => {
+    stopAttemptCancel()
+    stopAttemptCancel = () => {}
+  }
+  let stopCancel = disarmAttemptCancel
   const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
   let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
+  let observedReceipt = codexReceiptFromHeaders()
+  let packedMeta = null
+  let firstGeneratedEventType = null
+  let firstReleaseType = null
+  let clientFirstWriteSourceType = null
+  const nodeTimingMeta = () => ({
+    firstGeneratedEventType,
+    firstReleaseType,
+    clientFirstWriteSourceType,
+  })
   const nativeMetadata = () =>
     handoff ? { ...handoff.metadata, nativeHandoff } : { nativeHandoff: false, providerResult: null }
   try {
@@ -1230,9 +1761,15 @@ async function streamGoWorkerRaw({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          promptSpec,
           callerCwd,
           requestContext,
           repaired,
+          dropSampling,
+          strictPassthrough,
+          officialPassthrough,
+          officialTraffic,
+          safeguardsSanitized,
           redactionPrincipal,
           redactionSession,
         })
@@ -1244,8 +1781,18 @@ async function streamGoWorkerRaw({
       envelope: prepared.envelope,
     })
     if (useNativeHandoff || negotiateProviderResult(exec, { managedCrag, requestPath }))
-      handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff })
-    const response = await inferenceRequest(exec, {
+      handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff, strictPassthrough })
+    const resolvedCancelSessionId = resolveCancelSessionId(cancelSessionId, reqHeaders, prepared.envelope?.headers)
+    const armAttemptCancel = () => {
+      requestStarted = true
+      nativeHandoff = useNativeHandoff
+      const stopRemoteCancel = cancelOnAbort(exec, hopSignal.signal, requestId, resolvedCancelSessionId)
+      stopAttemptCancel = () => {
+        hopSignal.disarm()
+        stopRemoteCancel()
+      }
+    }
+    const sent = await sendPreparedInference(exec, {
       stream: true,
       deliveryMode,
       managedCrag,
@@ -1257,29 +1804,50 @@ async function streamGoWorkerRaw({
       requestPath,
       envelope: prepared.envelope,
       requestId,
+      gatewayRequestId,
       maxRequestBytes,
-      inference: true,
       beforeInferencePost,
-      onRequestStarted: () => {
-        requestStarted = true
-        nativeHandoff = useNativeHandoff
-        stopCancel = cancelOnAbort(exec, signal, requestId)
-      },
-      signal,
+      packedCodec,
+      armAttemptCancel,
+      disarmAttemptCancel,
+      signal: hopSignal.signal,
       timeoutMs,
     })
+    const response = sent.response
+    packedMeta = sent.packedMeta
+    observedReceipt = codexReceiptFromHeaders(response.headers)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     observedHeaders = headers
     handoff?.observeHeaders(response.headers)
+    const codexResponses =
+      requestPath === '/internal/v1/codex/responses' || requestPath === '/internal/v1/codex/responses/packed'
+    if (
+      codexResponses &&
+      response.statusCode === 200 &&
+      observedReceipt.interruptTransport === 'websocket' &&
+      typeof onInterruptReady === 'function'
+    ) {
+      try {
+        onInterruptReady({
+          requestId,
+          interruptMode: 'websocket',
+          interrupt: (responseId) => interruptWorker(exec, { requestId, responseId }),
+        })
+      } catch {}
+    }
     const claudeMessages = requestPath === '/internal/v1/messages'
     const jsonReply = claudeMessages && /^application\/json\b/i.test(response.headers['content-type'] || '')
     if (jsonReply || (response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, handoff ? MAX_BODY : 1024 * 1024)
-      let decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+      stopCancel()
+      const receipt = codexReceiptFromHeaders(response.headers, response.trailers)
+      observedReceipt = receipt
+      let decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal: hopSignal.signal })
       if (handoff) decoded = handoff.consumeBody(decoded)
       if (prepared.redaction) decoded = await restoreJsonValue(decoded, prepared.redaction)
       handoff?.observeHeaders(response.trailers)
       if (handoff) decoded = handoff.finish(decoded)
+      const mergedHeaders = mergeProviderHeaders(headers, handoff?.providerResult?.response_headers)
       // A real HTTP error remains the failure, even if handoff metadata is absent.
       const result = restoreKernelErrorStatus({
         ok: false,
@@ -1287,11 +1855,19 @@ async function streamGoWorkerRaw({
         upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body: decoded,
-        headers,
+        headers: mergedHeaders,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
+        hopRequestId: requestId,
+        ...(receipt.turnTiming ? { turnTiming: receipt.turnTiming } : {}),
+        ...(receipt.interruptTransport ? { interruptTransport: receipt.interruptTransport } : {}),
+        ...(receipt.upstreamSent ? { upstreamSent: receipt.upstreamSent } : {}),
+        ...(receipt.upstreamError ? { upstreamError: receipt.upstreamError } : {}),
+        ...(receipt.modelsEtag ? { modelsEtag: receipt.modelsEtag } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        nodeTiming: nodeTimingMeta(),
         ...nativeMetadata(),
       })
       return classifyManagedQueueRejection(result, managedCrag)
@@ -1302,13 +1878,14 @@ async function streamGoWorkerRaw({
         deliveryMode,
         onEvent,
         isCommitEvent: isDownstreamCommitEvent,
-        onCommit: () => {
+        onCommit: (commitHeaders) => {
           committed = true
-          onCommit?.()
+          onCommit?.(mergeRateLimitHeaders(publicHeaders({ ...headers, ...(commitHeaders || {}) })))
         },
         onObserve: (event) => {
           timing.observe(event)
           if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
+          if (event.type === 'message_stop') stopCancel()
         },
         onProviderResult: (result) => {
           // Freeze the already-observed generation window at the native stop;
@@ -1337,21 +1914,31 @@ async function streamGoWorkerRaw({
           }
         },
       })
+      stopCancel()
       const body = received.body
       const failed = body?.type === 'error' || !!body?.error
       const trailers = publicHeaders(response.trailers)
+      const status = failed ? nativeErrorStatus(handoff, body, { strictPassthrough }) : response.statusCode
       return {
         ok: !failed,
-        status: failed ? nativeErrorStatus(handoff, body) : response.statusCode,
+        status,
         upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body,
-        headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
+        headers: mergeProviderHeaders(
+          mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
+          handoff?.providerResult?.response_headers,
+        ),
+        hopRequestId: requestId,
         ...nativeMetadata(),
         ...timing.snapshot(),
         sawMessageStop: received.sawMessageStop,
         committed,
-        terminalState: failed ? 'incomplete' : 'verified',
+        terminalState: failed
+          ? strictPassthrough && !committed && status >= 400
+            ? 'rejected'
+            : 'incomplete'
+          : 'verified',
         transportError: false,
         threadBetas: prepared.thread,
       }
@@ -1364,7 +1951,7 @@ async function streamGoWorkerRaw({
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
-    const codexResponses = requestPath === '/internal/v1/codex/responses'
+    let firstSeenEventType = null
     let responsesId = null
     let responsesTerminal = null
     const assembler = createClaudeMessageAssembler()
@@ -1378,10 +1965,18 @@ async function streamGoWorkerRaw({
         return null
       }
     }
-    const flushCommit = async () => {
+    const flushCommit = async (triggerEvent = null) => {
       if (committed) return
       committed = true
-      if (typeof onCommit === 'function') onCommit()
+      if (firstReleaseType == null) {
+        firstReleaseType = typeof triggerEvent?.type === 'string' && triggerEvent.type ? triggerEvent.type : null
+      }
+      if (clientFirstWriteSourceType == null) {
+        clientFirstWriteSourceType =
+          firstSeenEventType || (typeof triggerEvent?.type === 'string' && triggerEvent.type ? triggerEvent.type : null)
+      }
+      if (typeof onCommit === 'function')
+        onCommit(mergeRateLimitHeaders(publicHeaders({ ...sseRateHeaders, ...headers })))
       if (onEvent) {
         for (const queued of pendingLines) await onEvent(queued)
       }
@@ -1396,7 +1991,14 @@ async function streamGoWorkerRaw({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
+      if (firstSeenEventType == null && typeof event.type === 'string' && event.type) {
+        firstSeenEventType = event.type
+      }
+      const hadToken = timing.snapshot().firstTokenAt != null
       timing.observe(event, receivedAt)
+      if (!hadToken && timing.snapshot().firstTokenAt != null && typeof event.type === 'string' && event.type) {
+        firstGeneratedEventType = event.type
+      }
       if (claudeMessages && isClaudeSlotOAuthError(event)) {
         lastError = slotOAuthUnavailable().body
         return lastError
@@ -1421,10 +2023,15 @@ async function streamGoWorkerRaw({
       }
       if (codexResponses && event.response && typeof event.response === 'object' && !Array.isArray(event.response)) {
         if (typeof event.response.id === 'string') responsesId = event.response.id
-        if (['response.completed', 'response.done', 'response.incomplete'].includes(event.type))
+        if (['response.completed', 'response.done', 'response.incomplete'].includes(event.type)) {
           responsesTerminal = event
+          stopCancel()
+        }
       }
-      if (event.type === 'message_stop') sawMessageStop = true
+      if (event.type === 'message_stop') {
+        sawMessageStop = true
+        stopCancel()
+      }
       if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
@@ -1464,10 +2071,11 @@ async function streamGoWorkerRaw({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
+      const decoder = new StringDecoder('utf8')
       const sseRestorer = prepared.redaction ? createSseRestorer(prepared.redaction) : null
       for await (const chunk of response) {
         receivedAt = Date.now()
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+        buffer += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           let line = buffer.slice(0, newline).replace(/\r$/, '')
@@ -1513,24 +2121,26 @@ async function streamGoWorkerRaw({
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               const event = observeSseEvent(takeSseEvent())
               line = publicSseLine(line, event)
-              if (shouldCommit(event)) await flushCommit()
+              if (shouldCommit(event)) await flushCommit(event)
             }
           } else if (line === '') {
             if (dataBuf) {
               const event = takeSseEvent()
               dataBuf = ''
               observeSseEvent(event)
-              if (shouldCommit(event)) await flushCommit()
+              if (shouldCommit(event)) await flushCommit(event)
             }
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
             dataBuf = `${dataBuf}\n${line}`
             const event = observeSseEvent(takeSseEvent())
-            if (shouldCommit(event)) await flushCommit()
+            if (shouldCommit(event)) await flushCommit(event)
           }
           await emitLine(line)
         }
         if (sawChunk && !outboundHeadersFrame && buffer) lastChunkAt = Date.now()
       }
+      stopCancel()
+      buffer += decoder.end()
       if (buffer && !outboundHeadersFrame) {
         applyClaudeSSELineToMessage(buffer, assembler)
         if (buffer.startsWith('data:')) {
@@ -1539,15 +2149,17 @@ async function streamGoWorkerRaw({
             dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
             const event = observeSseEvent(takeSseEvent())
             buffer = publicSseLine(buffer, event)
-            if (shouldCommit(event)) await flushCommit()
+            if (shouldCommit(event)) await flushCommit(event)
           }
         }
         await emitLine(buffer)
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
-        if (shouldCommit(event)) await flushCommit()
+        if (shouldCommit(event)) await flushCommit(event)
       }
+      const receipt = codexReceiptFromHeaders(response.headers, response.trailers)
+      observedReceipt = receipt
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       handoff?.observeHeaders(response.trailers)
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
@@ -1579,9 +2191,12 @@ async function streamGoWorkerRaw({
         (codexResponses
           ? !!responsesTerminal
           : isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop }))
-      if (!committed && complete) await flushCommit()
+      if (!committed && complete) await flushCommit(responsesTerminal || null)
       const terminalState = complete && !incomplete ? 'verified' : 'incomplete'
-      const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
+      const rateHeaders = mergeProviderHeaders(
+        mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers }),
+        handoff?.providerResult?.response_headers,
+      )
       const responseBody = lastError ||
         responsesTerminal?.response ||
         assembled || { type: 'message', role: 'assistant', content: [] }
@@ -1592,7 +2207,7 @@ async function streamGoWorkerRaw({
         ok: response.statusCode === 200 && !lastError && complete,
         status:
           lastError && handoff?.providerResult
-            ? nativeErrorStatus(handoff, lastError)
+            ? nativeErrorStatus(handoff, lastError, { strictPassthrough })
             : nativeTimeout && !committed
               ? 504
               : response.statusCode || 0,
@@ -1615,6 +2230,14 @@ async function streamGoWorkerRaw({
         clusterDeliveryUnconfirmed: clusterSlot && !complete && !sawMessageStop && !lastError,
         transportError: false,
         threadBetas: prepared.thread,
+        hopRequestId: requestId,
+        ...(receipt.turnTiming ? { turnTiming: receipt.turnTiming } : {}),
+        ...(receipt.interruptTransport ? { interruptTransport: receipt.interruptTransport } : {}),
+        ...(receipt.upstreamSent ? { upstreamSent: receipt.upstreamSent } : {}),
+        ...(receipt.upstreamError ? { upstreamError: receipt.upstreamError } : {}),
+        ...(receipt.modelsEtag ? { modelsEtag: receipt.modelsEtag } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        nodeTiming: nodeTimingMeta(),
         ...nativeMetadata(),
       })
     } finally {
@@ -1622,14 +2245,26 @@ async function streamGoWorkerRaw({
     }
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return { ...blocked, ...timing.snapshot(), committed, ...nativeMetadata() }
-    if (error.code === 'invalid_kernel_request')
-      return { ...invalidKernelResult(error), ...timing.snapshot(), committed, ...nativeMetadata() }
-    if (signal?.aborted) {
+    if (blocked) return { ...blocked, ...timing.snapshot(), committed, hopRequestId: requestId, ...nativeMetadata() }
+    if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
+      return {
+        ...invalidKernelResult(error),
+        ...timing.snapshot(),
+        committed,
+        hopRequestId: requestId,
+        ...nativeMetadata(),
+      }
+    if (hopSignal.signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
         ...timing.snapshot(),
         committed,
+        hopRequestId: requestId,
+        ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+        ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+        ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        nodeTiming: nodeTimingMeta(),
         ...nativeMetadata(),
       })
     }
@@ -1656,6 +2291,12 @@ async function streamGoWorkerRaw({
       },
       headers: observedHeaders,
       clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
+      hopRequestId: requestId,
+      ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+      ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+      ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+      ...(packedMeta ? { udsPacked: packedMeta } : {}),
+      nodeTiming: nodeTimingMeta(),
       ...nativeMetadata(),
       ...timing.snapshot(),
       committed,
@@ -1665,7 +2306,10 @@ async function streamGoWorkerRaw({
           : error.status === 413
             ? 'rejected'
             : 'transport_error',
-      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
+      transportError:
+        observedReceipt.upstreamSent !== 'unknown' &&
+        error.status !== 413 &&
+        !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
@@ -1733,17 +2377,22 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal, requireInte
 }
 
 /**
- * Relink a local slot's `.credentials.json` onto credentials.json. A regular file
- * left by the CLI's write-then-rename is adopted first when it holds the later
- * grant, so the refresh token the CLI already rotated to is the one kept.
+ * Relink a local slot's `.credentials.json` onto the panel's authoritative
+ * `credentials.json`. Under Panel SSOT a slot-written regular `.credentials.json`
+ * is never adopted over the panel store.
  */
 export function repairLocalCredentialLink(homeDir) {
   if (!homeDir) return Promise.resolve({ linked: false, error: 'home missing' })
-  return withCredentialRefreshLock(String(homeDir), async () => relinkKeepingRotation(homeDir))
+  return withCredentialRefreshLock(String(homeDir), async () => relinkPanelCredential(homeDir))
 }
 
-function relinkKeepingRotation(homeDir) {
-  return ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: 'rotation' })
+function relinkPanelCredential(homeDir) {
+  return ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: false })
+}
+
+/** Whether the control plane's `bin/kin-worker` keeps the refresh attempt journal (no token, no network). */
+export function probeWorkerAttemptGuard(exec, opts = {}) {
+  return probeAttemptGuard(exec, opts)
 }
 
 export async function ensureWorkerCredential(exec, { force = false, skewMs = REFRESH_SKEW_MS } = {}) {
@@ -1760,8 +2409,8 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
     }
   }
 
-  // Adopt a later CLI grant: dropping it and refreshing the older RT revokes the grant.
-  if (exec?.homeDir) relinkKeepingRotation(exec.homeDir)
+  // Keep the local `.credentials.json` alias pointed at panel `credentials.json` without ever adopting CLI writes.
+  if (exec?.homeDir) relinkPanelCredential(exec.homeDir)
   const credential = readWorkerCredentialFile(exec.homeDir)
   if (!credential) {
     return {
@@ -1788,7 +2437,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
   const snapshotRefresh = String(credential.refresh_token || '')
   const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
   return withCredentialRefreshLock(lockKey, async () => {
-    if (exec?.homeDir) relinkKeepingRotation(exec.homeDir)
+    if (exec?.homeDir) relinkPanelCredential(exec.homeDir)
     const live = readWorkerCredentialFile(exec.homeDir) || credential
     const liveRefresh = String(live?.refresh_token || '')
     if (snapshotRefresh && liveRefresh && snapshotRefresh !== liveRefresh) {
@@ -1810,7 +2459,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
         credential: credentialSummary(live, liveNow),
       }
     }
-    // The slot oauth helper only refreshes inside its own 5-minute window; an early
+    // The panel worker only refreshes inside its own 5-minute window; an early
     // scheduled refresh has to force it.
     const result = await runSlotOauth(exec, 'refresh', { force: !!force || skewMs > REFRESH_SKEW_MS })
     const body = result?.body || {}
@@ -1822,6 +2471,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
       refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
       credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
       error: result?.ok ? undefined : body.error,
+      attempt_guard: result?.attempt_guard,
     }
     if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
     return mapped
@@ -1838,7 +2488,6 @@ export function credentialSummary(credential, now = Date.now()) {
     mode: credential.mode || credential.type || null,
     account_uuid: credential.account_uuid || null,
     org_uuid: credential.org_uuid || null,
-    email: credential.email || null,
     scope: credential.scope || null,
     auth_scheme: credential.auth_scheme || null,
     has_access: credential.has_access ?? !!(credential.access_token || credential.api_key),
@@ -1857,8 +2506,10 @@ export async function importWorkerCredential(exec, credential, { timeoutMs = 600
   return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
     try {
       if (!writeWorkerCredentialFile(exec.homeDir, credential)) throw new Error('credential_required')
-      // Import is the one case where the control plane's credential replaces the slot's copy.
-      await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
+      // Panel SSOT: one-way project the imported credential down to the slot.
+      const host = slotHost(exec.vm)
+      const push = host.syncCredentials || host.onImport
+      if (typeof push === 'function') await push(exec.vm, path.dirname(exec.homeDir))
     } catch (error) {
       return {
         ok: false,
@@ -1912,24 +2563,21 @@ async function reconcileClaudeClientCredentials(
     try {
       if (!exec.homeDir) return clientCredentialRequired()
       const slotDir = path.dirname(exec.homeDir)
-      const repairRemoteLink = async () => {
-        if (host.kind === 'node' && !(await ensureRemoteLink(exec.vm, slotDir))?.linked) {
-          throw new Error('remote_link_failed')
-        }
-      }
       const repairLocalLink = () => {
-        // A loose native alias is never a panel import source.
-        if (!ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false }).linked) {
+        // Panel SSOT: a loose native alias is never adopted over panel credentials.json.
+        if (
+          !ensureOfficialCredentialLink(exec.homeDir, { ...slotUidGidFromHomeDir(exec.homeDir), adoptOfficial: false })
+            .linked
+        ) {
           throw new Error('credential_link_failed')
         }
       }
-      if (host.kind === 'node') {
-        const pulled = await host.afterRefresh(exec.vm, slotDir)
-        if (pulled?.reason === 'remote_missing') {
-          if (refreshInSlot) return clientCredentialRequired()
-          throw new Error('remote_missing')
+      const projectToSlot = async () => {
+        const push = host.syncCredentials || host.onImport
+        if (typeof push === 'function') await push(exec.vm, slotDir)
+        if (host.kind === 'node' && !(await ensureRemoteLink(exec.vm, slotDir))?.linked) {
+          throw new Error('remote_link_failed')
         }
-        await repairRemoteLink()
       }
       const credential = readWorkerCredentialFile(exec.homeDir)
       const mode = credential?.type || credential?.mode
@@ -1937,32 +2585,40 @@ async function reconcileClaudeClientCredentials(
       const hasAccess = hasAccessPresence(credential || {})
       const hasRefresh = hasRefreshPresence(credential || {})
       if (!hasAccess && !(refreshInSlot && refreshable && hasRefresh)) return clientCredentialRequired()
+      stripWorkerCredentialEmail(exec.homeDir)
       repairLocalLink()
-      if (!refreshInSlot) return { ok: true, synced: true, credential: credentialSummary(credential) }
+      if (!refreshInSlot) {
+        await projectToSlot()
+        return {
+          ok: true,
+          synced: true,
+          credential: credentialSummary(readWorkerCredentialFile(exec.homeDir) || credential),
+        }
+      }
 
-      let live = credential
+      let live = readWorkerCredentialFile(exec.homeDir) || credential
       let refreshed = false
-      if (refreshable && (!hasAccess || needsRefresh(credential.expires_at))) {
+      if (refreshable && (!hasAccess || needsRefresh(live.expires_at))) {
         if (!hasRefresh) return staleClientCredential({ error: { code: 'refresh_token_missing' } })
         let result
         try {
-          // This already holds the same lock as imports and worker refreshes.
+          // This already holds the same lock as imports and panel refreshes.
           result = await refreshInSlot(exec, 'refresh', { force: false })
         } catch {
           return staleClientCredential()
         }
         if (!result?.ok) return staleClientCredential({ error: result?.body?.error })
-        // Slot refresh also pulls the remote file back. Verify persisted expiry,
-        // not the subprocess's reported expiry, before admitting the client.
+        stripWorkerCredentialEmail(exec.homeDir)
         live = readWorkerCredentialFile(exec.homeDir)
         if (!live || !hasAccessPresence(live) || needsRefresh(live.expires_at)) return staleClientCredential()
-        await repairRemoteLink()
         repairLocalLink()
         refreshed = !!result.body?.refreshed
       } else if (!refreshable && !isApiKeyMode(mode)) {
-        const expiry = expiresAtToMs(credential.expires_at)
+        const expiry = expiresAtToMs(live.expires_at)
         if (expiry && expiry <= Date.now()) return staleClientCredential({ error: { code: 'refresh_token_missing' } })
       }
+      // One-way project the panel's authoritative credential down to the slot before admitting the client.
+      await projectToSlot()
       return {
         ok: true,
         status: 200,
@@ -2129,6 +2785,73 @@ export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs
   return runSlotOauth(exec, 'count-tokens', { body, headers, timeoutMs })
 }
 
+/**
+ * Route POST /v1/messages/count_tokens directly through the slot's Rust/CRAG
+ * `kernel.sock` (`POST /internal/v1/messages/count_tokens`), forwarding official
+ * upstream response headers and error envelopes cleanly across OAuth, Setup
+ * Token, and API Key slots.
+ */
+export async function countTokensViaKernel(exec, { body, headers = {}, timeoutMs = 45000, signal } = {}) {
+  if (isCrsMock()) {
+    return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'rust-kernel-mock' }
+  }
+  const base = workerPaths(exec)
+  const kernelSocket =
+    exec?.vm?.runtime?.kernel_socket || (base.runDir ? path.join(base.runDir, 'kernel.sock') : base.socketPath)
+  const kernelExec = {
+    ...exec,
+    vm: {
+      ...(exec?.vm || {}),
+      runtime: {
+        ...(exec?.vm?.runtime || {}),
+        worker_socket: kernelSocket,
+        worker_token_file: base.tokenPath,
+        worker_run_dir: base.runDir,
+      },
+    },
+  }
+  const outboundBody = rectifyCrag321Request(body, { strictPassthrough: true, countTokens: true })
+  try {
+    const response = await workerRequest(kernelExec, {
+      method: 'POST',
+      requestPath: '/internal/v1/messages/count_tokens',
+      body: outboundBody,
+      headers,
+      timeoutMs,
+      signal,
+      maxRequestBytes: MAX_BODY,
+    })
+    const data = await readAll(response)
+    const parsed = parseJson(data, response.statusCode)
+    const responseHeaders = mergeRateLimitHeaders(publicHeaders(response.headers))
+    const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error' && !parsed?.error
+    return {
+      ok,
+      status: response.statusCode || 0,
+      body: parsed,
+      headers: responseHeaders,
+      via: 'rust-kernel',
+    }
+  } catch (error) {
+    if (signal?.aborted) return clientCancelledResult({ via: 'rust-kernel' })
+    return {
+      ok: false,
+      status: error.status === 413 ? 413 : 0,
+      body: {
+        type: 'error',
+        error: {
+          type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
+          code: error.code || 'worker_transport_error',
+          message: String(error.message || error).slice(0, 300),
+        },
+      },
+      headers: {},
+      via: 'rust-kernel',
+      transportError: error.status !== 413,
+    }
+  }
+}
+
 export const EMPTY_CONTENT_VERDICT = 'native request completed without response content'
 
 export function isRecoverableThinkingOnly(result) {
@@ -2189,7 +2912,11 @@ function trackDownstreamEvents(onEvent) {
  * sent; with one, `downstream` says what was sent and only the missing
  * block stops and terminal frames are appended.
  */
-export function recoverThinkingOnlyMaxTokens(result, { onEvent, onCommit, downstream = null } = {}) {
+export function recoverThinkingOnlyMaxTokens(
+  result,
+  { onEvent, onCommit, downstream = null, strictPassthrough = false } = {},
+) {
+  if (strictPassthrough === true) return result
   const facts = result?.providerResult
   const writer = typeof onEvent === 'function'
   if (!isRecoverableThinkingOnly(result) || (result.committed && writer && (!downstream || downstream.terminal)))
@@ -2250,15 +2977,20 @@ export function recoverThinkingOnlyMaxTokens(result, { onEvent, onCommit, downst
 }
 
 export async function callGoWorker(opts = {}) {
-  const result = restoreInferenceFailure(await callGoWorkerRaw(opts), opts.requestPath)
-  return recoverThinkingOnlyMaxTokens(result, {})
+  const strictPassthrough = opts.strictPassthrough === true
+  const result = restoreInferenceFailure(await callGoWorkerRaw(opts), opts.requestPath, { strictPassthrough })
+  return strictPassthrough ? result : recoverThinkingOnlyMaxTokens(result, {})
 }
 
 export async function streamGoWorker(opts = {}) {
+  const strictPassthrough = opts.strictPassthrough === true
   const tracked = trackDownstreamEvents(opts.onEvent)
   const result = restoreInferenceFailure(
     await streamGoWorkerRaw({ ...opts, onEvent: tracked.onEvent }),
     opts.requestPath,
+    { strictPassthrough },
   )
-  return recoverThinkingOnlyMaxTokens(result, { ...opts, onEvent: opts.onEvent, downstream: tracked.state })
+  return strictPassthrough
+    ? result
+    : recoverThinkingOnlyMaxTokens(result, { ...opts, onEvent: opts.onEvent, downstream: tracked.state })
 }

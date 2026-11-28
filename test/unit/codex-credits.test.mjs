@@ -6,7 +6,12 @@ import path from 'node:path'
 import { handleCodexProtocol } from '../../src/lib/protocol/handle-codex.mjs'
 import { getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { persistCodexQuotaSnapshot } from '../../src/lib/vm/codex-slot.mjs'
-import { queryOpenaiQuota, CHATGPT_USAGE_URL, CHATGPT_RESET_CREDITS_URL } from '../../src/lib/oauth/openai-quota.mjs'
+import {
+  queryOpenaiQuota,
+  resetStaleCodexCreditsRefreshState,
+  CHATGPT_USAGE_URL,
+  CHATGPT_RESET_CREDITS_URL,
+} from '../../src/lib/oauth/openai-quota.mjs'
 import {
   CODEX_CREDITS_TTL_MS,
   codexCreditsFromHeaders,
@@ -22,8 +27,12 @@ import {
 } from '../../src/lib/pool/codex-slot-pool.mjs'
 import { evaluateOpenAIQuotaGate } from '../../src/lib/pool/openai-quota-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
-beforeEach(() => resetOpenAIAccountRuntime())
+beforeEach(() => {
+  resetOpenAIAccountRuntime()
+  resetStaleCodexCreditsRefreshState()
+})
 
 const NOW = Date.parse('2026-10-17T12:00:00Z')
 const WEEK_RESET = new Date(NOW + 3 * 86_400_000).toISOString()
@@ -78,6 +87,25 @@ function fixture(t, codex = {}) {
 }
 
 async function hop(root, { status = 200, headers = {}, code = 'usage_limit_reached' } = {}) {
+  let seq = 0
+  const mockRuntime = {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      if (excluded.has('codex_vm:vm-a')) {
+        throw new SchedulerApiError({ status: 503, code: 'pool_exhausted', message: 'exhausted' })
+      }
+      return {
+        lease_id: `credits-lease-${++seq}`,
+        lease_ttl_ms: 30_000,
+        selected_node: { node_type: 'codex_vm', node_id: 'vm-a', node_key: 'codex_vm:vm-a' },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
   await handleCodexProtocol({
     req: { headers: {}, apiKeyKind: 'user' },
     res: { headersSent: false, write() {}, end() {} },
@@ -90,6 +118,7 @@ async function hop(root, { status = 200, headers = {}, code = 'usage_limit_reach
     writeSSEHeaders() {},
     routing: {},
     projectRoot: root,
+    schedulerRuntime: mockRuntime,
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),

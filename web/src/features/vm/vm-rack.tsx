@@ -11,14 +11,16 @@ import { VmBlade, type RackSize } from '@/features/vm/vm-rack-blade'
 import {
   buildRacks,
   rackTotals,
+  GEMINI_EVIDENCE_ZONES,
   type Rack,
   type VmZoneFilter,
 } from '@/features/vm/vm-rack-model'
 import { VmUnit } from '@/features/vm/vm-rack-unit'
 
-/** 机架头的构成条按六档细分（吊销与无效分开着色），分区段落才合并。 */
+/** 机架头保留细分的凭证状态，分区段落才合并。 */
 const GROUP_SWATCH: { key: FleetGroup; label: string; color: string }[] = [
   { key: 'pool', label: '在池', color: 'var(--status-ok-solid)' },
+  ...GEMINI_EVIDENCE_ZONES,
   { key: 'restricted', label: '受限', color: 'var(--status-warn-solid)' },
   { key: 'off', label: '关闭调用', color: 'var(--status-none)' },
   {
@@ -96,7 +98,7 @@ function RackHeader({
       <dl className='m-0 flex gap-5 md:col-span-2 xl:col-span-1'>
         {t.seatsMax > 0 ? (
           <div className='grid min-w-16 gap-0.5'>
-            <dt className='text-[11.5px] text-muted-foreground'>席位</dt>
+            <dt className='text-[11.5px] text-muted-foreground'>执行位</dt>
             <dd className='m-0 text-[15px] font-[620] tracking-[-0.015em] tabular-nums'>
               {t.seatsUsed}/{t.seatsMax}
             </dd>

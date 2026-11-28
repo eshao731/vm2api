@@ -1,5 +1,5 @@
 /**
- * SQLite-backed request logs for access, usage, and billing.
+ * Database-backed request logs (PostgreSQL / SQLite) for access, usage, and billing.
  *
  * Modes:
  *   off    — no writes
@@ -18,13 +18,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
-import { resolveStoreDb } from '../db/database.mjs'
+import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../core/errors.mjs'
+import { getDb, getPgPool, isDbOpen, resolveStoreDb, withSavepoint } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
+import { getPgLogWriter, runRetentionCleanupAsync } from '../db/pg/pg-log-writer.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
-import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
+import { advisorUsageFromIterations, costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
 import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
-import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
+import { REASONING_EFFORTS, modelMismatch, sessionIdForLog } from '../protocol/log-fields.mjs'
 
 /** Persist the token a client actually sent — only for failed ingress auth. */
 export function presentedApiKeyForLog(token) {
@@ -35,10 +38,72 @@ export function presentedApiKeyForLog(token) {
 
 const MODES = new Set(['off', 'normal', 'debug'])
 
+export const LOGGING_RETAIN_DAYS_MIN = 1
+export const LOGGING_RETAIN_DAYS_MAX = 90
+export const LOGGING_MAX_MB_MIN = 0
+export const LOGGING_MAX_MB_MAX = 102400
+
 const DEFAULT_RETAIN_DAYS = 7
 const DEFAULT_DEBUG_RETAIN_DAYS = 3
 const DEFAULT_MAX_MB = 2048
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000
+const PG_TOTAL_ROWS_CACHE_TTL_MS = 30_000
+const SQLITE_TOTAL_ROWS_CACHE_TTL_MS = 5_000
+const INFLIGHT_COUNT_CACHE_TTL_MS = 2_000
+const CLEANUP_INVALIDATE_NAMESPACES = ['stats', 'overview', 'panel', 'filter-options', 'active-sessions']
+
+function loggingValidationError(message) {
+  const error = new TypeError(message)
+  error.code = 'invalid_logging_config'
+  return error
+}
+
+function parseStrictBoundedInt(raw, min, max, field) {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < min || raw > max) {
+    throw loggingValidationError(`${field} 必须是 ${min}–${max} 的整数`)
+  }
+  return raw
+}
+
+/** PUT /api/panel/routing strict check for logging retention and debug payload bounds. */
+export function validateLoggingRoutingPatch(body = {}, currentLogging = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return
+  if (!Object.prototype.hasOwnProperty.call(body, 'logging')) return
+  const logging = body.logging
+  if (!logging || typeof logging !== 'object' || Array.isArray(logging)) {
+    throw loggingValidationError('logging 必须是对象')
+  }
+  if (Object.prototype.hasOwnProperty.call(logging, 'mode')) {
+    if (typeof logging.mode !== 'string' || !MODES.has(logging.mode.trim().toLowerCase())) {
+      throw loggingValidationError('logging.mode 必须是 off / normal / debug')
+    }
+  }
+  const hasRetain = Object.prototype.hasOwnProperty.call(logging, 'retain_days')
+  const hasDebugRetain = Object.prototype.hasOwnProperty.call(logging, 'debug_retain_days')
+  const current = normalizeLoggingConfig(currentLogging || {})
+  const retainDays = hasRetain
+    ? parseStrictBoundedInt(
+        logging.retain_days,
+        LOGGING_RETAIN_DAYS_MIN,
+        LOGGING_RETAIN_DAYS_MAX,
+        'logging.retain_days',
+      )
+    : current.retain_days
+  const debugRetainDays = hasDebugRetain
+    ? parseStrictBoundedInt(
+        logging.debug_retain_days,
+        LOGGING_RETAIN_DAYS_MIN,
+        LOGGING_RETAIN_DAYS_MAX,
+        'logging.debug_retain_days',
+      )
+    : current.debug_retain_days
+  if ((hasRetain || hasDebugRetain) && debugRetainDays > retainDays) {
+    throw loggingValidationError('logging.debug_retain_days 不能大于 logging.retain_days')
+  }
+  if (Object.prototype.hasOwnProperty.call(logging, 'max_mb')) {
+    parseStrictBoundedInt(logging.max_mb, LOGGING_MAX_MB_MIN, LOGGING_MAX_MB_MAX, 'logging.max_mb')
+  }
+}
 
 function clampInt(value, min, max, fallback) {
   if (value == null || value === '') return fallback
@@ -107,6 +172,15 @@ function summarizeTools(tools) {
       for (const member of members) visit(member)
       return
     }
+    const geminiDecls = Array.isArray(tool.functionDeclarations)
+      ? tool.functionDeclarations
+      : Array.isArray(tool.function_declarations)
+        ? tool.function_declarations
+        : null
+    if (geminiDecls) {
+      functions += geminiDecls.length
+      return
+    }
     if (type === 'function' || type === 'custom' || (!type && typeof tool.name === 'string')) functions += 1
   }
   for (const tool of tools) visit(tool)
@@ -119,28 +193,57 @@ function summarizeTools(tools) {
   return { count: tools.length, functions, bytes, deferred, search }
 }
 
+function systemInstructionLen(value) {
+  if (typeof value === 'string') return value.length
+  if (Array.isArray(value)) {
+    return value.reduce((n, b) => n + (typeof b === 'string' ? b.length : (b?.text || '').length), 0)
+  }
+  if (value && typeof value === 'object' && Array.isArray(value.parts)) {
+    return value.parts.reduce((n, p) => n + (typeof p?.text === 'string' ? p.text.length : 0), 0)
+  }
+  return 0
+}
+
 function summarizeBody(body) {
   if (!body || typeof body !== 'object') return { empty: true }
-  const messages = Array.isArray(body.messages) ? body.messages : null
+  const messages = Array.isArray(body.messages) ? body.messages : Array.isArray(body.contents) ? body.contents : null
   const roles = messages ? messages.map((m) => m?.role).filter(Boolean) : []
   const toolStats = summarizeTools(body.tools)
-  let systemLen = 0
-  if (typeof body.system === 'string') systemLen = body.system.length
-  else if (Array.isArray(body.system)) {
-    systemLen = body.system.reduce((n, b) => n + (typeof b === 'string' ? b.length : (b?.text || '').length), 0)
-  }
+  const gc = body.generationConfig ?? body.generation_config
+  const systemLen =
+    systemInstructionLen(body.system) ||
+    systemInstructionLen(body.systemInstruction ?? body.system_instruction) ||
+    systemInstructionLen(body.instructions)
+  const hasThinking =
+    body.thinking != null ||
+    body.reasoning != null ||
+    body.reasoning_effort != null ||
+    gc?.thinkingConfig != null ||
+    gc?.thinking_config != null
   return {
     model: body.model || null,
     stream: !!body.stream,
-    max_tokens: body.max_tokens ?? body.max_output_tokens ?? null,
-    messages_count: messages ? messages.length : body.input != null ? 1 : 0,
+    max_tokens:
+      body.max_tokens ??
+      body.max_output_tokens ??
+      body.max_completion_tokens ??
+      gc?.maxOutputTokens ??
+      gc?.max_output_tokens ??
+      null,
+    messages_count: messages
+      ? messages.length
+      : Array.isArray(body.input)
+        ? body.input.length
+        : body.input != null
+          ? 1
+          : 0,
     roles,
     tools_count: Array.isArray(body.tools) ? body.tools.length : 0,
     tool_functions_count: toolStats.functions,
     tools_bytes: toolStats.bytes,
     tools_deferred_count: toolStats.deferred,
     tools_search_declared: toolStats.search,
-    has_thinking: body.thinking != null,
+    has_thinking: hasThinking,
     system_len: systemLen,
     top_level_keys: Object.keys(body).sort(),
   }
@@ -187,6 +290,7 @@ const PRICED_COLUMN_KEYS = [
   'cache_creation_cost',
   'web_search_cost',
   'image_cost',
+  'advisor_cost',
   'total_cost',
   'pricing_model',
   'price_source',
@@ -217,6 +321,7 @@ function costColumnsForLog(usage, model, extra = {}) {
     cache_creation_cost: priced.cache_creation_cost ?? null,
     web_search_cost: priced.web_search_cost ?? null,
     image_cost: priced.image_cost ?? null,
+    advisor_cost: priced.advisor_cost ?? null,
     total_cost: priced.total_cost ?? null,
     pricing_model: priced.pricing_model ?? null,
     price_source: priced.price_source ?? null,
@@ -227,24 +332,52 @@ function costColumnsForLog(usage, model, extra = {}) {
   }
 }
 
-/** Tri-state model mismatch: null = upstream did not declare a model. */
-function modelMismatch(requested, upstream) {
-  if (!requested || !upstream) return null
-  const norm = (m) =>
-    String(m)
-      .split('/')
-      .filter(Boolean)
-      .pop()
-      .replace(/\[1m\]$/i, '')
-      .toLowerCase()
-  return norm(requested) === norm(upstream) ? 0 : 1
+function appendCapturedHeader(target, rawKey, value) {
+  if (rawKey == null || value === undefined) return
+  const key = String(rawKey).trim().toLowerCase()
+  if (!key) return
+  if (Object.hasOwn(target, key)) {
+    const prev = target[key]
+    target[key] = Array.isArray(prev) ? [...prev, value] : [prev, value]
+  } else {
+    target[key] = value
+  }
+}
+
+function normalizeWriteHeadHeaders(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const out = {}
+  if (Array.isArray(raw)) {
+    if (raw.length > 0 && Array.isArray(raw[0])) {
+      for (const pair of raw) {
+        if (Array.isArray(pair) && pair.length >= 2) appendCapturedHeader(out, pair[0], pair[1])
+      }
+    } else {
+      for (let i = 0; i + 1 < raw.length; i += 2) {
+        appendCapturedHeader(out, raw[i], raw[i + 1])
+      }
+    }
+  } else {
+    for (const [k, v] of Object.entries(raw)) {
+      if (v === undefined) continue
+      const key = String(k).trim().toLowerCase()
+      if (key) out[key] = v
+    }
+  }
+  return Object.keys(out).length ? out : null
 }
 
 function redactHeaders(headers = {}) {
   const out = {}
   for (const [k, v] of Object.entries(headers)) {
     const key = String(k).toLowerCase()
-    if (key === 'authorization' || key === 'x-api-key' || key === 'cookie' || key === 'set-cookie') {
+    if (
+      key === 'authorization' ||
+      key === 'x-api-key' ||
+      key === 'x-goog-api-key' ||
+      key === 'cookie' ||
+      key === 'set-cookie'
+    ) {
       out[key] = '***REDACTED***'
     } else if (key === 'x-panel-token') {
       out[key] = '***REDACTED***'
@@ -428,6 +561,10 @@ export class RequestLogStore {
     debugRetainDays = Number(process.env.KIN_REQUEST_LOG_DEBUG_RETAIN_DAYS || DEFAULT_DEBUG_RETAIN_DAYS),
     maxMb = Number(process.env.KIN_REQUEST_LOG_MAX_MB || DEFAULT_MAX_MB),
     jsonlMirror = process.env.KIN_REQUEST_LOG_JSONL === '1',
+    cache = null,
+    pgLogWriter = null,
+    pgPool = null,
+    forceSyncWrite = false,
   } = {}) {
     this.dataDir = dataDir || path.join(process.cwd(), 'data')
     this.db = resolveStoreDb({ db, dataDir: this.dataDir })
@@ -442,9 +579,174 @@ export class RequestLogStore {
     this.maxMb = Number.isFinite(maxMb) && maxMb >= 0 ? maxMb : DEFAULT_MAX_MB
     this.jsonlMirror = !!jsonlMirror
     this.mutedErrorClasses = resolveMutedErrorClasses(null)
-    this._mem = [] // recent normal summaries for panel hot path
+    this._cache = cache
+    this._hasExplicitCache = cache != null
+    this._pgLogWriter = pgLogWriter
+    this._pgPool = pgPool
+    this._forceSyncWrite = !!forceSyncWrite
+    this._recentNormalCount = 0
     this._memMax = 200
+    this._totalRowsCache = { value: null, at: 0 }
+    this._totalRowsRefreshPromise = null
+    this._inflightCache = { value: null, at: 0 }
+    this._inflightRefreshPromise = null
     this._cleanupTimer = null
+    this._cleanupInFlight = null
+  }
+
+  _getCache() {
+    if (this._cache) return this._cache
+    try {
+      return getCacheRuntime()
+    } catch {
+      return null
+    }
+  }
+
+  _activePgLogWriter() {
+    if (this._forceSyncWrite) return null
+    if (this._pgLogWriter) {
+      return this._pgLogWriter.stats?.().closed ? null : this._pgLogWriter
+    }
+    if (this.db?.engine !== 'postgres') return null
+    const writer = getPgLogWriter()
+    return writer && !writer.stats?.().closed ? writer : null
+  }
+
+  _resolvePgPool() {
+    if (this._pgPool) return this._pgPool
+    if (this.db?.engine !== 'postgres') return null
+    return getPgPool()
+  }
+
+  _resolveVmOwner(vmId) {
+    if (!vmId) return null
+    const id = String(vmId)
+    const cache = this._getCache()
+    const entity = cache?.entity
+    const useCache =
+      entity &&
+      typeof entity.getVmOwnerSync === 'function' &&
+      (this.db?.engine === 'postgres' || this._hasExplicitCache || Boolean(cache?.client?.hasRedis))
+    if (useCache) {
+      return entity.getVmOwnerSync(id, () => this.repo.vmOwnerOf(id)) ?? null
+    }
+    return this.repo.vmOwnerOf(id) ?? null
+  }
+
+  _finishLive(requestId, completedSummary = null) {
+    if (!requestId) return
+    try {
+      const liveLogs = this._getCache()?.liveLogs
+      if (liveLogs && typeof liveLogs.finishRequest === 'function') {
+        Promise.resolve(liveLogs.finishRequest(requestId, completedSummary)).catch(() => {})
+      }
+    } catch {}
+  }
+
+  _buildDebugRecord(ctx, summary, extra) {
+    return {
+      ...summary,
+      headers: ctx.headers,
+      inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
+      request_body_snapshot:
+        !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
+      inbound_body:
+        !extra.classifier && extra.inbound_body != null ? clampBody(extra.inbound_body, this.maxDebugBodyChars) : null,
+      hop_meta: extra.hop_meta || null,
+      batch_member: extra.batch_member || null,
+      via: extra.via || extra.hop_meta?.via || null,
+      outbound_summary: extra.outbound_summary || null,
+      cache_prefix: extra.cache_prefix || null,
+      cache_continuity: extra.cache_continuity || null,
+      classifier: extra.classifier || null,
+      outbound_headers:
+        ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
+      outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
+      worker_envelope_headers:
+        ctx.capture_outbound && extra.worker_envelope_headers != null
+          ? redactHeaders(extra.worker_envelope_headers)
+          : null,
+      outbound_body:
+        ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
+          ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
+          : null,
+      outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
+      outbound_body_truncated: ctx.capture_outbound ? extra.outbound_body_truncated === true : false,
+      response: ctx.response ? debugResponse(ctx.response) : null,
+    }
+  }
+
+  _invalidateTotalRowsCache() {
+    this._totalRowsCache = { value: null, at: 0 }
+  }
+
+  _snapshotTotalRows() {
+    const now = Date.now()
+    if (this.db?.engine === 'postgres') {
+      if (this._totalRowsCache.value != null && now - this._totalRowsCache.at < PG_TOTAL_ROWS_CACHE_TTL_MS) {
+        return this._totalRowsCache.value
+      }
+      const pool = this._resolvePgPool()
+      if (pool && typeof pool.query === 'function' && !this._totalRowsRefreshPromise) {
+        this._totalRowsRefreshPromise = (async () => {
+          try {
+            const est = await pool.query(
+              "SELECT COALESCE(reltuples, -1)::bigint AS est FROM pg_class WHERE relname = 'usage_logs' LIMIT 1",
+            )
+            let count = Number(est?.rows?.[0]?.est ?? -1)
+            if (!Number.isFinite(count) || count < 0) {
+              const exact = await pool.query('SELECT COUNT(*)::bigint AS c FROM usage_logs')
+              count = Number(exact?.rows?.[0]?.c ?? 0)
+            }
+            this._totalRowsCache = { value: Math.max(0, Math.trunc(count)), at: Date.now() }
+          } catch {
+            // Preserve last known value on failure
+          } finally {
+            this._totalRowsRefreshPromise = null
+          }
+        })()
+      }
+      return this._totalRowsCache.value
+    }
+
+    const useSqliteCache = isDbOpen() && this.db === getDb()
+    if (
+      useSqliteCache &&
+      this._totalRowsCache.value != null &&
+      now - this._totalRowsCache.at < SQLITE_TOTAL_ROWS_CACHE_TTL_MS
+    ) {
+      return this._totalRowsCache.value
+    }
+    try {
+      const count = this.repo.count()
+      if (useSqliteCache) {
+        this._totalRowsCache = { value: count, at: now }
+      }
+      return count
+    } catch {
+      return null
+    }
+  }
+
+  _snapshotInflightCount() {
+    const liveLogs = this._getCache()?.liveLogs
+    if (!liveLogs) return 0
+    if (liveLogs.cache?.hasRedis && typeof liveLogs.getInflightCount === 'function') {
+      const now = Date.now()
+      if (!this._inflightRefreshPromise && now - this._inflightCache.at >= INFLIGHT_COUNT_CACHE_TTL_MS) {
+        this._inflightRefreshPromise = Promise.resolve(liveLogs.getInflightCount())
+          .then((n) => {
+            this._inflightCache = { value: Math.max(0, Number(n) || 0), at: Date.now() }
+          })
+          .catch(() => {})
+          .finally(() => {
+            this._inflightRefreshPromise = null
+          })
+      }
+      return this._inflightCache.value ?? liveLogs._localInflight?.size ?? 0
+    }
+    return liveLogs._localInflight?.size ?? 0
   }
 
   setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
@@ -473,37 +775,129 @@ export class RequestLogStore {
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
   reload() {
-    this._mem = []
+    this._recentNormalCount = 0
+    this._invalidateTotalRowsCache()
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new UsageLogsRepo(db)
-    this._mem = []
+    this._recentNormalCount = 0
+    this._invalidateTotalRowsCache()
   }
 
-  start(req, { protocol = null, pathName = null } = {}) {
+  start(
+    req,
+    {
+      protocol = null,
+      pathName = null,
+      model = null,
+      user_id = null,
+      owner_user_id = null,
+      api_key_id = null,
+      session_key = null,
+      session_id = null,
+      outbound_session_id = null,
+      vm_id = null,
+      account_id = null,
+      stream = null,
+      has_tools = null,
+      phase = 'routing',
+    } = {},
+  ) {
     const requestId = newRequestId(req)
     try {
       req.headers = req.headers || {}
     } catch {}
     const mode = resolveLogMode(this.mode, req)
-    return {
+    const t0 = Date.now()
+    const cleanPath = pathName || String(req?.url || '').split('?', 1)[0]
+    const method = req?.method || 'POST'
+    const ip = safeIp(req)
+    const userAgent = String(req?.headers?.['user-agent'] || '').slice(0, 512)
+    const ctx = {
       request_id: requestId,
       mode,
-      t0: Date.now(),
+      t0,
       protocol,
-      path: pathName || req.url || '',
-      method: req.method || 'POST',
-      ip: safeIp(req),
-      user_agent: String(req.headers?.['user-agent'] || '').slice(0, 512),
-      headers: mode === 'debug' ? redactHeaders(req.headers) : null,
+      // 兜底剥掉查询串：调用方都传 url.pathname，但 #1637 起 /v1beta/models 允许
+      // 用 ?key= 携带凭据，一旦有新调用点漏传 pathName，原始 req.url 会带着真 key
+      // 被 _appendJsonl 原样写进 request-logs（redactSecrets 只作用于 body）。
+      path: cleanPath,
+      method,
+      ip,
+      user_agent: userAgent,
+      headers: mode === 'debug' ? redactHeaders(req?.headers) : null,
       // Outbound bodies carry the gateway's rewrite (persona / overlay) and are
       // readable by the owning tenant; only the operator's configured mode may
       // enable them, never the caller's x-kin-debug / x-kin-log header.
       capture_outbound: this.mode === 'debug',
     }
+
+    if (mode !== 'off') {
+      try {
+        const liveLogs = this._getCache()?.liveLogs
+        if (liveLogs && typeof liveLogs.startRequest === 'function') {
+          const resolvedUserId = user_id ?? req?.apiKeyRecord?.user_id ?? null
+          const resolvedVmOwnerId = vm_id ? this._resolveVmOwner(vm_id) : null
+          const resolvedOwnerId = owner_user_id ?? resolvedUserId ?? resolvedVmOwnerId ?? null
+          const resolvedKeyId = api_key_id ?? req?.apiKeyRecord?.id ?? null
+          const resolvedSessionKey = session_key || session_id || outbound_session_id || null
+          Promise.resolve(
+            liveLogs.startRequest(requestId, {
+              request_id: requestId,
+              started_at: t0,
+              created_at: new Date(t0).toISOString(),
+              log_mode: mode,
+              method,
+              path: cleanPath,
+              endpoint: cleanPath,
+              protocol,
+              model: model || null,
+              requested_model: model || null,
+              stream: stream == null ? null : !!stream,
+              has_tools: has_tools == null ? null : !!has_tools,
+              user_id: resolvedUserId ?? null,
+              owner_user_id: resolvedOwnerId ?? null,
+              vm_owner_user_id: resolvedVmOwnerId ?? null,
+              api_key_id: resolvedKeyId ?? null,
+              session_key: resolvedSessionKey,
+              session_id: session_id ?? resolvedSessionKey ?? null,
+              outbound_session_id: outbound_session_id ?? null,
+              client_ip: ip || null,
+              ip_address: ip || null,
+              user_agent: userAgent || null,
+              vm_id: vm_id || null,
+              account_id: account_id || null,
+              phase,
+              attempt_count: 0,
+            }),
+          ).catch(() => {})
+        }
+      } catch {}
+    }
+
+    return ctx
+  }
+
+  /**
+   * Non-blocking phase/attempt/TTFT update for an in-flight request.
+   * Forwards to `LiveLogCache.updatePhase()` (microtask coalesced, zero PG write).
+   */
+  updatePhase(requestId, patch = {}) {
+    const id = typeof requestId === 'object' ? requestId?.request_id : requestId
+    if (!id || !patch || typeof patch !== 'object') return
+    try {
+      const liveLogs = this._getCache()?.liveLogs
+      if (liveLogs && typeof liveLogs.updatePhase === 'function') {
+        const enrichedPatch =
+          patch.vm_id && patch.vm_owner_user_id === undefined
+            ? { ...patch, vm_owner_user_id: this._resolveVmOwner(patch.vm_id) }
+            : patch
+        liveLogs.updatePhase(id, enrichedPatch)
+      }
+    } catch {}
   }
 
   /**
@@ -534,6 +928,23 @@ export class RequestLogStore {
       captured.body += text.slice(0, Math.max(0, room))
       captured.truncated = true
     }
+    let writeHeadStatus = null
+    let writeHeadHeaders = null
+    if (typeof res.writeHead === 'function') {
+      const writeHead = res.writeHead
+      res.writeHead = function tappedWriteHead(statusCode, statusMessage, headers) {
+        let rawHeaders = null
+        if (typeof statusMessage === 'string') rawHeaders = headers
+        else if (statusMessage != null) rawHeaders = statusMessage
+        else if (headers != null) rawHeaders = headers
+        const out = writeHead.apply(this, arguments)
+        const parsedStatus = Number(statusCode)
+        if (Number.isInteger(parsedStatus) && parsedStatus > 0) writeHeadStatus = parsedStatus
+        const normalized = normalizeWriteHeadHeaders(rawHeaders)
+        if (normalized) writeHeadHeaders = { ...(writeHeadHeaders || {}), ...normalized }
+        return out
+      }
+    }
     const write = res.write
     const end = res.end
     res.write = function tappedWrite(chunk, encoding, cb) {
@@ -545,9 +956,17 @@ export class RequestLogStore {
       return end.call(this, chunk, encoding, cb)
     }
     res.once('finish', () => {
-      captured.status = res.statusCode || null
+      captured.status = res.statusCode || writeHeadStatus || null
       try {
-        captured.headers = redactHeaders(res.getHeaders?.() || {})
+        const merged = {}
+        const fromSetHeader = res.getHeaders?.() || {}
+        for (const [k, v] of Object.entries(fromSetHeader)) {
+          if (v === undefined) continue
+          const key = String(k).trim().toLowerCase()
+          if (key) merged[key] = v
+        }
+        if (writeHeadHeaders) Object.assign(merged, writeHeadHeaders)
+        captured.headers = redactHeaders(merged)
       } catch {}
     })
   }
@@ -559,6 +978,49 @@ export class RequestLogStore {
   finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
+    if (extra.merge_into_request_id) {
+      this._finishLive(ctx.request_id, null)
+      const parentId = String(extra.merge_into_request_id).trim()
+      if (parentId) {
+        const continuation =
+          ctx.mode === 'debug'
+            ? {
+                request_id: ctx.request_id,
+                ts: new Date().toISOString(),
+                duration_ms,
+                ...(extra.tool_continuation && typeof extra.tool_continuation === 'object'
+                  ? extra.tool_continuation
+                  : {}),
+              }
+            : null
+        const persistMerge = () => {
+          try {
+            withSavepoint(this.repo.db, 'reqlog_merge', () => {
+              this.repo.mergeToolContinuation(parentId, { durationMs: duration_ms, continuation })
+            })
+          } catch {}
+        }
+        const pgWriter = this._activePgLogWriter()
+        if (pgWriter && pgWriter.pending() > 0) {
+          // Ensure parent row queued in PgLogWriter is flushed before merging continuation duration/debug.
+          Promise.resolve(pgWriter.flush())
+            .catch(() => {})
+            .finally(() => {
+              if (writeBehindArmed()) enqueueWrite(persistMerge)
+              else persistMerge()
+            })
+        } else if (writeBehindArmed()) {
+          enqueueWrite(persistMerge)
+        } else {
+          persistMerge()
+        }
+      }
+      return null
+    }
+    if (extra.skip_log) {
+      this._finishLive(ctx.request_id, null)
+      return null
+    }
     const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
     const breakdown = cacheCreationBreakdown(usage)
     const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)
@@ -580,6 +1042,11 @@ export class RequestLogStore {
       speed: extra.speed ?? usage.speed,
       requested_speed: extra.requested_speed ?? usage.requested_speed,
     }
+    const upstreamType = sanitizeErrorToken(extra.upstream_type ?? extra.error_details?.upstream_type, 128)
+    const errorDetails = sanitizeErrorDetailsForLog(extra.error_details, {
+      status: extra.status ?? null,
+      upstreamType,
+    })
     const summary = {
       id: 'log_' + crypto.randomBytes(6).toString('hex'),
       request_id: ctx.request_id,
@@ -593,9 +1060,11 @@ export class RequestLogStore {
       status: extra.status ?? null,
       upstream_status: extra.audit_upstream_400
         ? 400
-        : Number(extra.upstream_status) === 400
-          ? null
-          : (extra.upstream_status ?? null),
+        : Number.isInteger(extra.audit_upstream_error_status) && extra.audit_upstream_error_status >= 400
+          ? extra.audit_upstream_error_status
+          : Number(extra.upstream_status) === 400
+            ? null
+            : (extra.upstream_status ?? null),
       upstream_400_message: extra.audit_upstream_400_message
         ? String(extra.audit_upstream_400_message).slice(0, 300)
         : null,
@@ -609,6 +1078,8 @@ export class RequestLogStore {
       output_tokens: extra.output_tokens ?? usage.output_tokens ?? null,
       error_code: extra.error_code || null,
       error_message: extra.error_message ? String(extra.error_message).slice(0, 300) : null,
+      upstream_type: upstreamType,
+      error_details: errorDetails,
       user_agent: ctx.user_agent,
       ip: ctx.ip,
       api_key_presented: extra.api_key_presented ? presentedApiKeyForLog(extra.api_key_presented) : null,
@@ -642,6 +1113,12 @@ export class RequestLogStore {
       image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
       image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
       image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
+      advisor_usage: (() => {
+        const detail = Array.isArray(extra.advisor_usage)
+          ? extra.advisor_usage
+          : advisorUsageFromIterations(billedUsage)
+        return detail?.length ? JSON.stringify(detail) : null
+      })(),
       // Ownership and billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: null,
@@ -657,50 +1134,49 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
+    summary.vm_owner_user_id = this._resolveVmOwner(extra.vm_id)
+
+    this._finishLive(ctx.request_id, {
+      ...summary,
+      created_at: summary.ts,
+      ip_address: summary.ip,
+      completed_at: Date.now(),
+      owner_user_id: summary.user_id ?? summary.vm_owner_user_id ?? null,
+      session_key: summary.session_id || summary.outbound_session_id || null,
+    })
+
+    this._recentNormalCount = Math.min(this._memMax, this._recentNormalCount + 1)
+    if (this.db?.engine === 'postgres') {
+      if (this._totalRowsCache.value != null) {
+        this._totalRowsCache.value += 1
+      }
+    } else {
+      this._invalidateTotalRowsCache()
+    }
+
+    const pgWriter = this._activePgLogWriter()
+    if (pgWriter) {
+      const debugRec = ctx.mode === 'debug' ? this._buildDebugRecord(ctx, summary, extra) : null
+      pgWriter.enqueueUsageLog(summary, debugRec)
+      if (this.jsonlMirror) this._appendJsonl(summary)
+      return summary
+    }
+
     const persist = () => {
-      summary.vm_owner_user_id = this.repo.vmOwnerOf(extra.vm_id)
       try {
-        this.repo.insertSummaryIfAbsent(summary)
+        withSavepoint(this.repo.db, 'reqlog_sum', () => {
+          this.repo.insertSummaryIfAbsent(summary)
+        })
       } catch {}
       if (this.jsonlMirror) this._appendJsonl(summary)
       if (ctx.mode !== 'debug') return
-      const debugRec = {
-        ...summary,
-        headers: ctx.headers,
-        inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
-        request_body_snapshot:
-          !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
-        inbound_body:
-          !extra.classifier && extra.inbound_body != null
-            ? clampBody(extra.inbound_body, this.maxDebugBodyChars)
-            : null,
-        hop_meta: extra.hop_meta || null,
-        via: extra.via || extra.hop_meta?.via || null,
-        outbound_summary: extra.outbound_summary || null,
-        cache_prefix: extra.cache_prefix || null,
-        cache_continuity: extra.cache_continuity || null,
-        classifier: extra.classifier || null,
-        outbound_headers:
-          ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
-        outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
-        worker_envelope_headers:
-          ctx.capture_outbound && extra.worker_envelope_headers != null
-            ? redactHeaders(extra.worker_envelope_headers)
-            : null,
-        outbound_body:
-          ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
-            ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
-            : null,
-        outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
-        outbound_body_truncated: ctx.capture_outbound ? extra.outbound_body_truncated === true : false,
-        response: ctx.response ? debugResponse(ctx.response) : null,
-      }
+      const debugRec = this._buildDebugRecord(ctx, summary, extra)
       try {
-        this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
+        withSavepoint(this.repo.db, 'reqlog_dbg', () => {
+          this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
+        })
       } catch {}
     }
-    this._mem.push(summary)
-    if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
     if (writeBehindArmed()) enqueueWrite(persist)
     else persist()
     return summary
@@ -829,36 +1305,74 @@ export class RequestLogStore {
   }
 
   snapshot() {
+    const pgWriter = this._activePgLogWriter()
     return {
       mode: this.mode,
       retain_days: this.retainDays,
       debug_retain_days: this.debugRetainDays,
       max_mb: this.maxMb,
       muted_error_classes: this.mutedErrorClasses.slice(),
-      recent_normal: this._mem.length,
-      backend: 'sqlite',
+      recent_normal: this._recentNormalCount,
+      backend: this.db?.engine === 'postgres' ? 'postgres' : 'sqlite',
       jsonl_mirror: this.jsonlMirror,
-      total_rows: (() => {
-        try {
-          return this.repo.count()
-        } catch {
-          return null
-        }
-      })(),
+      total_rows: this._snapshotTotalRows(),
+      inflight_count: this._snapshotInflightCount(),
+      pg_log_writer: pgWriter ? pgWriter.stats() : null,
     }
   }
 
-  /** Retention: delete rows older than retain windows, then enforce max_mb. */
+  /**
+   * Retention: delete rows older than retain windows, then enforce max_mb.
+   * On PostgreSQL with an async pool, runs non-blocking ctid-batched cleanup off
+   * the main thread and invalidates dashboard caches afterward; on SQLite runs
+   * the synchronous repository cleanup.
+   */
   cleanup() {
+    const opts = {
+      retainDays: this.retainDays,
+      debugRetainDays: this.debugRetainDays,
+      maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
+    }
+    this._invalidateTotalRowsCache()
+
+    const pool = this._resolvePgPool()
+    if (this.db?.engine === 'postgres' && pool && typeof pool.query === 'function') {
+      if (this._cleanupInFlight) return this._cleanupInFlight
+      const task = (async () => {
+        try {
+          const result = await runRetentionCleanupAsync(pool, opts)
+          this._invalidateTotalRowsCache()
+          if (result && !result.skipped && (result.usage_logs > 0 || result.request_log_debug > 0)) {
+            await this._getCache()
+              ?.dashboard?.invalidateNamespaces?.(CLEANUP_INVALIDATE_NAMESPACES)
+              .catch(() => {})
+          }
+          this._cleanupLegacyFiles(this.retainDays, this.root)
+          this._cleanupLegacyFiles(this.debugRetainDays, path.join(this.root, 'debug'))
+          return result
+        } catch (err) {
+          console.warn('[request-log] async retention cleanup failed:', err?.message || err)
+          return null
+        } finally {
+          this._cleanupInFlight = null
+        }
+      })()
+      this._cleanupInFlight = task
+      return task
+    }
+
+    let result = null
     try {
-      this.repo.cleanup({
-        retainDays: this.retainDays,
-        debugRetainDays: this.debugRetainDays,
-        maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
-      })
+      result = this.repo.cleanup(opts)
     } catch {}
+    if (result && (result.usage_logs > 0 || result.request_log_debug > 0)) {
+      this._getCache()
+        ?.dashboard?.invalidateNamespaces?.(CLEANUP_INVALIDATE_NAMESPACES)
+        .catch(() => {})
+    }
     this._cleanupLegacyFiles(this.retainDays, this.root)
     this._cleanupLegacyFiles(this.debugRetainDays, path.join(this.root, 'debug'))
+    return result
   }
 
   startCleanupScheduler({ intervalMs = CLEANUP_INTERVAL_MS } = {}) {
@@ -866,7 +1380,7 @@ export class RequestLogStore {
     const ms = Math.max(60_000, Number(intervalMs) || CLEANUP_INTERVAL_MS)
     const run = () => {
       try {
-        this.cleanup()
+        Promise.resolve(this.cleanup()).catch(() => {})
       } catch {}
     }
     this._cleanupTimer = setInterval(run, ms)
@@ -903,6 +1417,8 @@ const EXPORT_COLUMNS = [
   'error_code',
   'error_message',
   'error_label',
+  'upstream_type',
+  'error_details',
   'model',
   'vm_id',
   'ip',
@@ -920,7 +1436,7 @@ const EXPORT_COLUMNS = [
 
 function csvCell(v) {
   if (v == null || v === '') return ''
-  const s = String(v)
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
 }
 

@@ -23,6 +23,7 @@ export type CommerceSelection = {
   slots?: number
   months?: number
   coupon?: string
+  renew_order_id?: string
 }
 
 export const paymentLabels = { wxpay: '微信支付', alipay: '支付宝' }
@@ -83,6 +84,8 @@ export function quoteProblem(error: unknown) {
     return '订单私有存储不可用。请让管理员检查数据目录和原收据密钥，再操作原订单。'
   if (code === 'shop_device_checkout_required')
     return '请允许浏览器 Cookie，刷新设备购买页后重试。'
+  if (code === 'shop_order_recover_conflict')
+    return '本浏览器已有一笔来自同一次结账的订单。请在另一个浏览器找回，或联系管理员核对这两笔订单。'
   if (code.includes('coupon'))
     return '优惠码不可用、次数已用完，或优惠后金额低于 ¥0.01。'
   if (/stock|sold_out|inventory/.test(code)) return '此档首批名额已售罄。'
@@ -105,6 +108,7 @@ export function CragCommerce({
   catalogKey,
   customTitle,
   device = false,
+  quoteEndpoint,
   paymentMethods,
   deliveryOptions,
   onOrder,
@@ -121,6 +125,7 @@ export function CragCommerce({
   catalogKey?: string
   customTitle?: string
   device?: boolean
+  quoteEndpoint?: string
   paymentMethods: readonly PaymentMethod[]
   deliveryOptions?: ReactNode
   onOrder: (
@@ -179,12 +184,15 @@ export function CragCommerce({
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       const quoteRequest = device ? cragDeviceApi<Quote> : api<Quote>
-      void quoteRequest(device ? '/quote' : '/api/panel/crag-shop/quote', {
-        method: 'POST',
-        body,
-        signal: controller.signal,
-        cache: 'no-store',
-      }).then(
+      void quoteRequest(
+        device ? '/quote' : (quoteEndpoint ?? '/api/panel/crag-shop/quote'),
+        {
+          method: 'POST',
+          body,
+          signal: controller.signal,
+          cache: 'no-store',
+        }
+      ).then(
         (quote) => {
           if (controller.signal.aborted) return
           if (
@@ -212,7 +220,7 @@ export function CragCommerce({
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [body, canQuote, device, key, rules.max_amount_minor, sku])
+  }, [body, canQuote, device, key, quoteEndpoint, rules.max_amount_minor, sku])
 
   const selectionUnavailable =
     !available && (sku !== 'custom' || !customEnabled)

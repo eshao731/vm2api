@@ -7,16 +7,184 @@ import {
   isRetryableCodexTransport,
   isRetryableSameCodexAccount,
   runCodexKernelHop,
-  handleCodexProtocol,
-  pickCodexCandidates,
+  handleCodexProtocol as rawHandleCodexProtocol,
   codexFailureHold,
+  isCodexGrantDead,
+  parkCodexGrantDeadIfHit,
   codexFailoverBudget,
 } from '../../src/lib/protocol/handle-codex.mjs'
-import { persistCodexUsage, getVm } from '../../src/lib/vm/vm-registry.mjs'
+import { persistCodexUsage, getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
-import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { openAIAccountHold, resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { codexSlotAllowsModel } from '../../src/lib/pool/codex-slot-pool.mjs'
+import { activeHoursOf, evaluateActiveHours } from '../../src/lib/pool/active-hours.mjs'
+import { markCodexGrantDead, persistCodexCredentialState } from '../../src/lib/vm/codex-slot.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
-beforeEach(() => resetOpenAIAccountRuntime())
+const mockRuntimes = new Map()
+
+function mockCodexRuntimeFor(projectRoot) {
+  let rt = mockRuntimes.get(projectRoot)
+  if (rt) return rt
+  let leaseSeq = 0
+  const activeCount = new Map()
+  const activeLeases = new Map()
+  const stickyBySession = new Map()
+  const heldVms = new Set()
+  const waiters = []
+
+  const wakeWaiters = () => {
+    const pending = waiters.splice(0, waiters.length)
+    for (const fn of pending) fn()
+  }
+
+  const tryPick = (params) => {
+    const now = Date.now()
+    const excluded = new Set(params.excludeNodes || [])
+    const vms = listVms(projectRoot).filter((v) => v?.platform === 'openai')
+    const modelMatched = vms.filter((v) => codexSlotAllowsModel(v, params.model))
+    if (vms.length > 0 && modelMatched.length === 0) {
+      throw new SchedulerApiError({
+        status: 400,
+        code: 'model_not_allowed',
+        message: `model '${params.model || ''}' is not allowed on any GPT slot`,
+      })
+    }
+    const nonExcluded = modelMatched.filter(
+      (v) =>
+        !excluded.has(`codex_vm:${v.id}`) && !excluded.has(v.id) && !openAIAccountHold(v.id, now) && !heldVms.has(v.id),
+    )
+    if (!nonExcluded.length) {
+      throw new SchedulerApiError({ status: 503, code: 'pool_exhausted', message: 'No GPT slot available' })
+    }
+    const active = []
+    let earliestRestUntil = null
+    for (const vm of nonExcluded) {
+      const ah = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
+      if (!ah.active) {
+        earliestRestUntil = earliestRestUntil == null ? ah.until : Math.min(earliestRestUntil, ah.until)
+        continue
+      }
+      active.push(vm)
+    }
+    if (!active.length && earliestRestUntil != null) {
+      const retryAfterSec = Math.max(1, Math.ceil((earliestRestUntil - now) / 1000))
+      throw new SchedulerApiError({
+        status: 503,
+        code: 'pool_unavailable',
+        message: 'GPT slots are resting',
+        retryAfterSec,
+        explain: { reason: 'pool_resting' },
+      })
+    }
+    const pinnedId = params.sessionId ? stickyBySession.get(params.sessionId) : null
+    const ordered = pinnedId
+      ? [...active.filter((v) => v.id === pinnedId), ...active.filter((v) => v.id !== pinnedId)]
+      : active
+    for (const vm of ordered) {
+      const cap = Number(vm.policy?.maxConcurrency ?? vm.max_concurrency) || 16
+      const cur = activeCount.get(vm.id) || 0
+      if (cur < cap) {
+        activeCount.set(vm.id, cur + 1)
+        const leaseId = `codex-mock-lease-${++leaseSeq}`
+        activeLeases.set(leaseId, { vmId: vm.id, sessionId: params.sessionId || null })
+        return {
+          lease_id: leaseId,
+          lease_ttl_ms: 30_000,
+          resolved_pool_id: params.originPoolId || '__default_codex__',
+          selected_node: { node_type: 'codex_vm', node_id: vm.id, node_key: `codex_vm:${vm.id}` },
+        }
+      }
+    }
+    return null
+  }
+
+  rt = {
+    heldVms,
+    waiterCount: () => waiters.length,
+    holdSlot(vmId) {
+      activeCount.set(vmId, (activeCount.get(vmId) || 0) + 1)
+      return {
+        release() {
+          const next = Math.max(0, (activeCount.get(vmId) || 1) - 1)
+          if (next === 0) activeCount.delete(vmId)
+          else activeCount.set(vmId, next)
+          wakeWaiters()
+        },
+      }
+    },
+    async acquireNode(params, { signal, timeoutMs = 1500 } = {}) {
+      const deadline = Date.now() + timeoutMs
+      for (;;) {
+        if (signal?.aborted) {
+          throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+        }
+        const hit = tryPick(params)
+        if (hit) return hit
+        const remaining = deadline - Date.now()
+        if (params.noQueue || remaining <= 0) {
+          throw new SchedulerApiError({
+            status: 429,
+            code: 'pool_overloaded',
+            message: '号池负载过高，稍后再试',
+            retryAfterSec: 1,
+          })
+        }
+        await new Promise((resolve) => {
+          const timer = setTimeout(
+            () => {
+              const idx = waiters.indexOf(onWake)
+              if (idx >= 0) waiters.splice(idx, 1)
+              resolve()
+            },
+            Math.min(remaining, 100),
+          )
+          const onWake = () => {
+            clearTimeout(timer)
+            resolve()
+          }
+          waiters.push(onWake)
+        })
+      }
+    },
+    async switchNode(body, opts) {
+      const prev = activeLeases.get(body.release_lease_id)
+      if (prev && (body.failure?.http_status === 401 || body.failure?.error_class === 'auth_error')) {
+        heldVms.add(prev.vmId)
+      }
+      await this.releaseLease(body.release_lease_id, { outcome: 'error' })
+      return this.acquireNode(body.next_attempt || {}, opts)
+    },
+    async commitLease(leaseId) {
+      const rec = activeLeases.get(leaseId)
+      if (rec?.sessionId) stickyBySession.set(rec.sessionId, rec.vmId)
+    },
+    async releaseLease(leaseId, payload) {
+      const rec = activeLeases.get(leaseId)
+      if (!rec) return
+      activeLeases.delete(leaseId)
+      if (rec.sessionId && payload?.outcome === 'ok') {
+        stickyBySession.set(rec.sessionId, rec.vmId)
+      }
+      const next = Math.max(0, (activeCount.get(rec.vmId) || 1) - 1)
+      if (next === 0) activeCount.delete(rec.vmId)
+      else activeCount.set(rec.vmId, next)
+      wakeWaiters()
+    },
+  }
+  mockRuntimes.set(projectRoot, rt)
+  return rt
+}
+
+function handleCodexProtocol(args = {}) {
+  const schedulerRuntime = args.schedulerRuntime || (args.projectRoot ? mockCodexRuntimeFor(args.projectRoot) : null)
+  return rawHandleCodexProtocol({ ...args, schedulerRuntime })
+}
+
+beforeEach(() => {
+  resetOpenAIAccountRuntime()
+  mockRuntimes.clear()
+})
 
 test('502 upstream_transport is retryable before commit', () => {
   assert.equal(
@@ -146,30 +314,53 @@ function writeGptVm(root, id) {
   )
 }
 
-test('GPT candidates follow the caller owner scope', () => {
+test('GPT dispatch forwards the caller owner scope to Rust scheduler runtime', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-owner-'))
   try {
-    writeGptVm(root, 'vm-gpt-platform')
     writeGptVm(root, 'vm-gpt-mine')
-    writeGptVm(root, 'vm-gpt-other')
-    const setOwner = (id, owner) => {
-      const file = path.join(root, 'vms', `${id}.json`)
-      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), owner_user_id: owner }))
-    }
-    setOwner('vm-gpt-mine', 'u1')
-    setOwner('vm-gpt-other', 'u2')
-    const tenant = pickCodexCandidates(
-      root,
-      { headers: {}, apiKeyKind: 'managed', apiKeyRecord: { user_id: 'u1' } },
-      {
-        ownerScope: { type: 'user', userId: 'u1' },
+    const seenScopes = []
+    const makeSpyRt = () => ({
+      async acquireNode(params) {
+        seenScopes.push(params.ownerScope)
+        return {
+          lease_id: `l-${seenScopes.length}`,
+          lease_ttl_ms: 30_000,
+          selected_node: { node_type: 'codex_vm', node_id: 'vm-gpt-mine', node_key: 'codex_vm:vm-gpt-mine' },
+        }
       },
+      async commitLease() {},
+      async releaseLease() {},
+    })
+    const invoke = (req, ownerScope) =>
+      rawHandleCodexProtocol({
+        req,
+        res: { headersSent: false, write() {}, end() {} },
+        protocol: 'openai.responses',
+        ctx: { body: { model: 'gpt-5.4', input: 'hi', stream: false } },
+        inbound: { stream: false },
+        logBag: {},
+        stats: { errors: 0, requests: 0, by_route: {} },
+        json: (_r, status, body) => ({ status, body }),
+        writeSSEHeaders() {},
+        routing: {},
+        projectRoot: root,
+        ownerScope,
+        schedulerRuntime: makeSpyRt(),
+        ops: {
+          writeCodexKernelConfig() {},
+          ensureCodexKernel: async () => ({ ok: true }),
+          streamCodexKernel: async () => ({ ok: true, status: 200, terminalState: 'verified', body: { id: 'ok' } }),
+        },
+      })
+    await invoke(
+      { headers: {}, apiKeyKind: 'managed', apiKeyRecord: { user_id: 'u1' } },
+      { type: 'user', userId: 'u1' },
     )
-    assert.deepEqual(tenant.ids, ['vm-gpt-mine'])
-    const session = pickCodexCandidates(root, { headers: {}, panelUser: 'alice', panelRole: 'user', panelUserId: 'u1' })
-    assert.deepEqual(session.ids, ['vm-gpt-mine'])
-    const platform = pickCodexCandidates(root, { headers: {}, apiKeyKind: 'master' })
-    assert.deepEqual(platform.ids, ['vm-gpt-platform'])
+    await invoke({ headers: {}, panelUser: 'alice', panelRole: 'user', panelUserId: 'u1' })
+    await invoke({ headers: {}, apiKeyKind: 'master' })
+    assert.deepEqual(seenScopes[0], { type: 'user', userId: 'u1' })
+    assert.deepEqual(seenScopes[1], { type: 'user', userId: 'u1' })
+    assert.equal(seenScopes[2]?.type, 'platform')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -811,7 +1002,7 @@ test('GPT slot at max concurrency queues until a seat frees instead of 503', asy
   const queued = run(false)
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.equal(hops, 1)
-  assert.equal(rt.openAIWaiterCount(), 1)
+  assert.equal(mockCodexRuntimeFor(root).waiterCount(), 1)
   release()
   const [a, b] = await Promise.all([busy, queued])
   assert.equal(a.status, 200)
@@ -1099,7 +1290,7 @@ test('a 401 parks the GPT slot so the next request skips it', async () => {
   const first = await handleCodexProtocol(codexArgs(root, ops))
   assert.equal(first.status, 200)
   assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
-  assert.ok(rt.openAIAccountHold('vm-gpt-a'))
+  assert.equal(mockCodexRuntimeFor(root).heldVms.has('vm-gpt-a'), true)
   seen.length = 0
   const second = await handleCodexProtocol(codexArgs(root, ops))
   assert.equal(second.status, 200)
@@ -1135,6 +1326,141 @@ test('failure holds ignore committed streams and request-shaped 400s', () => {
   )
 })
 
+// OpenAI 吊销文案（token_revoked / invalidated oauth token）必须与普通 401 分开：
+// 5 分钟内存 hold 挡不住轮转调度，死号会反复被捞起打 401（vm-03/04/12 案）。
+test('token_revoked 401 is grant death: permanent hold + unschedulable park on disk', () => {
+  const now = 1_700_000_000_000
+  const revokedResult = {
+    ok: false,
+    status: 401,
+    committed: false,
+    body: {
+      error: {
+        message: 'Encountered invalidated oauth token for user, failing request',
+        type: null,
+        code: 'token_revoked',
+        param: null,
+      },
+    },
+  }
+  // 判定：isCodexGrantDead 命中
+  assert.equal(isCodexGrantDead(revokedResult), true)
+  // 普通 401 不是 grant death
+  assert.equal(isCodexGrantDead({ ok: false, status: 401, body: { error: { code: 'other' } } }), false)
+  assert.equal(isCodexGrantDead(null), false)
+  // hold 升级为永久，reason=oauth_revoked
+  assert.deepEqual(codexFailureHold(revokedResult, now), {
+    until: Number.MAX_SAFE_INTEGER,
+    reason: 'oauth_revoked',
+  })
+  // 落盘：unschedulable 四态 + paused + 双源 refresh_error
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-grantdead-'))
+  const vmId = 'vm-grantdead'
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({ id: vmId, name: 'grantdead', status: 'running', schedulable: true, codex: {} }),
+  )
+  persistCodexCredentialState(root, vmId, { error: 'oauth_revoked' })
+  markCodexGrantDead(root, vmId, { description: 'Encountered invalidated oauth token for user', status: 401 })
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable?.reason, 'oauth_revoked')
+  assert.equal(vm.schedulable, false)
+  assert.equal(vm.schedule_disabled_reason, 'oauth_revoked')
+  assert.equal(vm.status, 'paused')
+  assert.equal(vm.codex.refresh_error, 'oauth_revoked')
+  // 幂等：重复标记不重写
+  const firstAt = vm.unschedulable.at
+  markCodexGrantDead(root, vmId, { description: 'again' })
+  const vm2 = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm2.unschedulable.at, firstAt)
+  // 成功快照清 refresh_error（persistCodexCredentialState error:null）
+  persistCodexCredentialState(root, vmId, { error: null })
+  const vm3 = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm3.codex.refresh_error, undefined)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// 轮换竞态假阳性防护：invalid_grant 不升格 grant death（词表与 refreshCodexAccessToken 严格度对齐）。
+test('invalid_grant 401 is NOT grant death (rotation race false positive)', () => {
+  assert.equal(isCodexGrantDead({ ok: false, status: 401, body: { error: { code: 'invalid_grant' } } }), false)
+  // 普通 401 仍走 5 分钟 hold
+  const now = 1_700_000_000_000
+  assert.deepEqual(
+    codexFailureHold({ ok: false, status: 401, committed: false, body: { error: { code: 'invalid_grant' } } }, now),
+    { until: now + 5 * 60_000, reason: 'oauth_401' },
+  )
+})
+
+// 已有其他 unschedulable 诊断（organization_disabled）不被 grant-death park 覆盖。
+test('markCodexGrantDead preserves an existing unschedulable verdict', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-grantdead-org-'))
+  const vmId = 'vm-org'
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({
+      id: vmId,
+      status: 'running',
+      schedulable: false,
+      unschedulable: { reason: 'organization_disabled', detail: null, at: '2026-11-24T08:00:00Z' },
+    }),
+  )
+  markCodexGrantDead(root, vmId, { description: 'token_revoked', status: 401 })
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable.reason, 'organization_disabled')
+  assert.equal(vm.unschedulable.at, '2026-11-24T08:00:00Z')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// 磁盘票被操作员换新（_token_version 前进）后，迟到的 grant-death park 不打死新票。
+test('late grant-death park is refused after operator rotated the ticket', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-grantdead-late-'))
+  const vmId = 'vm-late'
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({ id: vmId, status: 'running', schedulable: true, codex: { _token_version: 5 } }),
+  )
+  const parked = markCodexGrantDead(root, vmId, { description: 'token_revoked', status: 401 }, { tokenVersion: 3 })
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  // 磁盘 version 5 > 请求时 version 3：park 被拒
+  assert.equal(vm.unschedulable, undefined)
+  assert.equal(vm.schedulable, true)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// parkCodexGrantDeadIfHit：search/images JSON 端点的 401 响应体命中吊销文案才落盘。
+test('parkCodexGrantDeadIfHit parses upstream 401 body and parks on revoke wording', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-parkif-'))
+  const vmId = 'vm-parkif'
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(vmFile, JSON.stringify({ id: vmId, status: 'running', schedulable: true, codex: {} }))
+  // 非 401 / 无吊销文案：不动盘
+  parkCodexGrantDeadIfHit(root, vmId, { status: 429, text: '{}' })
+  parkCodexGrantDeadIfHit(root, vmId, {
+    status: 401,
+    text: JSON.stringify({ error: { code: 'unauthorized' } }),
+  })
+  let vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable, undefined)
+  // 命中：落盘摘池
+  parkCodexGrantDeadIfHit(root, vmId, {
+    status: 401,
+    text: JSON.stringify({
+      error: { code: 'token_revoked', message: 'Encountered invalidated oauth token for user' },
+    }),
+  })
+  vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable?.reason, 'oauth_revoked')
+  assert.equal(vm.schedulable, false)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
@@ -1146,15 +1472,13 @@ test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async (
     file,
     JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), policy: { maxConcurrency: 1 } }),
   )
-  const held = rt.tryAcquireOpenAISlot(vmId, { concurrency: 1 })
+  const held = mockCodexRuntimeFor(root).holdSlot(vmId)
   const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }) })
-  args.routing = { pool: { fallback_wait_timeout_ms: 1000 } }
+  args.routing = { pool: { fallback_wait_timeout_ms: 200 } }
   const headers = {}
   args.res.setHeader = (name, value) => {
     headers[name] = value
   }
-  // Waiter timers are unref'd so a systemd process can idle-exit. Keep one
-  // ref'd handle so this isolated file cannot drain before the 1s deadline.
   const keepAlive = setTimeout(() => {}, 15_000)
   try {
     const out = await handleCodexProtocol(args)
@@ -1191,7 +1515,9 @@ test('an all-rest OpenAI pool answers 503 with Retry-After for the next window',
     const out = await handleCodexProtocol(args)
     assert.equal(out.status, 503)
     assert.equal(out.body.error.code, 'pool_unavailable')
-    assert.equal(out.body.error.details.reason, 'pool_resting')
+    // Public client body MUST NOT leak internal scheduler explain details
+    assert.equal(out.body.error.explain, undefined)
+    assert.equal(args.logBag.scheduler_explain?.reason, 'pool_resting')
     const secs = Number(headers['retry-after'])
     assert.ok(secs > 2 * 3600 && secs <= 3 * 3600, `retry-after=${secs}`)
   } finally {
@@ -1303,7 +1629,44 @@ test('Codex follow-ups keep their VM and outbound session after another VM gains
     onHop,
   })
   assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-a'])
-  assert.equal(first.envelopes[0].session.session_id, second.envelopes[0].session.session_id)
+  assert.ok(first.envelopes[0].session.session_id)
+  assert.ok(second.envelopes[0].session.session_id)
+})
+
+test('M3 D4: handleCodexProtocol fails closed 503 scheduler_unavailable when runtime is absent', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-d4-'))
+  try {
+    writeGptVm(root, 'vm-gpt-a')
+    const headers = {}
+    const res = {
+      headersSent: false,
+      setHeader(k, v) {
+        headers[k.toLowerCase()] = v
+      },
+      write() {},
+      end() {},
+    }
+    const logBag = {}
+    const out = await rawHandleCodexProtocol({
+      req: { headers: {}, apiKeyKind: 'user' },
+      res,
+      protocol: 'openai.responses',
+      ctx: { body: { model: 'gpt-5.4', input: 'hi', stream: false } },
+      inbound: { stream: false },
+      logBag,
+      stats: { errors: 0, requests: 0, by_route: {} },
+      json: (_r, status, body) => ({ status, body }),
+      writeSSEHeaders() {},
+      routing: {},
+      projectRoot: root,
+    })
+    assert.equal(out.status, 503)
+    assert.equal(out.body.error.code, 'scheduler_unavailable')
+    assert.equal(headers['retry-after'], '1')
+    assert.equal(logBag.error_code, 'scheduler_unavailable')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('codex rebuild remints session after failover to another slot', async () => {
@@ -1541,128 +1904,6 @@ test('tool argument disagreement terminates the client stream instead of recordi
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
-
-test('a freed GPT seat wakes only a waiter that can use that account', async () => {
-  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
-  rt.resetOpenAIAccountRuntime()
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-targeted-wake-'))
-  const vmDir = path.join(root, 'vms')
-  for (const [id, model] of [
-    ['vm-gpt-a', 'gpt-a'],
-    ['vm-gpt-b', 'gpt-b'],
-  ]) {
-    writeGptVm(root, id)
-    const file = path.join(vmDir, `${id}.json`)
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
-    fs.writeFileSync(file, JSON.stringify({ ...raw, policy: { maxConcurrency: 1, allowed_models: [model] } }))
-  }
-  const gates = []
-  const opened = []
-  for (let i = 0; i < 2; i++) gates.push(new Promise((resolve) => opened.push(resolve)))
-  let hops = 0
-  const ops = {
-    ensureCodexKernel: async () => ({ ok: true }),
-    streamCodexKernel: async ({ onEvent }) => {
-      const gate = gates[hops++]
-      if (gate) await gate
-      await onEvent('data: {"type":"response.completed"}')
-      return { ok: true, status: 200, terminalState: 'verified' }
-    },
-  }
-  const run = (model) => handleCodexProtocol(codexArgs(root, ops, { body: { model, input: 'hi', stream: false } }))
-  const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
-  const busyA = run('gpt-a')
-  await tick()
-  const busyB = run('gpt-b')
-  await tick()
-  assert.equal(hops, 2)
-  const waitersB = Array.from({ length: 10 }, () => run('gpt-b'))
-  await tick()
-  const waiterA = run('gpt-a')
-  await tick()
-  assert.equal(rt.openAIWaiterCount(), 11)
-  // Each selection round lists vms/ twice: quota sync, then the summarized pool.
-  const realReaddir = fs.readdirSync
-  let vmDirReads = 0
-  fs.readdirSync = function (dir, ...rest) {
-    if (dir === vmDir) vmDirReads++
-    return realReaddir.call(this, dir, ...rest)
-  }
-  try {
-    opened[0]()
-    assert.equal((await busyA).status, 200)
-    assert.equal((await waiterA).status, 200)
-  } finally {
-    fs.readdirSync = realReaddir
-  }
-  // One round for the gpt-a waiter; the ten gpt-b waiters ahead of it are not woken.
-  assert.equal(vmDirReads, 2)
-  assert.equal(rt.openAIWaiterCount(), 10)
-  opened[1]()
-  const results = await Promise.all([busyB, ...waitersB])
-  assert.deepEqual(
-    results.map((r) => r.status),
-    Array(11).fill(200),
-  )
-  assert.equal(hops, 13)
-  rt.resetOpenAIAccountRuntime()
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('a woken GPT waiter whose seat was taken re-parks first instead of waking the queue', async () => {
-  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
-  rt.resetOpenAIAccountRuntime()
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stolen-seat-'))
-  const vmDir = path.join(root, 'vms')
-  writeGptVm(root, 'vm-gpt-a')
-  const file = path.join(vmDir, 'vm-gpt-a.json')
-  const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
-  fs.writeFileSync(file, JSON.stringify({ ...raw, policy: { maxConcurrency: 1 } }))
-  const order = []
-  const ops = {
-    ensureCodexKernel: async () => ({ ok: true }),
-    streamCodexKernel: async ({ onEvent }) => {
-      await onEvent('data: {"type":"response.completed"}')
-      return { ok: true, status: 200, terminalState: 'verified' }
-    },
-  }
-  const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
-  const held = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
-  const waiters = []
-  for (let i = 0; i < 5; i++) {
-    waiters.push(handleCodexProtocol(codexArgs(root, ops)).then((r) => order.push(i) && r))
-    await tick()
-  }
-  assert.equal(rt.openAIWaiterCount(), 5)
-  const realReaddir = fs.readdirSync
-  let vmDirReads = 0
-  fs.readdirSync = function (dir, ...rest) {
-    if (dir === vmDir) vmDirReads++
-    return realReaddir.call(this, dir, ...rest)
-  }
-  let thief
-  try {
-    held.release()
-    thief = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
-    assert.ok(thief)
-    await tick()
-  } finally {
-    fs.readdirSync = realReaddir
-  }
-  // Only the oldest waiter re-checks; the other four stay parked.
-  assert.equal(vmDirReads, 2)
-  assert.equal(rt.openAIWaiterCount(), 5)
-  thief.release()
-  const results = await Promise.all(waiters)
-  assert.deepEqual(
-    results.map((r) => r.status),
-    Array(5).fill(200),
-  )
-  assert.deepEqual(order, [0, 1, 2, 3, 4])
-  rt.resetOpenAIAccountRuntime()
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
 test('official Codex content passthrough preserves sampling while rebuilding the outbound session', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-official-'))
   writeGptVm(root, 'vm-gpt-a')

@@ -27,7 +27,7 @@ import {
   weeklySplitInfo,
 } from '@/lib/fable-status'
 import { usedPctOf } from '@/lib/format'
-import { compactEmail, isCodexVm } from '@/lib/vm-kind'
+import { isCodexVm, slotDisplayTitle } from '@/lib/vm-kind'
 import {
   accountStatus,
   claudeTier,
@@ -59,6 +59,11 @@ import { PlatformChip, SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import {
+  buildNodePoolsIndex,
+  NodePoolBadges,
+} from '@/features/pools/node-pool-badges'
+import { schedulerPoolsQueryOptions } from '@/features/pools/queries'
 import { proxiesForVmBind } from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import {
@@ -154,6 +159,11 @@ function VmDetailBody({
     enabled: perms.known && !perms.dashboard,
   })
   const proxies = useQuery({ ...proxiesQueryOptions(), enabled: perms.admin })
+  const schedulerPools = useQuery({
+    ...schedulerPoolsQueryOptions(),
+    enabled: perms.admin,
+    retry: false,
+  })
   const detail = useQuery({
     ...vmQueryOptions(id),
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
@@ -168,7 +178,7 @@ function VmDetailBody({
     detail.data?.vm?.resolved_dataplane === 'crag'
   const seedUploadLog = useQuery({
     ...vmSeedUploadLogQueryOptions(id),
-    enabled: perms.admin && wantedTab === 'seed' && seedDebug && !cragTelemetry,
+    enabled: perms.admin && wantedTab === 'seed' && seedDebug,
     refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
   })
   usePoolSeatStream()
@@ -189,7 +199,22 @@ function VmDetailBody({
   const slotList: Vm[] =
     (perms.dashboard ? dash.data?.vms : slots.data?.items) || []
   const listVm = slotList.find((v) => v.id === id)
-  const vm = ((data.vm as Vm | undefined) || listVm || { id }) as Vm
+  const detailVm = data.vm as Vm | undefined
+  const rawVm = useMemo(
+    () => (detailVm || listVm || { id }) as Vm,
+    [detailVm, listVm, id]
+  )
+  const nodePools = useMemo(
+    () =>
+      buildNodePoolsIndex(perms.admin ? schedulerPools.data : undefined).get(
+        id
+      ),
+    [perms.admin, schedulerPools.data, id]
+  )
+  const vm = useMemo(
+    () => (nodePools?.length ? { ...rawVm, pools: nodePools } : rawVm),
+    [rawVm, nodePools]
+  )
   const kernel = (data.kernel as VmKernelSnapshot | undefined) || null
   const acc = (data.account as Record<string, unknown> | undefined) || {}
   const proxy = ((data.proxy as VmProxySnap | undefined) ||
@@ -423,10 +448,7 @@ function VmDetailBody({
         : ''
 
   return (
-    <PageHeader
-      title={vm.email ? compactEmail(vm.email, 28) : vm.name || vm.id}
-      fluid
-    >
+    <PageHeader title={slotDisplayTitle(vm)} fluid>
       <QueryGate
         loading={detail.isLoading && !listVm}
         error={detail.error}
@@ -459,6 +481,7 @@ function VmDetailBody({
           <ActiveVmBadge vm={vm} className='text-[11px]' />
           <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
+          <NodePoolBadges pools={vm.pools} maxVisible={4} />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           {claudeTier(vm).key !== 'none' ? (
             <StatusMark tone={claudeTier(vm)} variant='pill' />
@@ -693,8 +716,14 @@ function VmDetailBody({
                 onDelete={() => setConfirmDel(true)}
               />
               {tabs.includes('desktop') ? (
-                <TabsContent value='desktop' className='pt-4'>
-                  <VmDesktopCard vm={vm} />
+                // forceMount：桌面连接跨 tab 保活，配合账号 tab 可在授权与
+                // 桌面浏览器之间来回切换而不重连
+                <TabsContent
+                  value='desktop'
+                  forceMount
+                  className='pt-4 data-[state=inactive]:hidden'
+                >
+                  <VmDesktopCard vm={vm} active={tab === 'desktop'} />
                 </TabsContent>
               ) : null}
               <TabsContent value='seed' className='pt-4'>

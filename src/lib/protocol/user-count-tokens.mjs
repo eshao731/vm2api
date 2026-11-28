@@ -4,40 +4,57 @@
  */
 import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { refusalAuditIdentity, refusalGuardPolicy, riskPrincipal } from '../core/refusal-guard.mjs'
+import { isDbOpen } from '../db/database.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
-import { runProtocolIntercept } from './intercept-gate.mjs'
+import { recordUpstream400SessionBlock, runProtocolIntercept } from './intercept-gate.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
-import {
-  detectProxiedOfficialCcFromRouting,
-  isOfficialClaudeCodeTraffic,
-  isProxiedOfficialClaudeCode,
-} from '../identity/crs-persona.mjs'
+import { verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
+import { toStandardAnthropicBody } from './anthropic-policy.mjs'
+import { rectifyCrag321Request } from './crag-321-rectifier.mjs'
+import { relocateThirdPartySystem } from './third-party-system.mjs'
+import { foldThirdPartyRoleSystemMessages } from './outbound-attempt.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
-import { getUsageCache } from '../oauth/usage-cache.mjs'
+import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs-usage-probe.mjs'
-import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaKernel, countTokensViaWorker, extractCragCallerHeaders } from '../transport/go-worker-client.mjs'
+import { peekRustHealth } from '../transport/kernel-router.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
-import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { keyAllowsVm, keyScopeFromRequest, resolvePoolAccessForKey, vmPoolDenial } from '../admin/key-scope.mjs'
+import { isPoolZeroInjectMode, requestedPoolIdFromHeaders } from './pool-prompt-policy.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { validateImageDimensions } from './images.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
+
+/** routing.compatibility.count_tokens — whether the count_tokens entries are served.
+ *
+ * Both entries (public `/v1/messages/count_tokens` and the panel's per-VM probe) were
+ * stubbed to 404 by 94b6f728 with the implementations left in place. Default off keeps
+ * that: these are a public API surface and a panel route, so turning them on is the
+ * operator's decision, not something a routing file gains by omission.
+ */
+export function countTokensEnabled(routing) {
+  return routing?.compatibility?.count_tokens === true
+}
+
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -97,6 +114,7 @@ export async function peekCurrentAccount({
   model,
   signal,
   usersRepo = null,
+  keyScopeOverride = null,
 } = {}) {
   const detected = detectInboundPlatform(model)
   const platform = detected.ok ? detected.platform : undefined
@@ -112,7 +130,7 @@ export async function peekCurrentAccount({
   if (!poolScheduler?.peekAccount) {
     return { ok: false, code: 'no_eligible_accounts' }
   }
-  const keyScope = keyScopeFromRequest(req)
+  const keyScope = keyScopeOverride || keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(keyScope)
   if (poolDenial) return { ok: false, code: ErrorCode.VM_POOL_UNAVAILABLE, message: poolDenial.message }
   // Same gate as Messages: a platform-scoped key must not hop to the other platform's VMs.
@@ -162,23 +180,41 @@ function sendPoolFail(res, json, peeked) {
   return json(res, mapped.status, mapped.body)
 }
 
-function distillContext(req, inbound) {
-  let routing = null
-  try {
-    routing = readRoutingConfigFile()
-  } catch {
-    routing = null
+export function sanitizeThirdPartyCountTokensBody(body, { routing = null } = {}) {
+  if (!body || typeof body !== 'object') return body
+  const relocated = relocateThirdPartySystem(body, { onlyForeign: false })
+  const folded = foldThirdPartyRoleSystemMessages(relocated.moved ? relocated.body : body)
+  const standard = toStandardAnthropicBody(folded, {
+    official: false,
+    rewriteTools: routing?.compatibility?.tool_name_rewrite !== false,
+    preserveToolNames: false,
+  })
+  const out = { ...standard.body }
+  // /v1/messages/count_tokens rejects max_tokens (added by sanitizeAnthropicBody default).
+  delete out.max_tokens
+  return out
+}
+
+function distillContext(
+  req,
+  inbound,
+  { effectivePool = null, routing: routingArg = null, nodeProvider = null, official: officialOverride = null } = {},
+) {
+  let routing = routingArg
+  if (!routing) {
+    try {
+      routing = readRoutingConfigFile()
+    } catch {
+      routing = null
+    }
   }
   const official =
-    isOfficialClaudeCodeTraffic(req?.headers || {}, inbound) ||
-    (detectProxiedOfficialCcFromRouting(routing || {}) && isProxiedOfficialClaudeCode(inbound, req?.headers || {}))
-  const inject = String(routing?.compatibility?.persona_inject || '')
-    .trim()
-    .toLowerCase()
-  const preset = String(routing?.compatibility?.persona_preset || '')
-    .trim()
-    .toLowerCase()
-  return { official, zeroInject: inject === 'zero' || preset === 'zero' }
+    typeof officialOverride === 'boolean'
+      ? officialOverride
+      : verifyOfficialClaudeCode(req?.headers || {}, inbound, { routing: routing || {}, countTokens: true })
+          .official === true
+  const zeroInject = isPoolZeroInjectMode(effectivePool, routing || {}, { nodeProvider })
+  return { official, zeroInject }
 }
 
 function refusalPolicy(deps) {
@@ -235,10 +271,16 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
       headers: req?.headers,
       principal: riskPrincipal(req),
     }),
-    ...distillContext(req, inbound),
+    ...distillContext(req, inbound, {
+      effectivePool: deps.effectivePool || null,
+      routing: deps.routing || null,
+      nodeProvider: deps.nodeProvider || null,
+      official: deps.official,
+    }),
     distillRules: deps.cfg?.distill,
     policy: refusalPolicy(deps),
     jev,
+    poolJevProfile: deps.effectivePool?.jev_profile || req?.poolJevProfile || req?.apiKeyRecord?.jev_profile || null,
     repo: refusalRepo(deps),
     devices: deviceRepo(deps),
     sessions: sessionRepo(deps),
@@ -247,12 +289,74 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
   return { error: decision?.action === 'block' ? decision.error : null, wait: decision.wait === true }
 }
 
+function slotCapabilitiesForCountTokens(peeked, deps) {
+  const sources = [
+    peeked?.workerStatus?.capabilities,
+    peeked?.state?.worker_status?.capabilities,
+    peeked?.exec?.workerStatus?.capabilities,
+    peeked?.vm?.workerStatus?.capabilities,
+    peeked?.vm?.worker_status?.capabilities,
+    peeked?.vm?.runtime?.capabilities,
+    peeked?.vm?.kernel_installation?.capabilities,
+    peekRustHealth(peeked?.exec, 60_000)?.health?.capabilities,
+  ]
+  for (const caps of sources) {
+    if (Array.isArray(caps) && caps.length) return caps
+  }
+  if (typeof deps?.slotCapabilities === 'function') {
+    const caps = deps.slotCapabilities(peeked)
+    if (Array.isArray(caps)) return caps
+  }
+  return []
+}
+
+function sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors = false } = {}) {
+  const forwardHeaders = hop?.headers && typeof hop.headers === 'object' ? { ...hop.headers } : null
+  if (!hop?.ok) {
+    const status = hop?.status && hop.status >= 400 ? hop.status : 502
+    // Upstream limit / overload: same mapping and Retry-After as Messages.
+    if (status === 429 || status === 529) {
+      const mapped = mapUpstreamError(status, hop?.body, forwardHeaders || {})
+      const mergedHeaders = forwardHeaders ? { ...forwardHeaders } : {}
+      const hasRetryAfter = Object.keys(mergedHeaders).some((k) => k.toLowerCase() === 'retry-after')
+      if (mapped.retryAfterSec) {
+        if (!hasRetryAfter) mergedHeaders['retry-after'] = String(mapped.retryAfterSec)
+        res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+      }
+      return forwardHeaders
+        ? json(res, mapped.status, mapped.body, mergedHeaders)
+        : json(res, mapped.status, mapped.body)
+    }
+    if (preserveOfficialErrors && hop?.body?.type === 'error' && hop.body.error && typeof hop.body.error === 'object') {
+      return forwardHeaders ? json(res, status, hop.body, forwardHeaders) : json(res, status, hop.body)
+    }
+    const err = hop?.body?.error || {}
+    const errBody = makeError({
+      type: err.type || ErrorType.UPSTREAM,
+      code: err.code || 'count_tokens_failed',
+      message: err.message || 'count_tokens 失败',
+      status,
+    }).body
+    return forwardHeaders ? json(res, status, errBody, forwardHeaders) : json(res, status, errBody)
+  }
+  const raw = hop.body && typeof hop.body === 'object' ? hop.body : {}
+  const inputTokens = Number(raw.input_tokens)
+  const payload = { ...raw, input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0 }
+  return forwardHeaders ? json(res, 200, payload, forwardHeaders) : json(res, 200, payload)
+}
+
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
+  const routing =
+    typeof deps.getRoutingConfig === 'function'
+      ? deps.getRoutingConfig()
+      : typeof deps.getRouting === 'function'
+        ? deps.getRouting()
+        : null
   let inbound
   try {
-    inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
+    inbound = await deps.readBody(req, inboundBodyLimit(routing, deps.cfg.limits.max_body_bytes))
   } catch (error) {
     if (error?.body?.error) return json(res, error.status || 400, error.body)
     return json(
@@ -270,17 +374,92 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
   const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
   if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
-  const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
+  const targetPlatform = detectInboundPlatform(parsed.body.model).platform || 'anthropic'
+  const ccVerdict =
+    targetPlatform === 'anthropic'
+      ? verifyOfficialClaudeCode(req?.headers || {}, inbound, { routing: routing || {}, countTokens: true })
+      : { official: false }
+  const officialTraffic = ccVerdict.official === true
   if (
     claudeCodeOnlyFromRouting(routing) &&
-    detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
-    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
+    targetPlatform === 'anthropic' &&
+    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { routing, countTokens: true })
   ) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
-  if (gate?.error) return json(res, gate.error.status, gate.error.body)
+  const blockedClient = targetPlatform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  if (blockedClient) {
+    const err = blockedClientError(blockedClient)
+    return json(res, err.status, err.body)
+  }
+  if (targetPlatform === 'anthropic') {
+    try {
+      validateImageDimensions(parsed.body)
+    } catch (error) {
+      if (!error.body?.error) throw error
+      return json(res, error.status, error.body)
+    }
+  }
+  const requestedPoolId = requestedPoolIdFromHeaders(req?.headers || {})
+  const keyRec = req?.apiKeyRecord || null
+  const explicitPoolIntent =
+    Boolean(requestedPoolId) ||
+    keyRec?.pool_binding_mode === 'strict_pool' ||
+    Boolean(keyRec?.default_pool_id) ||
+    (Array.isArray(keyRec?.allowed_pool_ids) && keyRec.allowed_pool_ids.length > 0)
+  let poolAccess = null
+  if (deps.poolsRepo || isDbOpen() || explicitPoolIntent) {
+    const poolScheduler = typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler
+    const projectRoot = deps.projectRoot || deps.cfg?.paths?.project || poolScheduler?.projectRoot || null
+    let vms = Array.isArray(deps.vms) ? deps.vms : null
+    if (!vms && projectRoot) {
+      try {
+        const listed = listVms(projectRoot)
+        if (Array.isArray(listed)) vms = listed
+      } catch {}
+    }
+    poolAccess = resolvePoolAccessForKey({
+      key: keyRec,
+      apiKeyKind: req?.apiKeyKind || null,
+      requestedPoolId,
+      model: parsed.body.model,
+      poolsRepo: deps.poolsRepo || null,
+      vms,
+      ownerScope: ownerScopeFromRequest(req, deps.apiKeyStore?.users || null),
+    })
+    if (!poolAccess.ok) {
+      const err = makeError({
+        type: ErrorType.PERMISSION,
+        code: poolAccess.code || 'pool_unavailable',
+        message: poolAccess.message || '分组池不可用',
+        status: poolAccess.status || 403,
+      })
+      return json(res, poolAccess.status || 403, err.body)
+    }
+  }
+  const effectivePool = poolAccess?.effectivePool || null
+  const poolKeyScopeOverride =
+    poolAccess && !poolAccess.legacy && effectivePool
+      ? {
+          ...keyScopeFromRequest(req),
+          vm_pool_id: effectivePool.id,
+          vm_pool_error: null,
+          allowed_vms: poolAccess.allowedVmIds || [],
+        }
+      : null
+  const gate = await blockCountTokensBeforeHop(req, parsed.body, {
+    ...deps,
+    rawInbound: inbound,
+    effectivePool,
+    routing,
+    nodeProvider: targetPlatform,
+    official: officialTraffic,
+  })
+  if (gate?.error) {
+    if (gate.error.retryAfterSec) res.setHeader?.('retry-after', String(gate.error.retryAfterSec))
+    return json(res, gate.error.status, gate.error.body)
+  }
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
     stickyRouter: deps.stickyRouter,
@@ -288,15 +467,61 @@ export async function handleUserCountTokens(req, res, deps) {
     inbound,
     model: parsed.body.model,
     usersRepo: deps.apiKeyStore?.users || null,
+    keyScopeOverride: poolKeyScopeOverride,
   })
   if (!peeked.ok) return sendPoolFail(res, json, peeked)
   if (gate.wait) {
     const again = await blockCountTokensBeforeHop(req, parsed.body, {
       ...deps,
       rawInbound: inbound,
+      effectivePool,
+      routing,
+      nodeProvider: targetPlatform,
+      official: officialTraffic,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
-    if (again?.error) return json(res, again.error.status, again.error.body)
+    if (again?.error) {
+      if (again.error.retryAfterSec) res.setHeader?.('retry-after', String(again.error.retryAfterSec))
+      return json(res, again.error.status, again.error.body)
+    }
+  }
+  const observeCountTokens400 = (hop) => {
+    if (!hop || hop.ok === true) return
+    recordUpstream400SessionBlock({
+      inbound,
+      body: parsed.body,
+      headers: req?.headers,
+      identity: refusalAuditIdentity({
+        inbound,
+        body: parsed.body,
+        headers: req?.headers,
+        principal: riskPrincipal(req),
+      }),
+      result: hop,
+      policy: refusalPolicy(deps),
+      devices: deviceRepo(deps),
+    })
+  }
+  const outboundBody = officialTraffic ? parsed.body : sanitizeThirdPartyCountTokensBody(parsed.body, { routing })
+  const caps = slotCapabilitiesForCountTokens(peeked, deps)
+  if (caps.includes('count_tokens_v1')) {
+    const kernelHeaders = {}
+    if (officialTraffic) {
+      const callerHeaders = extractCragCallerHeaders(req?.headers, { includeUserAgent: true })
+      if (callerHeaders) Object.assign(kernelHeaders, callerHeaders)
+      const beta = req?.headers?.['anthropic-beta']
+      if (typeof beta === 'string' && beta.trim()) kernelHeaders['anthropic-beta'] = beta.trim()
+    }
+    const hop = await (deps.countTokensViaKernel || countTokensViaKernel)(peeked.exec, {
+      body: rectifyCrag321Request(outboundBody, {
+        strictPassthrough: officialTraffic === true,
+        countTokens: true,
+      }),
+      headers: kernelHeaders,
+      timeoutMs: 45000,
+    })
+    observeCountTokens400(hop)
+    return sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors: true })
   }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canCountTokens(mode)) {
@@ -312,37 +537,16 @@ export async function handleUserCountTokens(req, res, deps) {
     return json(res, 200, buildUsageView(listed, source))
   }
   const hop = await (deps.countTokensViaWorker || countTokensViaWorker)(peeked.exec, {
-    body: parsed.body,
+    body: outboundBody,
     headers: {
       'user-agent': 'kin-inference/1.0',
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(parsed.body.model),
+      'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(outboundBody.model),
     },
     timeoutMs: 45000,
   })
-  if (!hop.ok) {
-    const status = hop.status && hop.status >= 400 ? hop.status : 502
-    // Upstream limit / overload: same mapping and Retry-After as Messages.
-    if (status === 429 || status === 529) {
-      const mapped = mapUpstreamError(status, hop.body, hop.headers || {})
-      if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
-      return json(res, mapped.status, mapped.body)
-    }
-    const err = hop.body?.error || {}
-    return json(
-      res,
-      status,
-      makeError({
-        type: err.type || ErrorType.UPSTREAM,
-        code: err.code || 'count_tokens_failed',
-        message: err.message || 'count_tokens 失败',
-        status,
-      }).body,
-    )
-  }
-  const raw = hop.body && typeof hop.body === 'object' ? hop.body : {}
-  const inputTokens = Number(raw.input_tokens)
-  return json(res, 200, { ...raw, input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0 })
+  observeCountTokens400(hop)
+  return sendCountTokensHopResult(res, json, hop)
 }
 
 export async function resolveUsageWindows({
@@ -363,13 +567,22 @@ export async function resolveUsageWindows({
   const cache = usageCache || getUsageCache()
   let result
   try {
-    result = await cache.load(accountId, () => probe({ exec, vm, includeFable: false }))
+    result = await cache.load(accountId, async () => {
+      const startedAt = Date.now()
+      const resetGenerations = accountQuota?.resetGenerations?.(accountId) || null
+      const probed = await probe({ exec, vm, includeFable: false })
+      return attachUsageFetchMeta(probed, { startedAt, resetGenerations })
+    })
   } catch {
     return { listed, source }
   }
   if (!result || isOfficialUsageRateLimited(result)) return { listed, source }
   try {
-    accountQuota?.ingestOAuthUsage?.(accountId, result)
+    const fetchMeta = getUsageFetchMeta(result)
+    accountQuota?.ingestOAuthUsage?.(accountId, result, {
+      ...(fetchMeta?.startedAt != null ? { startedAt: fetchMeta.startedAt } : {}),
+      ...(fetchMeta?.resetGenerations ? { resetGenerations: fetchMeta.resetGenerations } : {}),
+    })
   } catch {}
   const next = accountQuota?.repo?.get?.(accountId) || acc
   listed = listQuotaFromHeaders(next?.unified || {})

@@ -33,6 +33,7 @@ import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { rollWindowHistory } from '../pool/window-history.mjs'
 import { normalizeOwnerId, vmOriginOf, vmOwnerId, VM_ORIGIN } from '../admin/resource-owner.mjs'
+import { fingerprintDir, syncSlotIdentityTimezoneAndPreset } from '../identity/slot-computer.mjs'
 import { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
@@ -100,6 +101,13 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
           kernel: vm.kernel_installation.kernel,
           version: vm.kernel_installation.version ?? null,
           ...(vm.kernel_installation.payload_tag ? { payload_tag: vm.kernel_installation.payload_tag } : {}),
+          ...(Array.isArray(vm.kernel_installation.capabilities) && vm.kernel_installation.capabilities.length
+            ? { capabilities: [...vm.kernel_installation.capabilities] }
+            : {}),
+          ...(Number.isInteger(vm.kernel_installation.kernel_generation)
+            ? { kernel_generation: vm.kernel_installation.kernel_generation }
+            : {}),
+          ...(vm.kernel_installation.transport ? { transport: vm.kernel_installation.transport } : {}),
           installed_at: vm.kernel_installation.installed_at,
         }
       : null,
@@ -110,7 +118,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     platform: kind.platform,
     family: kind.family,
     codex_kernel: kind.kind === 'codex',
-    email: kind.kind === 'codex' ? codex?.email || null : vm.claude?.email || null,
+    email: kind.kind === 'codex' ? codex?.email || vm.email || null : vm.claude?.email || vm.email || null,
     account_uuid: kind.kind === 'codex' ? null : vm.claude?.account_uuid || null,
     org_uuid: kind.kind === 'codex' ? codex?.chatgpt_account_id || null : vm.claude?.org_uuid || null,
     has_token: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),
@@ -131,7 +139,11 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
     account_tier_source: kind.kind === 'codex' ? null : vm.claude?.account_tier_source || null,
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
-    refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
+    // codex 槽同样透出刷票失败（oauth_revoked / refresh_rejected），面板不再一律显示健康。
+    refresh_error:
+      kind.kind === 'codex'
+        ? codex?.refresh_error || vm.codex?.refresh_error || vm.refresh_error || null
+        : vm.claude?.refresh_error || null,
     account_tier:
       kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || (hasAccessPresence(vm.claude) ? 'pro' : null),
     subscription_type: kind.kind === 'codex' ? null : normalizeSubscriptionType(vm.claude?.subscription_type),
@@ -146,6 +158,11 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     max_sessions_override: kind.kind === 'codex' ? openAIPolicy.sessions_override : false,
     session_slots: kind.kind === 'codex' ? null : (vm.policy?.sessionSlots ?? null),
     session_slots_override: kind.kind === 'codex' ? false : vm.policy?.sessionSlotsOverride === true,
+    max_primary_sessions: kind.kind === 'codex' ? null : (vm.policy?.maxPrimarySessions ?? null),
+    max_primary_sessions_override: kind.kind === 'codex' ? false : vm.policy?.maxPrimarySessionsOverride === true,
+    max_subagents_per_session: kind.kind === 'codex' ? null : (vm.policy?.maxSubagentsPerSession ?? null),
+    max_subagents_per_session_override:
+      kind.kind === 'codex' ? false : vm.policy?.maxSubagentsPerSessionOverride === true,
     scheduling_inherited:
       kind.kind === 'codex'
         ? {
@@ -949,6 +966,11 @@ export function persistVmTimezone(projectRoot, id, timezone, { source = 'manual'
   if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zone
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
+  if (fs.existsSync(fingerprintDir(projectRoot, id))) {
+    try {
+      syncSlotIdentityTimezoneAndPreset(projectRoot, vm, { timezone: zone, locale: vm.locale })
+    } catch {}
+  }
   return summarizeVm(vm)
 }
 

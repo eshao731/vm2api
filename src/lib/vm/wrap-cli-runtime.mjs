@@ -18,9 +18,22 @@ import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
-import { resolveKernelDataplane } from './slot-engine.mjs'
+import {
+  CRAG_CLAUDE_DIR_RE,
+  CRAG_CLAUDE_VERSION,
+  resolveKernelDataplane,
+  resolveManifestClaudePath,
+} from './slot-engine.mjs'
+export { CRAG_CLAUDE_VERSION, resolveManifestClaudePath } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
-import { isValidVmId } from './vm-file.mjs'
+import { isValidVmId, listVmRecordFiles } from './vm-file.mjs'
+import {
+  isCustomKvmMode,
+  isCustomOsRuntimeMode,
+  isCustomOsSlot,
+  resolveHostSharedStoreDir,
+  validateReadOnlyNoFollowPath,
+} from './custom-os-runtime.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -66,13 +79,123 @@ exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 
 export const CRAG_V2_DIR = 'crag-v2'
 const CRAG_V2_ENTRY = 'crag-v2'
-const CRAG_V2_CLAUDE = 'claude-code-2.1.321/claude'
 const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
 
-export function cragV2Arch() {
-  if (process.arch === 'x64') return 'amd64'
-  if (process.arch === 'arm64') return 'arm64'
-  return process.arch
+export function normalizeCragArch(raw) {
+  const value = String(raw || '')
+    .trim()
+    .toLowerCase()
+  if (value === 'x64' || value === 'x86_64' || value === 'amd64') return 'amd64'
+  if (value === 'arm64' || value === 'aarch64') return 'arm64'
+  return value
+}
+
+export function dockerPlatformArch(
+  platformSpec = process.env.DOCKER_DEFAULT_PLATFORM,
+  hostPlatform = process.platform,
+) {
+  const raw = String(platformSpec || '')
+    .trim()
+    .toLowerCase()
+  if (!raw) return ''
+  const parts = raw.split('/').filter(Boolean)
+  if (parts.length === 1) return hostPlatform === 'linux' ? normalizeCragArch(parts[0]) : raw
+  if (parts[0] !== 'linux') return raw
+  return normalizeCragArch(parts[1])
+}
+
+export function cragV2Arch({
+  arch = process.arch,
+  platform = process.platform,
+  dockerDefaultPlatform = process.env.DOCKER_DEFAULT_PLATFORM,
+} = {}) {
+  const slotArch = dockerPlatformArch(dockerDefaultPlatform, platform)
+  if (slotArch) return slotArch
+  return normalizeCragArch(arch)
+}
+
+export function elfMachineArch(file) {
+  let fd
+  try {
+    const st = fs.lstatSync(file)
+    if (!st.isFile() || st.size < 64) return ''
+    fd = fs.openSync(file, 'r')
+    const head = Buffer.alloc(64)
+    if (fs.readSync(fd, head, 0, 64, 0) !== 64) return ''
+    if (head.readUInt32BE(0) !== 0x7f454c46 || head[4] !== 2 || head[5] !== 1) return ''
+    const machine = head.readUInt16LE(18)
+    if (machine === 62) return 'amd64'
+    if (machine === 183) return 'arm64'
+    return `elf-${machine}`
+  } catch {
+    return ''
+  } finally {
+    if (fd != null) fs.closeSync(fd)
+  }
+}
+
+function hasCragSelectionForArch(projectRoot, arch) {
+  if (!projectRoot || !arch) return false
+  const base = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2')
+  return isFile(path.join(base, `current-${arch}.json`)) || isFile(path.join(base, arch, 'manifest.json'))
+}
+
+function stagedSlotBinaryArch(projectRoot, vmId) {
+  if (!projectRoot || !isValidVmId(vmId)) return ''
+  const dir = wrapCliHomeDir(projectRoot, vmId)
+  for (const name of [CC_NODE_BIN, WRAP_KERNEL_BIN, WRAP_CLI_BIN]) {
+    const detected = elfMachineArch(path.join(dir, name))
+    if (detected) return detected
+  }
+  return ''
+}
+
+/** Runtime architecture of a target slot, independent of the control-plane host CPU. */
+export function cragSlotArch(projectRoot, vm, options = {}) {
+  if (!vm) return cragTargetArch(projectRoot, options)
+  if (vm.node_platform === 'darwin') return 'darwin'
+  const explicit = normalizeCragArch(vm.runtime?.arch || vm.node_arch || vm.arch)
+  if (explicit) return explicit
+  const platformArch = dockerPlatformArch(options.dockerDefaultPlatform, options.platform)
+  if (platformArch) return platformArch
+  const hostArch = normalizeCragArch(options.arch ?? process.arch)
+  if (hostArch !== 'amd64' && hasCragSelectionForArch(projectRoot, hostArch)) return hostArch
+  if (clusterDockerSlot(vm) || isKvmRuntime(vm)) return 'amd64'
+  const staged = stagedSlotBinaryArch(projectRoot, vm.id)
+  if (staged) return staged
+  return cragTargetArch(projectRoot, options)
+}
+
+/** Runtime architecture targeted by this installation's CRAG cache/pull operations. */
+export function cragTargetArch(projectRoot = '', options = {}) {
+  const platformArch = dockerPlatformArch(options.dockerDefaultPlatform, options.platform)
+  if (platformArch) return platformArch
+  const hostArch = normalizeCragArch(options.arch ?? process.arch)
+  if (hostArch === 'amd64' || !projectRoot) return hostArch
+  if (hasCragSelectionForArch(projectRoot, hostArch)) return hostArch
+  if (hasCragSelectionForArch(projectRoot, 'amd64')) return 'amd64'
+  const vmsDir = path.join(projectRoot, 'vms')
+  let sawSlotArch = ''
+  for (const file of listVmRecordFiles(vmsDir)) {
+    let vm
+    try {
+      vm = JSON.parse(fs.readFileSync(path.join(vmsDir, file), 'utf8'))
+    } catch {
+      continue
+    }
+    if (!vm || isCodexVm(vm) || vm.node_platform === 'darwin') continue
+    const explicit = normalizeCragArch(vm.runtime?.arch || vm.node_arch || vm.arch)
+    if (explicit === 'amd64') return 'amd64'
+    if (explicit) {
+      sawSlotArch ||= explicit
+      continue
+    }
+    if (clusterDockerSlot(vm) || isKvmRuntime(vm)) return 'amd64'
+    const staged = stagedSlotBinaryArch(projectRoot, vm.id)
+    if (staged === 'amd64') return 'amd64'
+    if (staged) sawSlotArch ||= staged
+  }
+  return sawSlotArch || hostArch
 }
 
 // A cache pointer is data, never a symlink or an arbitrary filesystem path.
@@ -100,7 +223,7 @@ function cachedPackageRoot(base, arch) {
   }
 }
 /** Package location only. This does not select v2 for VMs that omitted the version. */
-export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
+export function cragV2PackageRoot(projectRoot, arch = cragTargetArch(projectRoot)) {
   const env = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
   if (env && isFile(path.join(env, 'manifest.json'))) return env
   if (!projectRoot) return ''
@@ -115,8 +238,7 @@ export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
   return isFile(path.join(staged, 'manifest.json')) ? staged : ''
 }
 
-export function matchesCragIssuer(projectRoot, issuerId, pem) {
-  const arch = cragV2Arch()
+export function matchesCragIssuer(projectRoot, issuerId, pem, arch = cragTargetArch(projectRoot)) {
   const factory =
     String(process.env.KIN_CRAG_V2_ROOT || '').trim() || path.join(projectRoot, 'share/crag/kernels/v2', arch)
   try {
@@ -202,7 +324,45 @@ function listCragV2Files(dir, prefix = '') {
   return rows
 }
 
-export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude = false } = {}) {
+/**
+ * Member digests keyed by inode identity, size, mtime and ctime. Rehashing the ~100 MB package on every
+ * check blocked the event loop for seconds at a time (slot-image warm runs it per kernel per node, license
+ * checks per slot). Any write changes ctime, so a modified member is always rehashed.
+ */
+const memberDigestCache = new Map()
+const MEMBER_HEAD_BYTES = 64
+
+function memberDigest(file) {
+  const st = fs.lstatSync(file)
+  const key = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`
+  const hit = memberDigestCache.get(file)
+  if (hit?.key === key) return hit
+  const body = fs.readFileSync(file)
+  const entry = {
+    key,
+    size: body.length,
+    head: Buffer.from(body.subarray(0, MEMBER_HEAD_BYTES)),
+    digest: crypto.createHash('sha256').update(body).digest('hex'),
+  }
+  memberDigestCache.set(file, entry)
+  return entry
+}
+
+export function verifyCragV2Tree(
+  dir,
+  {
+    arch = cragV2Arch(),
+    expectedArch = null,
+    expectedIssuerPublicKeyId = null,
+    expectedPayloadKeyId = null,
+    allowPreviousClaude = false,
+    allowUnbundledStore = isCustomOsRuntimeMode(),
+    sharedClaudeStoreRoot = '',
+    externalClaudeBin = '',
+    requireReadOnlyExternal = process.platform !== 'win32',
+  } = {},
+) {
+  const targetArch = expectedArch ?? arch
   try {
     const root = fs.lstatSync(dir)
     if (root.isSymbolicLink())
@@ -226,11 +386,11 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
   if (manifest.family !== 'crag' || manifest.version !== 'v2') {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest family/version mismatch' }
   }
-  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== arch) {
+  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== targetArch) {
     return {
       ok: false,
       code: 'crag_v2_arch_mismatch',
-      error: `CRAG v2 arch ${manifest.arch} does not match ${arch}`,
+      error: `CRAG v2 arch ${manifest.arch} does not match ${targetArch}`,
     }
   }
   if (manifest.encrypted !== true || manifest.runtime !== 'native' || manifest.entrypoint !== CRAG_V2_ENTRY) {
@@ -246,10 +406,39 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
   if (!manifest.sha256 || typeof manifest.sha256 !== 'object' || Array.isArray(manifest.sha256)) {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest sha256 map is missing' }
   }
+  const claude = resolveManifestClaudePath(manifest)
+  if (!claude) {
+    return {
+      ok: false,
+      code: 'crag_v2_manifest_invalid',
+      error: 'CRAG v2 manifest officialClaude path is missing or invalid',
+    }
+  }
+  const officialObj =
+    manifest.officialClaude && typeof manifest.officialClaude === 'object' && !Array.isArray(manifest.officialClaude)
+      ? manifest.officialClaude
+      : null
+  const unbundledOfficial = Boolean(officialObj && officialObj.bundled === false)
+  if (unbundledOfficial && !allowUnbundledStore) {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 encrypted package authorization is invalid' }
+  }
   const expected = new Set(Object.keys(manifest.sha256))
-  for (const required of [CRAG_V2_ENTRY, CRAG_V2_CLAUDE, 'crag-license-public.pem', 'crag-v2.payload.enc']) {
+  const requiredMembers = unbundledOfficial
+    ? [CRAG_V2_ENTRY, 'crag-license-public.pem', 'crag-v2.payload.enc']
+    : [CRAG_V2_ENTRY, claude.path, 'crag-license-public.pem', 'crag-v2.payload.enc']
+  for (const required of requiredMembers) {
     if (!expected.has(required)) {
       return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest does not hash ${required}` }
+    }
+  }
+  // Ensure the manifest references at most one `claude-code-<semver>` directory.
+  for (const rel of expected) {
+    if (rel.startsWith('claude-code-') && !rel.startsWith(`${claude.dir}/`)) {
+      return {
+        ok: false,
+        code: 'crag_v2_manifest_invalid',
+        error: `CRAG v2 manifest mixes multiple official Claude versions: ${rel}`,
+      }
     }
   }
   const present = new Set(listed.filter((rel) => rel !== 'manifest.json'))
@@ -282,16 +471,15 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
   for (const rel of present) {
     if (!expected.has(rel)) {
       // A running slot may still exec the previous official Claude path.
-      if (allowPreviousClaude && retainedClaudePath(rel)) continue
+      if (allowPreviousClaude && retainedClaudePath(rel, claude.path)) continue
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package has unlisted file ${rel}` }
     }
     const file = path.join(dir, rel)
-    const body = fs.readFileSync(file)
-    const digest = crypto.createHash('sha256').update(body).digest('hex')
+    const { digest, head: body, size } = memberDigest(file)
     if (digest !== manifest.sha256[rel]) {
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 hash mismatch: ${rel}` }
     }
-    const requiredElf = rel === CRAG_V2_ENTRY || rel === CRAG_V2_CLAUDE
+    const requiredElf = rel === CRAG_V2_ENTRY || (!unbundledOfficial && rel === claude.path)
     if (requiredElf || body.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
       if (!requiredElf)
         return {
@@ -300,6 +488,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
           error: 'CRAG v2 may only ship the native bootstrap and separate official Claude executables',
         }
       if (
+        size < 64 ||
         body.length < 64 ||
         body.readUInt32BE(0) !== 0x7f454c46 ||
         body[4] !== 2 ||
@@ -322,6 +511,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       }
     }
   }
+  let verifiedExternalClaudeBin = null
   try {
     const auth = manifest.authorization
     const payload = manifest.payload
@@ -345,8 +535,23 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       payload.ciphertext_sha256 !== manifest.sha256[payload.path]
     )
       throw new Error('metadata')
-    const bytes = fs.readFileSync(path.join(dir, payload.path))
-    if (bytes.length <= 36 || bytes.subarray(0, 8).toString('ascii') !== 'CRAGV2E1') throw new Error('payload')
+    if (expectedIssuerPublicKeyId && auth.public_key_id !== expectedIssuerPublicKeyId) {
+      return {
+        ok: false,
+        code: 'crag_v2_identity_mismatch',
+        error: 'CRAG v2 issuer public key id does not match expected identity',
+      }
+    }
+    if (expectedPayloadKeyId && payload.key_id !== expectedPayloadKeyId) {
+      return {
+        ok: false,
+        code: 'crag_v2_identity_mismatch',
+        error: 'CRAG v2 payload key id does not match expected identity',
+      }
+    }
+    // Header only: the member loop above already hashed it against the manifest.
+    const { head, size } = memberDigest(path.join(dir, payload.path))
+    if (size <= 36 || head.subarray(0, 8).toString('ascii') !== 'CRAGV2E1') throw new Error('payload')
     const signed = {
       product: 'crag-v2',
       format: payload.format,
@@ -364,15 +569,140 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       )
     )
       throw new Error('signature')
+    const official = manifest.officialClaude
+    if (official && typeof official === 'object') {
+      if (official.bundled !== undefined && official.bundled !== true && !unbundledOfficial) {
+        throw new Error('official_claude_unbundled')
+      }
+      if (unbundledOfficial) {
+        if (typeof official.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(official.sha256)) {
+          throw new Error('official_claude_sha256')
+        }
+        if (typeof official.signature !== 'string' || !official.signature) {
+          throw new Error('official_claude_signature')
+        }
+        const signedOfficial = {
+          product: 'crag-v2',
+          arch: manifest.arch,
+          version: claude.version,
+          path: claude.path,
+          sha256: official.sha256,
+        }
+        if (
+          !crypto.verify(
+            null,
+            Buffer.concat([Buffer.from('CRAG-OFFICIAL-CLAUDE-V1\0'), Buffer.from(JSON.stringify(signedOfficial))]),
+            pub,
+            decodeLicenseBytes(official.signature, 64),
+          )
+        ) {
+          throw new Error('official_claude_signature')
+        }
+        const storeRoot = resolveHostSharedStoreDir('', { sharedClaudeStoreRoot })
+        if (!storeRoot) {
+          return {
+            ok: false,
+            code: 'crag_v2_shared_store_missing',
+            error: 'CRAG v2 unbundled officialClaude requires a configured read-only shared store root',
+          }
+        }
+        const versionsPrefix = path.join(storeRoot, 'claude', 'versions')
+        const candidateBin = externalClaudeBin || path.join(versionsPrefix, claude.version, 'claude')
+        const pathCheck = validateReadOnlyNoFollowPath(candidateBin, versionsPrefix, {
+          requireExecutable: true,
+          requireNotWritable: requireReadOnlyExternal,
+        })
+        if (!pathCheck.ok) {
+          return { ok: false, code: pathCheck.code, error: pathCheck.error }
+        }
+        const { digest: extDigest, head: extHead, size: extSize } = memberDigest(pathCheck.path)
+        if (
+          extSize < 64 ||
+          extHead.length < 64 ||
+          extHead.readUInt32BE(0) !== 0x7f454c46 ||
+          extHead[4] !== 2 ||
+          extHead[5] !== 1 ||
+          extHead[6] !== 1 ||
+          ![2, 3].includes(extHead.readUInt16LE(16))
+        ) {
+          return {
+            ok: false,
+            code: 'crag_v2_elf_invalid',
+            error: `CRAG v2 shared store official Claude must be a Linux ELF64 executable: ${pathCheck.path}`,
+          }
+        }
+        if (extHead.readUInt16LE(18) !== (manifest.arch === 'amd64' ? 62 : 183)) {
+          return {
+            ok: false,
+            code: 'crag_v2_arch_mismatch',
+            error: `CRAG v2 shared store official Claude arch does not match ${manifest.arch}`,
+          }
+        }
+        if (extDigest !== official.sha256) {
+          return {
+            ok: false,
+            code: 'crag_v2_hash_mismatch',
+            error: `CRAG v2 shared store official Claude SHA-256 mismatch: ${pathCheck.path}`,
+          }
+        }
+        verifiedExternalClaudeBin = pathCheck.path
+      } else {
+        const expectedSha = manifest.sha256[claude.path]
+        const requireOfficialSha =
+          official.sha256 !== undefined || (official.bundled === true && official.signature !== undefined)
+        if (requireOfficialSha) {
+          if (
+            typeof official.sha256 !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(official.sha256) ||
+            official.sha256 !== expectedSha
+          ) {
+            throw new Error('official_claude_sha256')
+          }
+        }
+        if (official.signature !== undefined) {
+          if (official.signature == null || typeof official.signature !== 'string') {
+            throw new Error('official_claude_signature')
+          }
+          const signedOfficial = {
+            product: 'crag-v2',
+            arch: manifest.arch,
+            version: claude.version,
+            path: claude.path,
+            sha256: expectedSha,
+          }
+          if (
+            !crypto.verify(
+              null,
+              Buffer.concat([Buffer.from('CRAG-OFFICIAL-CLAUDE-V1\0'), Buffer.from(JSON.stringify(signedOfficial))]),
+              pub,
+              decodeLicenseBytes(official.signature, 64),
+            )
+          )
+            throw new Error('official_claude_signature')
+        }
+      }
+    }
   } catch {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 encrypted package authorization is invalid' }
   }
-  return { ok: true, manifest }
+  return {
+    ok: true,
+    manifest,
+    claudePath: claude.path,
+    claudeVersion: claude.version,
+    bundledClaude: !unbundledOfficial,
+    ...(verifiedExternalClaudeBin ? { externalClaudeBin: verifiedExternalClaudeBin } : {}),
+  }
 }
 
-function retainedClaudePath(rel) {
-  const current = CRAG_V2_CLAUDE.split('/')[0]
-  return rel.startsWith('claude-code-') && !rel.startsWith(`${current}/`)
+export function retainedClaudePath(rel, currentPath = '') {
+  const relStr = String(rel || '')
+  const slash = relStr.indexOf('/')
+  if (slash <= 0) return false
+  const top = relStr.slice(0, slash)
+  if (!CRAG_CLAUDE_DIR_RE.test(top)) return false
+  const current = String(currentPath || '').split('/')[0]
+  return !current || top !== current
 }
 
 function restoreDirectoryContents(backup, dest) {
@@ -382,7 +712,7 @@ function restoreDirectoryContents(backup, dest) {
   }
 }
 
-export function stageCragV2Tree(src, dest) {
+export function stageCragV2Tree(src, dest, { arch, allowUnbundledStore, sharedClaudeStoreRoot } = {}) {
   const parent = path.dirname(dest)
   const staging = fs.mkdtempSync(path.join(parent, `.${path.basename(dest)}.new-`))
   let backup = ''
@@ -390,7 +720,12 @@ export function stageCragV2Tree(src, dest) {
     fs.cpSync(src, staging, { recursive: true, dereference: false })
     // mkdtemp is 0700. The slot user is not root, so it cannot exec the bootstrap inside it.
     fs.chmodSync(staging, 0o755)
-    const verified = verifyCragV2Tree(staging)
+    const verifyOpts = {
+      ...(arch ? { arch } : {}),
+      ...(allowUnbundledStore !== undefined ? { allowUnbundledStore } : {}),
+      ...(sharedClaudeStoreRoot ? { sharedClaudeStoreRoot } : {}),
+    }
+    const verified = verifyCragV2Tree(staging, Object.keys(verifyOpts).length ? verifyOpts : undefined)
     if (!verified.ok) {
       fs.rmSync(staging, { recursive: true, force: true })
       return verified
@@ -407,7 +742,7 @@ export function stageCragV2Tree(src, dest) {
       backup = `${staging}.bak`
       fs.cpSync(dest, backup, { recursive: true, dereference: false })
       try {
-        publishCragTree(staging, dest)
+        publishCragTree(staging, dest, verified.claudePath)
       } catch (error) {
         restoreDirectoryContents(backup, dest)
         fs.rmSync(backup, { recursive: true, force: true })
@@ -435,19 +770,367 @@ export function stageCragV2Tree(src, dest) {
   }
 }
 
-function publishCragTree(src, dest) {
-  const next = new Set(listCragV2Files(src))
-  for (const rel of next) replaceFile(path.join(src, rel), path.join(dest, rel))
-  for (const rel of listCragV2Files(dest)) {
-    if (next.has(rel) || retainedClaudePath(rel)) continue
-    fs.rmSync(path.join(dest, rel), { force: true })
+function activeClaudeDirOfTree(dir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+    return resolveManifestClaudePath(manifest)?.dir || ''
+  } catch {
+    return ''
   }
 }
 
-function cragV2WouldChange(src, destDir, select = true) {
+function publishCragTree(src, dest, nextClaudePath = '') {
+  const prevDir = activeClaudeDirOfTree(dest)
+  const nextDir = String(nextClaudePath || '').split('/')[0]
+  const upgradedVersion = Boolean(prevDir && nextDir && prevDir !== nextDir)
+  const next = new Set(listCragV2Files(src))
+  for (const rel of next) replaceFile(path.join(src, rel), path.join(dest, rel))
+  for (const rel of listCragV2Files(dest)) {
+    if (next.has(rel)) continue
+    // On an official Claude version upgrade, retain only the immediately previous
+    // active directory so running slots survive until restart and clean up older
+    // superseded versions. On a same-version resync, keep any previously retained
+    // directory intact because a running slot may still exec it before restart.
+    const keepPrevious = upgradedVersion
+      ? retainedClaudePath(rel, nextClaudePath) && rel.startsWith(`${prevDir}/`)
+      : retainedClaudePath(rel, nextClaudePath)
+    if (keepPrevious) continue
+    fs.rmSync(path.join(dest, rel), { force: true })
+  }
+  if (upgradedVersion) {
+    for (const entry of fs.readdirSync(dest, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !CRAG_CLAUDE_DIR_RE.test(entry.name)) continue
+      if (entry.name === nextDir || entry.name === prevDir) continue
+      try {
+        fs.rmSync(path.join(dest, entry.name), { recursive: true, force: true })
+      } catch {}
+    }
+  }
+}
+
+const SAFE_STORE_CRAG_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const SHARED_STORE_CRAG_SYMLINK_RE = /^versions\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/
+const DEFAULT_STORE_CRAG_RETAIN = 3
+
+function readSharedStoreCragSymlink(linkPath) {
+  try {
+    const st = fs.lstatSync(linkPath)
+    if (!st.isSymbolicLink()) return ''
+    const raw = fs.readlinkSync(linkPath).replaceAll('\\', '/')
+    const match = SHARED_STORE_CRAG_SYMLINK_RE.exec(raw)
+    return match ? `versions/${match[1]}` : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Safely resolve `<storeRoot>/crag/current` to a verified real directory path
+ * (never returning a symlink path, which `verifyCragV2Tree` rejects fail-closed).
+ */
+export function resolveSharedStoreCragCurrentDir(storeRoot) {
+  if (!storeRoot || typeof storeRoot !== 'string') return ''
+  const cragDir = path.join(storeRoot, 'crag')
+  const currentPath = path.join(cragDir, 'current')
+  let st
+  try {
+    st = fs.lstatSync(currentPath)
+  } catch {
+    return ''
+  }
+  if (st.isSymbolicLink()) {
+    const rel = readSharedStoreCragSymlink(currentPath)
+    if (!rel) return ''
+    const versionsDir = path.join(cragDir, 'versions')
+    try {
+      const vSt = fs.lstatSync(versionsDir)
+      if (vSt.isSymbolicLink() || !vSt.isDirectory()) return ''
+      const target = path.join(versionsDir, rel.slice('versions/'.length))
+      const tSt = fs.lstatSync(target)
+      return !tSt.isSymbolicLink() && tSt.isDirectory() ? target : ''
+    } catch {
+      return ''
+    }
+  }
+  return st.isDirectory() ? currentPath : ''
+}
+
+function atomicReplaceRelativeSymlink(linkPath, relativeTarget) {
+  const dir = path.dirname(linkPath)
+  const base = path.basename(linkPath)
+  const tmpLink = path.join(dir, `.${base}.next.${crypto.randomBytes(6).toString('hex')}`)
+  try {
+    fs.symlinkSync(relativeTarget, tmpLink)
+    fs.renameSync(tmpLink, linkPath)
+  } catch (error) {
+    try {
+      fs.rmSync(tmpLink, { force: true })
+    } catch {}
+    throw error
+  }
+}
+
+function pruneSharedStoreCragVersions(versionsDir, protectedNames, retainCount = DEFAULT_STORE_CRAG_RETAIN) {
+  const keepTotal = Math.max(2, Number(retainCount) || DEFAULT_STORE_CRAG_RETAIN)
+  let entries
+  try {
+    entries = fs.readdirSync(versionsDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  const rows = []
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !SAFE_STORE_CRAG_VERSION_RE.test(entry.name)) continue
+    const full = path.join(versionsDir, entry.name)
+    try {
+      const st = fs.lstatSync(full)
+      if (st.isSymbolicLink() || !st.isDirectory()) continue
+      rows.push({ name: entry.name, dir: full, mtimeMs: st.mtimeMs })
+    } catch {}
+  }
+  rows.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  let kept = 0
+  for (const row of rows) {
+    if (protectedNames.has(row.name)) {
+      kept += 1
+      continue
+    }
+  }
+  let extraKept = 0
+  const extraLimit = Math.max(0, keepTotal - kept)
+  for (const row of rows) {
+    if (protectedNames.has(row.name)) continue
+    if (extraKept < extraLimit) {
+      extraKept += 1
+      continue
+    }
+    try {
+      fs.rmSync(row.dir, { recursive: true, force: true })
+    } catch {}
+  }
+}
+
+export function sharedStoreCragWouldChange(src, storeRoot, arch = cragV2Arch(), verifyOpts = {}) {
+  if (!src || !storeRoot) return false
+  const currentLink = path.join(storeRoot, 'crag', 'current')
+  const rel = readSharedStoreCragSymlink(currentLink)
+  if (!rel) return true
+  const currentDir = resolveSharedStoreCragCurrentDir(storeRoot)
+  if (!currentDir) return true
+  if (!filesEqual(path.join(src, 'manifest.json'), path.join(currentDir, 'manifest.json'))) return true
+  return verifyCragV2Tree(currentDir, { arch, allowPreviousClaude: true, ...verifyOpts }).ok !== true
+}
+
+/**
+ * Atomically sync the active verified CRAG v2 package into `<storeHost>/crag/versions/<version>`
+ * and switch the relative symlink `<storeHost>/crag/current -> versions/<version>` (preserving
+ * `previous` and immutable version directories so running custom-erofs KVM guests stay intact).
+ */
+export function syncSharedStoreCrag(
+  projectRoot,
+  {
+    sharedStoreHostDir = '',
+    arch = cragTargetArch(projectRoot),
+    srcDir = '',
+    allowUnbundledStore = true,
+    allowPreviousClaude = false,
+    requireStore = false,
+    retainCount = DEFAULT_STORE_CRAG_RETAIN,
+  } = {},
+) {
+  const storeHost = resolveHostSharedStoreDir(projectRoot, { sharedStoreHostDir })
+  if (!storeHost || !fs.existsSync(storeHost)) {
+    if (requireStore) {
+      return { ok: false, code: 'shared_store_missing', error: 'shared store root directory is missing' }
+    }
+    return { ok: true, skipped: true, changed: false, dir: '', version: '' }
+  }
+  let src = String(srcDir || '').trim()
+  if (!src) {
+    try {
+      src = cragV2PackageRoot(projectRoot, arch)
+    } catch (error) {
+      return { ok: false, code: error.code || 'kernel_cache_invalid', error: error.message }
+    }
+  }
+  if (!src) return missingCragPackageResult(projectRoot, arch)
+
+  const verifyOpts = {
+    arch,
+    allowUnbundledStore,
+    sharedClaudeStoreRoot: storeHost,
+  }
+  const verified = verifyCragV2Tree(src, { ...verifyOpts, allowPreviousClaude })
+  if (!verified.ok) return verified
+
+  const srcManifestPath = path.join(src, 'manifest.json')
+  const manifestSha = crypto.createHash('sha256').update(fs.readFileSync(srcManifestPath)).digest('hex')
+  const cragDir = path.join(storeHost, 'crag')
+  const versionsDir = path.join(cragDir, 'versions')
+  const currentLink = path.join(cragDir, 'current')
+  const previousLink = path.join(cragDir, 'previous')
+
+  const prevRel = readSharedStoreCragSymlink(currentLink)
+  const curDir = resolveSharedStoreCragCurrentDir(storeHost)
+  if (
+    prevRel &&
+    curDir &&
+    filesEqual(srcManifestPath, path.join(curDir, 'manifest.json')) &&
+    verifyCragV2Tree(curDir, { ...verifyOpts, allowPreviousClaude: true }).ok === true
+  ) {
+    return {
+      ok: true,
+      changed: false,
+      dir: curDir,
+      currentLink,
+      target: prevRel,
+      previous: readSharedStoreCragSymlink(previousLink) || null,
+      version: prevRel.slice('versions/'.length),
+      manifest_sha256: manifestSha,
+    }
+  }
+
+  const rawVer = String(verified.manifest?.software_version || verified.manifest?.version || 'v2').trim()
+  const baseVersion = SAFE_STORE_CRAG_VERSION_RE.test(rawVer) ? rawVer : 'v2'
+  const sha8 = manifestSha.slice(0, 8)
+  const matchesVerifiedDir = (dir) => {
+    try {
+      const st = fs.lstatSync(dir)
+      if (st.isSymbolicLink() || !st.isDirectory()) return false
+    } catch {
+      return false
+    }
+    return filesEqual(srcManifestPath, path.join(dir, 'manifest.json')) && verifyCragV2Tree(dir, verifyOpts).ok === true
+  }
+
+  let targetName = ''
+  let reuseExisting = false
+  const candidates = [baseVersion, `${baseVersion}-${sha8}`]
+  for (const candidate of candidates) {
+    if (matchesVerifiedDir(path.join(versionsDir, candidate))) {
+      targetName = candidate
+      reuseExisting = true
+      break
+    }
+  }
+  if (!targetName) {
+    for (const candidate of candidates) {
+      if (!fs.lstatSync(path.join(versionsDir, candidate), { throwIfNoEntry: false })) {
+        targetName = candidate
+        break
+      }
+    }
+  }
+  if (!targetName) {
+    targetName = `${baseVersion}-${sha8}-${crypto.randomBytes(3).toString('hex')}`
+  }
+
+  const targetDir = path.join(versionsDir, targetName)
+  if (!reuseExisting) {
+    let staging = ''
+    try {
+      fs.mkdirSync(versionsDir, { recursive: true, mode: 0o755 })
+      if (process.platform !== 'win32') {
+        fs.chmodSync(cragDir, 0o755)
+        fs.chmodSync(versionsDir, 0o755)
+      }
+      const listed = ['manifest.json', ...Object.keys(verified.manifest.sha256)]
+      staging = fs.mkdtempSync(path.join(versionsDir, `.${targetName}.tmp-`))
+      if (process.platform !== 'win32') fs.chmodSync(staging, 0o755)
+      const createdDirs = new Set([staging])
+      for (const rel of listed) {
+        const srcFile = path.join(src, rel)
+        const dstFile = path.join(staging, rel)
+        const parent = path.dirname(dstFile)
+        if (!createdDirs.has(parent)) {
+          fs.mkdirSync(parent, { recursive: true, mode: 0o755 })
+          if (process.platform !== 'win32') {
+            let cur = parent
+            while (cur.startsWith(staging) && !createdDirs.has(cur)) {
+              fs.chmodSync(cur, 0o755)
+              createdDirs.add(cur)
+              cur = path.dirname(cur)
+            }
+          } else {
+            createdDirs.add(parent)
+          }
+        }
+        fs.copyFileSync(srcFile, dstFile)
+        if (process.platform !== 'win32') {
+          const isExec = rel === CRAG_V2_ENTRY || (verified.bundledClaude && rel === verified.claudePath)
+          fs.chmodSync(dstFile, isExec ? 0o555 : 0o444)
+        }
+      }
+      const stagedCheck = verifyCragV2Tree(staging, verifyOpts)
+      if (!stagedCheck.ok) {
+        fs.rmSync(staging, { recursive: true, force: true })
+        return stagedCheck
+      }
+      try {
+        fs.renameSync(staging, targetDir)
+        staging = ''
+      } catch (error) {
+        if ((error?.code === 'EEXIST' || error?.code === 'ENOTEMPTY') && matchesVerifiedDir(targetDir)) {
+          fs.rmSync(staging, { recursive: true, force: true })
+          staging = ''
+          reuseExisting = true
+        } else {
+          throw error
+        }
+      }
+    } catch (error) {
+      if (staging) {
+        try {
+          fs.rmSync(staging, { recursive: true, force: true })
+        } catch {}
+      }
+      return { ok: false, code: 'crag_v2_store_sync_failed', error: String(error?.message || error) }
+    }
+  }
+
+  const targetRel = `versions/${targetName}`
+  try {
+    const existingCurrent = fs.lstatSync(currentLink, { throwIfNoEntry: false })
+    if (existingCurrent && !existingCurrent.isSymbolicLink() && existingCurrent.isDirectory()) {
+      const legacyDest = path.join(versionsDir, `legacy-${crypto.randomBytes(4).toString('hex')}`)
+      fs.renameSync(currentLink, legacyDest)
+    }
+    if (prevRel && prevRel !== targetRel) {
+      atomicReplaceRelativeSymlink(previousLink, prevRel)
+    }
+    atomicReplaceRelativeSymlink(currentLink, targetRel)
+  } catch (error) {
+    return { ok: false, code: 'crag_v2_store_sync_failed', error: String(error?.message || error) }
+  }
+
+  const nextPrevious = readSharedStoreCragSymlink(previousLink)
+  const protectedNames = new Set([targetName])
+  if (nextPrevious) protectedNames.add(nextPrevious.slice('versions/'.length))
+  pruneSharedStoreCragVersions(versionsDir, protectedNames, retainCount)
+
+  return {
+    ok: true,
+    changed: true,
+    reused: reuseExisting,
+    dir: targetDir,
+    currentLink,
+    target: targetRel,
+    previous: nextPrevious || null,
+    version: targetName,
+    manifest_sha256: manifestSha,
+  }
+}
+
+function shouldSyncSharedStoreCrag(vm, storeRoot, runtimeOptions = {}) {
+  if (!storeRoot || clusterDockerSlot(vm)) return false
+  if (!isCustomOsSlot(vm, runtimeOptions)) return false
+  return Boolean(runtimeOptions.sharedStoreHostDir || fs.existsSync(storeRoot))
+}
+
+function cragV2WouldChange(src, destDir, select = true, arch = cragV2Arch(), verifyOpts = {}) {
   const destRoot = path.join(destDir, CRAG_V2_DIR)
   if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
-  if (verifyCragV2Tree(destRoot, { allowPreviousClaude: true }).ok !== true) return true
+  if (verifyCragV2Tree(destRoot, { arch, allowPreviousClaude: true, ...verifyOpts }).ok !== true) return true
   if (!select) return false
   try {
     const wrapper = fs.lstatSync(path.join(destDir, WRAP_KERNEL_WRAPPER))
@@ -476,26 +1159,48 @@ function writeCragV2Wrapper(destDir) {
   }
 }
 
-export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, select = true } = {}) {
+function missingCragPackageResult(projectRoot, slotArch) {
+  if (slotArch && slotArch !== 'amd64') {
+    try {
+      if (cragV2PackageRoot(projectRoot, 'amd64')) {
+        return {
+          ok: false,
+          code: 'crag_v2_arch_mismatch',
+          error: `CRAG v2 arch amd64 does not match ${slotArch}`,
+        }
+      }
+    } catch {}
+  }
+  return {
+    ok: false,
+    code: 'crag_v2_package_missing',
+    error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
+  }
+}
+
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, select = true, ...runtimeOptions } = {}) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
   const placement = cragV2PlacementError(vm)
   if (placement) return placement
+  const slotArch = cragSlotArch(projectRoot, vm, runtimeOptions)
   let src
   try {
-    src = cragV2PackageRoot(projectRoot)
+    src = cragV2PackageRoot(projectRoot, slotArch)
   } catch (error) {
     return { ok: false, code: error.code, error: error.message }
   }
   if (!src) {
-    return {
-      ok: false,
-      code: 'crag_v2_package_missing',
-      error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
-    }
+    return missingCragPackageResult(projectRoot, slotArch)
   }
-  const verified = verifyCragV2Tree(src)
+  const customOs = isCustomOsSlot(vm, runtimeOptions)
+  const storeRoot = customOs ? resolveHostSharedStoreDir(projectRoot, runtimeOptions) : ''
+  const verifyOpts = {
+    arch: slotArch,
+    ...(customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+  }
+  const verified = verifyCragV2Tree(src, verifyOpts)
   if (!verified.ok) return verified
   // Preinstallation only copies encrypted distribution files; runtime admission
   // and the encrypted native binary itself enforce licensing on start. Keep refusing
@@ -519,7 +1224,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
       dataplane: 'crag',
       kernel_version: 'v2',
       runtime_variant: 'crag-v2',
-      claude_bin: CRAG_V2_CLAUDE,
+      claude_bin: verified.claudePath,
       changed: false,
       kernel_changed: false,
       glibc_shim: false,
@@ -529,35 +1234,42 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
-  if (!cragV2WouldChange(src, dest, select)) {
+  const customKvm = isCustomKvmMode({ vm, ...runtimeOptions })
+  const syncStore = shouldSyncSharedStoreCrag(vm, storeRoot, runtimeOptions)
+  const slotNeedsUpdate = cragV2WouldChange(src, dest, select, slotArch, verifyOpts)
+  if (!slotNeedsUpdate) {
     try {
       fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
     } catch {}
     chownTree(dest, uid, gid)
-    return {
-      ok: true,
-      dest,
-      src,
-      dataplane: 'crag',
-      kernel_version: 'v2',
-      runtime_variant: 'crag-v2',
-      changed: false,
-      kernel_changed: false,
-      glibc_shim: false,
-      wrapper: true,
-      kernel_bin: true,
+  } else {
+    const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR), verifyOpts)
+    if (!tree.ok) return tree
+    try {
+      if (select) writeCragV2Wrapper(dest)
+    } catch (error) {
+      tree.rollback()
+      return { ok: false, code: 'crag_v2_stage_failed', error: String(error?.message || error) }
+    }
+    tree.commit()
+    chownTree(dest, uid, gid)
+  }
+  let storeChanged = false
+  if (syncStore) {
+    const storeSync = syncSharedStoreCrag(projectRoot, {
+      sharedStoreHostDir: storeRoot,
+      arch: slotArch,
+      srcDir: src,
+      allowUnbundledStore: true,
+    })
+    if (!storeSync.ok) {
+      if (customKvm) return storeSync
+    } else {
+      storeChanged = storeSync.changed === true
     }
   }
-  const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR))
-  if (!tree.ok) return tree
-  try {
-    if (select) writeCragV2Wrapper(dest)
-  } catch (error) {
-    tree.rollback()
-    return { ok: false, code: 'crag_v2_stage_failed', error: String(error?.message || error) }
-  }
-  tree.commit()
-  chownTree(dest, uid, gid)
+  const changed = slotNeedsUpdate || storeChanged
+  const kernelChanged = select && (slotNeedsUpdate || (customKvm && storeChanged))
   return {
     ok: true,
     dest,
@@ -565,11 +1277,12 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
     dataplane: 'crag',
     kernel_version: 'v2',
     runtime_variant: 'crag-v2',
-    changed: true,
-    kernel_changed: select,
+    changed,
+    kernel_changed: kernelChanged,
+    ...(syncStore ? { shared_store_crag_changed: storeChanged } : {}),
     glibc_shim: false,
-    wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
-    kernel_bin: isFile(path.join(dest, CRAG_V2_DIR, CRAG_V2_ENTRY)),
+    wrapper: slotNeedsUpdate ? isFile(path.join(dest, WRAP_KERNEL_WRAPPER)) : true,
+    kernel_bin: slotNeedsUpdate ? isFile(path.join(dest, CRAG_V2_DIR, CRAG_V2_ENTRY)) : true,
   }
 }
 
@@ -912,7 +1625,11 @@ function installKernelPayload(src, dest, projectRoot = '') {
   return kernelChanged
 }
 
-export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, nativeCliOptions } = {}) {
+export function materializeWrapCli(
+  projectRoot,
+  vm,
+  { uid = null, gid = null, nativeCliOptions, ...runtimeOptions } = {},
+) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
@@ -927,7 +1644,7 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
   const native = nativeCliForVm(vm, src, nativeCliOptions)
   if (native && !native.ok) return native
   if (isKvmRuntime(vm) && !isCodexVm(vm) && !clusterDockerSlot(vm)) {
-    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false })
+    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false, ...runtimeOptions })
     if (!crag.ok) return crag
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
@@ -1228,7 +1945,7 @@ function payloadWouldChange(srcDir, destDir, projectRoot, native) {
   ]
   return pairs.some(([src, dest]) => kernelWouldChange(src, dest))
 }
-export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptions } = {}) {
+export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptions, ...runtimeOptions } = {}) {
   const sample = describeWrapSample(projectRoot)
   const items = []
   for (const vm of vms || []) {
@@ -1237,9 +1954,10 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
     const destDir = wrapCliHomeDir(projectRoot, vm.id)
     if (dataplane === 'crag') {
       const placement = cragV2PlacementError(vm)
+      const slotArch = cragSlotArch(projectRoot, vm, runtimeOptions)
       let src
       try {
-        src = cragV2PackageRoot(projectRoot)
+        src = cragV2PackageRoot(projectRoot, slotArch)
       } catch (error) {
         items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: false, code: error.code, kernel_changed: false })
         continue
@@ -1256,17 +1974,24 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
         continue
       }
       if (!src) {
+        const missing = missingCragPackageResult(projectRoot, slotArch)
         items.push({
           id: vm.id,
           dataplane,
           kernel_version: 'v2',
           ok: false,
-          code: 'crag_v2_package_missing',
+          code: missing.code,
           kernel_changed: false,
         })
         continue
       }
-      const verified = verifyCragV2Tree(src)
+      const customOs = isCustomOsSlot(vm, runtimeOptions)
+      const storeRoot = customOs ? resolveHostSharedStoreDir(projectRoot, runtimeOptions) : ''
+      const verifyOpts = {
+        arch: slotArch,
+        ...(customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+      }
+      const verified = verifyCragV2Tree(src, verifyOpts)
       if (!verified.ok) {
         items.push({
           id: vm.id,
@@ -1278,9 +2003,16 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
         })
         continue
       }
+      const storeNeedsUpdate =
+        !clusterDockerSlot(vm) &&
+        isCustomKvmMode({ vm, ...runtimeOptions }) &&
+        shouldSyncSharedStoreCrag(vm, storeRoot, runtimeOptions) &&
+        sharedStoreCragWouldChange(src, storeRoot, slotArch, verifyOpts)
       const kernelChanged = clusterDockerSlot(vm)
         ? false
-        : cragV2WouldChange(src, destDir) || Boolean(vm?.kernel_restart_pending)
+        : cragV2WouldChange(src, destDir, true, slotArch, verifyOpts) ||
+          storeNeedsUpdate ||
+          Boolean(vm?.kernel_restart_pending)
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }

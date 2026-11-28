@@ -20,7 +20,12 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { SEAT_CAP_MAX, SeatCells } from '@/components/scheduler-viz'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { ChipGroup } from '@/features/settings/scheduler-controls'
+import { NodePoolBadges } from '@/features/pools/node-pool-badges'
+import { WeightTierBadge } from '@/features/pools/pool-badges'
+import {
+  ChipGroup,
+  FamilyLimitSelect,
+} from '@/features/settings/scheduler-controls'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 import {
   CONC_STEPS,
@@ -58,6 +63,9 @@ function SeatSessionList({ sessions }: { sessions: Vm['seat_sessions'] }) {
                 ? '粘性'
                 : '占用'}
             {Number(seat.inflight) > 1 ? ` ×${seat.inflight}` : ''}
+            {seat.subagents_max != null
+              ? ` · 子代理 ${seat.subagents_running ?? 0}/${seat.subagents_max} · 排队 ${seat.subagents_queued ?? 0}`
+              : ''}
           </span>
         </li>
       ))}
@@ -69,6 +77,8 @@ type Knob<T> = { own: boolean; value: T }
 type QuotaKey = keyof VmQuotaView
 type Draft = {
   seats: Knob<number>
+  primary: Knob<number>
+  subagents: Knob<number>
   conc: Knob<number>
   rpm: Knob<number>
   sessions: Knob<number>
@@ -131,6 +141,23 @@ function draftOf(vm: Vm): Draft {
       own: vm.session_slots_override === true,
       value: Number(
         vm.session_slots ?? inherited?.session_slots ?? SEAT_CAP_MAX
+      ),
+    },
+    primary: {
+      own: vm.max_primary_sessions_override === true,
+      value: Number(
+        vm.max_primary_sessions ??
+          inherited?.max_primary_sessions ??
+          vm.session_slots ??
+          SEAT_CAP_MAX
+      ),
+    },
+    subagents: {
+      own: vm.max_subagents_per_session_override === true,
+      value: Number(
+        vm.max_subagents_per_session ??
+          inherited?.max_subagents_per_session ??
+          0
       ),
     },
     conc: {
@@ -198,7 +225,13 @@ function patchOf(vm: Vm, draft: Draft): VmPatch {
   const body: VmPatch = {}
   const before = draftOf(vm)
   const knob = (
-    key: 'session_slots' | 'max_concurrency' | 'max_rpm' | 'max_sessions',
+    key:
+      | 'session_slots'
+      | 'max_primary_sessions'
+      | 'max_subagents_per_session'
+      | 'max_concurrency'
+      | 'max_rpm'
+      | 'max_sessions',
     next: Knob<number>,
     prev: Knob<number>
   ) => {
@@ -208,7 +241,11 @@ function patchOf(vm: Vm, draft: Draft): VmPatch {
       body[key] = null
     }
   }
-  if (!isCodexVm(vm)) knob('session_slots', draft.seats, before.seats)
+  if (!isCodexVm(vm)) {
+    knob('session_slots', draft.seats, before.seats)
+    knob('max_primary_sessions', draft.primary, before.primary)
+    knob('max_subagents_per_session', draft.subagents, before.subagents)
+  }
   knob('max_concurrency', draft.conc, before.conc)
   knob('max_rpm', draft.rpm, before.rpm)
   if (isCodexVm(vm)) knob('max_sessions', draft.sessions, before.sessions)
@@ -252,6 +289,8 @@ function overrideCount(vm: Vm): number {
   return (
     quota +
     Number(vm.session_slots_override === true) +
+    Number(vm.max_primary_sessions_override === true) +
+    Number(vm.max_subagents_per_session_override === true) +
     Number(vm.concurrency_override === true) +
     Number(vm.rpm_override === true) +
     Number(vm.max_sessions_override === true) +
@@ -294,7 +333,7 @@ function Tile({
 }
 
 /**
- * VM 内的「调度」块：席位、并发、RPM、调度优先级与配额闸的生效值；
+ * VM 内的「调度」块：执行位、并发、RPM、调度优先级与配额闸的生效值；
  * 本槽覆盖的项高亮，悬停看全局值，一个弹窗改全部。
  */
 export function VmSchedulingBlock({
@@ -341,7 +380,7 @@ export function VmSchedulingBlock({
       {codex ? null : (
         <div className='space-y-1' title={seatTitle(vm)}>
           <div className='flex items-baseline justify-between gap-2 text-xs'>
-            <span className='text-muted-foreground'>席位</span>
+            <span className='text-muted-foreground'>执行位</span>
             <span className='tabular-nums'>
               {seatsUsed}/{seatsMax}
               {vm.seats_grace ? ` · 交接 ${vm.seats_grace}` : ''}
@@ -391,7 +430,7 @@ export function VmSchedulingBlock({
         />
         {codex ? null : (
           <Tile
-            label='席位上限'
+            label='执行位上限'
             value={vm.session_slots ?? '—'}
             own={vm.session_slots_override}
             title={
@@ -400,6 +439,34 @@ export function VmSchedulingBlock({
                 : '跟随全局'
             }
           />
+        )}
+        {codex ? null : (
+          <Tile
+            label='主会话上限'
+            value={vm.max_primary_sessions ?? seatsMax}
+            own={vm.max_primary_sessions_override}
+            title={
+              vm.max_primary_sessions_override
+                ? `本槽钉住；全局 ${inherited?.max_primary_sessions ?? seatsMax}`
+                : '跟随全局；未设置全局时等于执行位上限'
+            }
+          />
+        )}
+        {codex ? null : (
+          <div className='col-span-2'>
+            <Tile
+              label='每会话子代理上限'
+              value={vm.max_subagents_per_session ?? '关闭(子代理各占一个执行位)'}
+              own={vm.max_subagents_per_session_override}
+              title={
+                vm.max_subagents_per_session_override
+                  ? `本槽钉住；全局 ${inherited?.max_subagents_per_session ?? '关闭'}`
+                  : vm.max_subagents_per_session == null
+                    ? '跟随全局；全局留空时关闭家族模式'
+                    : `跟随全局；每个主会话最多 ${vm.max_subagents_per_session} 个`
+              }
+            />
+          </div>
         )}
         {codex ? (
           <Tile
@@ -421,7 +488,7 @@ export function VmSchedulingBlock({
               : '—'
           }
           own={vm.schedule_level_mode === 'manual'}
-          title='数值越大越优先；自动模式按 7D 重置倒计时计算'
+          title='权重等级 1–10，数值越大越优先；manual 为手动固定，auto 按 7D 重置倒计时计算（1–7）'
         />
         <Tile
           label='工作时段'
@@ -461,6 +528,23 @@ export function VmSchedulingBlock({
               />
             ))}
       </div>
+      {Number.isInteger(level) && level >= 1 && level <= 10 ? (
+        <div className='flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2 text-[11px]'>
+          <div className='flex flex-wrap items-center gap-1.5'>
+            <span className='text-muted-foreground'>权重模式</span>
+            <WeightTierBadge
+              tier={level}
+              mode={vm.schedule_level_mode === 'manual' ? 'manual' : 'auto'}
+            />
+          </div>
+          <NodePoolBadges pools={vm.pools} maxVisible={3} />
+        </div>
+      ) : vm.pools?.length ? (
+        <div className='flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2 text-[11px]'>
+          <span className='text-muted-foreground'>所属分组池</span>
+          <NodePoolBadges pools={vm.pools} maxVisible={3} />
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -571,6 +655,8 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
     setDraft({
       ...draft,
       seats: { ...draft.seats, own: false },
+      primary: { ...draft.primary, own: false },
+      subagents: { ...draft.subagents, own: false },
       conc: { ...draft.conc, own: false },
       rpm: { ...draft.rpm, own: false },
       sessions: { ...draft.sessions, own: false },
@@ -612,12 +698,12 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
           <div className='space-y-4'>
             <section className='space-y-2'>
               <h4 className='text-xs font-medium text-muted-foreground'>
-                席位与流量
+                执行位与流量
               </h4>
               {codex ? null : (
                 <KnobRow
-                  label='席位上限'
-                  desc='本 VM 同时能占住的 client session 数。请求进行中占槽，对话结束即释放；粘性 TTL 只记住 VM，不占席位。同 session 的并发请求共用一个席位。'
+                  label='执行位上限'
+                  desc='默认控制同时占用的物理执行位数（回合结束即让位）；开启家族模式时，主会话与子代理共同占用本 VM 的物理执行位。'
                   inheritedText={String(inherited?.session_slots ?? '—')}
                   own={draft.seats.own}
                   onOwnChange={(own) =>
@@ -626,7 +712,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                   disabled={pending}
                 >
                   <ChipGroup
-                    label='席位上限'
+                    label='执行位上限'
                     value={draft.seats.value}
                     options={withCurrent(
                       SEAT_CAP_STEPS.map((n): [number, string] => [
@@ -644,6 +730,67 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                     used={Number(vm.seats_used) || 0}
                     grace={Number(vm.seats_grace) || 0}
                     max={draft.seats.value}
+                  />
+                </KnobRow>
+              )}
+              {codex ? null : (
+                <KnobRow
+                  label='主会话上限'
+                  desc='家族模式下每台 VM 同时占用的根会话（主会话）数。留空全局时默认跟随执行位上限。'
+                  inheritedText={String(
+                    inherited?.max_primary_sessions ?? vm.session_slots ?? '—'
+                  )}
+                  own={draft.primary.own}
+                  onOwnChange={(own) =>
+                    setDraft({ ...draft, primary: { ...draft.primary, own } })
+                  }
+                  disabled={pending}
+                >
+                  <FamilyLimitSelect
+                    label='主会话上限'
+                    min={1}
+                    value={draft.primary.value}
+                    onChange={(value) =>
+                      value != null &&
+                      setDraft({
+                        ...draft,
+                        primary: { own: true, value },
+                      })
+                    }
+                    disabled={pending}
+                  />
+                </KnobRow>
+              )}
+              {codex ? null : (
+                <KnobRow
+                  label='每会话子代理上限'
+                  desc='开启家族模式后限制每个主会话并发的子代理数；0 表示子代理在根 VM 排队直至超时，全局留空时默认关闭家族模式。'
+                  inheritedText={
+                    inherited?.max_subagents_per_session == null
+                      ? '关闭(子代理各占一个执行位)'
+                      : String(inherited.max_subagents_per_session)
+                  }
+                  own={draft.subagents.own}
+                  onOwnChange={(own) =>
+                    setDraft({
+                      ...draft,
+                      subagents: { ...draft.subagents, own },
+                    })
+                  }
+                  disabled={pending}
+                >
+                  <FamilyLimitSelect
+                    label='每会话子代理上限'
+                    min={0}
+                    value={draft.subagents.value}
+                    onChange={(value) =>
+                      value != null &&
+                      setDraft({
+                        ...draft,
+                        subagents: { own: true, value },
+                      })
+                    }
+                    disabled={pending}
                   />
                 </KnobRow>
               )}

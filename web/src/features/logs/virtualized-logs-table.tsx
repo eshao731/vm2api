@@ -1,5 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
-import { useInfiniteQuery } from '@tanstack/react-query'
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { QueryClientContext, useInfiniteQuery } from '@tanstack/react-query'
 import type { UsageLogFilters, UsageLogRow } from '@/types/panel-usage-logs'
 import { ArrowUp, Loader2 } from 'lucide-react'
 import {
@@ -25,13 +32,72 @@ import {
   StatusBadge,
   ThinkingEffortDisplay,
 } from './log-cells'
-import { cacheWriteSplit, copyText, hasFastMode } from './log-display'
+import {
+  cacheWriteSplit,
+  copyText,
+  dedupeUsageLogs,
+  hasFastMode,
+  isInFlightLog,
+  logRowKey,
+  resolveLiveMeta,
+} from './log-display'
 import { ProviderCell } from './provider-chain-popover'
-import { usageLogsBatchQueryOptions } from './queries'
+import {
+  fetchUsageLogsPage,
+  mergeFirstUsageLogsPage,
+  usageLogsBatchQueryOptions,
+} from './queries'
 import { RelativeTime } from './relative-time'
 
 const ROW_HEIGHT = 52
 const SCROLL_TOP_THRESHOLD = 500
+
+type LiveTickListener = () => void
+const liveTickListeners = new Set<LiveTickListener>()
+let liveTickInterval: number | null = null
+
+// 单一 1s 心跳仅在存在在飞请求行时启动；无在飞请求时零定时器开销。
+function subscribeToLiveTick(listener: LiveTickListener): () => void {
+  liveTickListeners.add(listener)
+  if (liveTickInterval == null && typeof window !== 'undefined') {
+    liveTickInterval = window.setInterval(() => {
+      for (const fn of liveTickListeners) fn()
+    }, 1000)
+  }
+  return () => {
+    liveTickListeners.delete(listener)
+    if (liveTickListeners.size === 0 && liveTickInterval != null) {
+      window.clearInterval(liveTickInterval)
+      liveTickInterval = null
+    }
+  }
+}
+
+export function LiveElapsedDuration({
+  startedAtMs,
+  fallbackDurationMs,
+}: {
+  startedAtMs: number | null
+  fallbackDurationMs?: number | null
+}) {
+  const [now, setNow] = useState(() => Date.now())
+  const isActive = startedAtMs != null
+  useEffect(() => {
+    if (!isActive) return
+    return subscribeToLiveTick(() => setNow(Date.now()))
+  }, [isActive])
+  if (startedAtMs == null) {
+    return <span>{formatDuration(fallbackDurationMs)}</span>
+  }
+  return (
+    <span
+      data-live-elapsed='true'
+      className='tabular-nums text-sky-700 dark:text-sky-300'
+    >
+      {formatDuration(Math.max(0, now - startedAtMs))}
+    </span>
+  )
+}
 
 export type DetailTab = 'summary' | 'logic-trace' | 'performance' | 'raw'
 
@@ -64,29 +130,34 @@ function HeadCell({
 }
 
 function CostBadges({ row }: { row: UsageLogRow }) {
-  const fast = hasFastMode(row)
+  const speed =
+    row.serviceTier === 'ultrafast'
+      ? 'Ultrafast'
+      : hasFastMode(row)
+        ? 'fast'
+        : null
   const context1m = Boolean(row.context1mApplied)
-  if (fast && context1m) {
+  if (speed && context1m) {
     return (
       <Badge
         variant='outline'
         className='gap-0 px-0.5 text-[9px] leading-3'
-        title='fast + 1M 上下文'
+        title={`${speed} + 1M 上下文`}
       >
-        <span className='text-orange-700 dark:text-orange-300'>fast</span>
+        <span className='text-orange-700 dark:text-orange-300'>{speed}</span>
         <span className='text-muted-foreground'>·</span>
         <span className='text-purple-700 dark:text-purple-300'>1M</span>
       </Badge>
     )
   }
-  if (fast) {
+  if (speed) {
     return (
       <Badge
         variant='outline'
         className={FAST_BADGE}
-        title='优先服务等级（fast 模式）'
+        title={`发送档位 ${speed}`}
       >
-        fast
+        {speed}
       </Badge>
     )
   }
@@ -109,6 +180,8 @@ function LogRow({
   hidden: (column: LogsTableColumn) => boolean
   onOpenDetail: OpenDetail
 }) {
+  const inFlight = isInFlightLog(row)
+  const live = inFlight ? resolveLiveMeta(row) : null
   const nonBilling = isNonBillingEndpoint(row.endpoint)
   const cache = cacheWriteSplit({
     total: row.cacheCreationInputTokens,
@@ -118,6 +191,11 @@ function LogRow({
   })
   const rate = calculateOutputRate(row.outputTokens, row.generationMs)
   const showRate = rate != null
+  const effectiveTtftMs = live?.ttftMs ?? row.ttftMs
+  const hidePendingTokens =
+    inFlight && !row.inputTokens && !row.outputTokens
+  const hidePendingCache =
+    inFlight && !row.cacheCreationInputTokens && !row.cacheReadInputTokens
 
   return (
     <>
@@ -222,52 +300,60 @@ function LogRow({
       )}
       {hidden('tokens') ? null : (
         <div className='min-w-[70px] flex-[0.7] px-1.5 text-right font-mono text-xs'>
-          <Tooltip delayDuration={250}>
-            <TooltipTrigger asChild>
-              <div className='flex cursor-help flex-col items-end leading-tight tabular-nums'>
-                <span>{formatTokenAmount(row.inputTokens)}</span>
-                <span className='text-muted-foreground'>
-                  {formatTokenAmount(row.outputTokens)}
-                </span>
-              </div>
-            </TooltipTrigger>
-            <TooltipContent align='end' className='space-y-1 text-xs'>
-              <div>输入: {formatTokenAmount(row.inputTokens)}</div>
-              <div>输出: {formatTokenAmount(row.outputTokens)}</div>
-            </TooltipContent>
-          </Tooltip>
+          {hidePendingTokens ? (
+            <span className='text-muted-foreground'>-</span>
+          ) : (
+            <Tooltip delayDuration={250}>
+              <TooltipTrigger asChild>
+                <div className='flex cursor-help flex-col items-end leading-tight tabular-nums'>
+                  <span>{formatTokenAmount(row.inputTokens)}</span>
+                  <span className='text-muted-foreground'>
+                    {formatTokenAmount(row.outputTokens)}
+                  </span>
+                </div>
+              </TooltipTrigger>
+              <TooltipContent align='end' className='space-y-1 text-xs'>
+                <div>输入: {formatTokenAmount(row.inputTokens)}</div>
+                <div>输出: {formatTokenAmount(row.outputTokens)}</div>
+              </TooltipContent>
+            </Tooltip>
+          )}
         </div>
       )}
       {hidden('cache') ? null : (
         <div className='min-w-[70px] flex-[0.8] px-1.5 text-right font-mono text-xs'>
-          <Tooltip delayDuration={250}>
-            <TooltipTrigger asChild>
-              <div className='flex cursor-help flex-col items-end leading-tight tabular-nums'>
-                <div className='flex w-full items-center gap-1'>
-                  {row.cacheTtlApplied ? (
-                    <Badge variant='outline' className={TTL_BADGE}>
-                      {row.cacheTtlApplied}
-                    </Badge>
-                  ) : null}
-                  <span className='ml-auto'>
-                    {formatTokenAmount(row.cacheCreationInputTokens)}
+          {hidePendingCache ? (
+            <span className='text-muted-foreground'>-</span>
+          ) : (
+            <Tooltip delayDuration={250}>
+              <TooltipTrigger asChild>
+                <div className='flex cursor-help flex-col items-end leading-tight tabular-nums'>
+                  <div className='flex w-full items-center gap-1'>
+                    {row.cacheTtlApplied ? (
+                      <Badge variant='outline' className={TTL_BADGE}>
+                        {row.cacheTtlApplied}
+                      </Badge>
+                    ) : null}
+                    <span className='ml-auto'>
+                      {formatTokenAmount(row.cacheCreationInputTokens)}
+                    </span>
+                  </div>
+                  <span className='text-muted-foreground'>
+                    {formatTokenAmount(row.cacheReadInputTokens)}
                   </span>
                 </div>
-                <span className='text-muted-foreground'>
+              </TooltipTrigger>
+              <TooltipContent align='end' className='space-y-1 text-xs'>
+                <div className='font-medium'>缓存写入</div>
+                <div className='pl-2'>5m: {formatTokenAmount(cache.fiveM)}</div>
+                <div className='pl-2'>1h: {formatTokenAmount(cache.oneH)}</div>
+                <div className='mt-1 font-medium'>缓存读取</div>
+                <div className='pl-2'>
                   {formatTokenAmount(row.cacheReadInputTokens)}
-                </span>
-              </div>
-            </TooltipTrigger>
-            <TooltipContent align='end' className='space-y-1 text-xs'>
-              <div className='font-medium'>缓存写入</div>
-              <div className='pl-2'>5m: {formatTokenAmount(cache.fiveM)}</div>
-              <div className='pl-2'>1h: {formatTokenAmount(cache.oneH)}</div>
-              <div className='mt-1 font-medium'>缓存读取</div>
-              <div className='pl-2'>
-                {formatTokenAmount(row.cacheReadInputTokens)}
-              </div>
-            </TooltipContent>
-          </Tooltip>
+                </div>
+              </TooltipContent>
+            </Tooltip>
+          )}
         </div>
       )}
       {hidden('cost') ? null : (
@@ -294,10 +380,17 @@ function LogRow({
           <Tooltip delayDuration={250}>
             <TooltipTrigger asChild>
               <div className='flex cursor-help flex-col items-end'>
-                <span>{formatDuration(row.durationMs)}</span>
-                {row.ttftMs != null && row.ttftMs > 0 ? (
+                {inFlight && live?.startedAtMs != null ? (
+                  <LiveElapsedDuration
+                    startedAtMs={live.startedAtMs}
+                    fallbackDurationMs={row.durationMs}
+                  />
+                ) : (
+                  <span>{formatDuration(row.durationMs)}</span>
+                )}
+                {effectiveTtftMs != null && effectiveTtftMs > 0 ? (
                   <span className='text-[10px] text-muted-foreground'>
-                    TTFT {formatDuration(row.ttftMs)}
+                    TTFT {formatDuration(effectiveTtftMs)}
                   </span>
                 ) : null}
                 {showRate ? (
@@ -308,12 +401,22 @@ function LogRow({
               </div>
             </TooltipTrigger>
             <TooltipContent align='end' className='space-y-1 text-xs'>
-              <div>总耗时: {formatDuration(row.durationMs)}</div>
+              <div>
+                {inFlight ? '已耗时' : '总耗时'}:{' '}
+                {inFlight && live?.startedAtMs != null ? (
+                  <LiveElapsedDuration
+                    startedAtMs={live.startedAtMs}
+                    fallbackDurationMs={row.durationMs}
+                  />
+                ) : (
+                  formatDuration(row.durationMs)
+                )}
+              </div>
               {row.firstByteMs != null ? (
                 <div>首字节时间（TTFB）: {formatDuration(row.firstByteMs)}</div>
               ) : null}
-              {row.ttftMs != null ? (
-                <div>首 Token 时间（TTFT）: {formatDuration(row.ttftMs)}</div>
+              {effectiveTtftMs != null ? (
+                <div>首 Token 时间（TTFT）: {formatDuration(effectiveTtftMs)}</div>
               ) : null}
               {row.generationMs != null && row.generationMs > 0 ? (
                 <div>
@@ -336,6 +439,9 @@ function LogRow({
             statusCode={row.statusCode}
             finalState={row.finalState}
             errorCode={row.errorCode}
+            inFlight={inFlight}
+            livePhase={live?.phase}
+            attemptCount={live?.attemptCount}
           />
         </Button>
       </div>
@@ -367,19 +473,20 @@ export function VirtualizedLogsTable({
   onOpenDetail: OpenDetail
 }) {
   const scrolledDownRef = useRef(false)
-  const query = useInfiniteQuery(
-    usageLogsBatchQueryOptions({
-      filters,
-      pollMs: autoRefreshIntervalMs,
-      shouldPoll: () => autoRefreshEnabled && !scrolledDownRef.current,
-    })
-  )
+  const queryClient = useContext(QueryClientContext)
+  const batchQueryOptions = usageLogsBatchQueryOptions({
+    filters,
+    pollMs: autoRefreshIntervalMs,
+    shouldPoll: () => autoRefreshEnabled && !scrolledDownRef.current,
+  })
+  const query = useInfiniteQuery(batchQueryOptions)
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = query
   const allLogs = useMemo(
-    () => data?.pages.flatMap((page) => page.logs) ?? [],
+    () => dedupeUsageLogs(data?.pages.flatMap((page) => page.logs) ?? []),
     [data]
   )
   const pages = data?.pages
+  const pageCount = pages?.length ?? 0
   const lastPageEmpty =
     !!pages?.length && pages[pages.length - 1].logs.length === 0
 
@@ -400,7 +507,10 @@ export function VirtualizedLogsTable({
     overscan: 10,
     loadMoreThreshold: 5,
     scrollTopThreshold: SCROLL_TOP_THRESHOLD,
-    getItemKey: (index) => allLogs[index]?.id ?? `loader-${index}`,
+    getItemKey: (index) => {
+      const row = allLogs[index]
+      return (row && logRowKey(row)) || `loader-${index}`
+    },
   })
   scrolledDownRef.current = showScrollToTop
 
@@ -412,6 +522,64 @@ export function VirtualizedLogsTable({
   }, [lastPageEmpty, hasNextPage, isFetchingNextPage, fetchNextPage])
 
   const filtersKey = JSON.stringify(filters)
+  const filtersRef = useRef(filters)
+  filtersRef.current = filters
+  const queryKeyRef = useRef(batchQueryOptions.queryKey)
+  queryKeyRef.current = batchQueryOptions.queryKey
+
+  // 已加载多页（pages.length > 1）但用户滚回顶部时，仅后台静默拉取第 1 页并原地合并，
+  // 彻底避免每次轮询串行重拉所有历史页造成 PG 查询放大。
+  useEffect(() => {
+    if (
+      !queryClient ||
+      !autoRefreshEnabled ||
+      showScrollToTop ||
+      pageCount <= 1 ||
+      !(autoRefreshIntervalMs > 0)
+    ) {
+      return
+    }
+    let cancelled = false
+    let refreshing = false
+    const timer = window.setInterval(() => {
+      if (cancelled || refreshing || scrolledDownRef.current) return
+      if (
+        typeof document !== 'undefined' &&
+        document.visibilityState === 'hidden'
+      ) {
+        return
+      }
+      const state = queryClient.getQueryState(queryKeyRef.current)
+      if (state && state.fetchStatus !== 'idle') return
+      refreshing = true
+      const targetKey = queryKeyRef.current
+      void fetchUsageLogsPage(filtersRef.current, null)
+        .then((freshFirstPage) => {
+          if (cancelled) return
+          queryClient.setQueryData(targetKey, (prev) =>
+            mergeFirstUsageLogsPage(prev, freshFirstPage)
+          )
+        })
+        .catch(() => {
+          // 静默刷新失败不打断浏览，下个周期重试。
+        })
+        .finally(() => {
+          refreshing = false
+        })
+    }, autoRefreshIntervalMs)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [
+    queryClient,
+    autoRefreshEnabled,
+    showScrollToTop,
+    pageCount,
+    autoRefreshIntervalMs,
+    filtersKey,
+  ])
+
   const resetRef = useRef(resetScrollPosition)
   resetRef.current = resetScrollPosition
   useEffect(() => {
@@ -578,15 +746,20 @@ export function VirtualizedLogsTable({
                     </div>
                   )
                 }
+                const rowKey = logRowKey(row) || `row-${virtualRow.index}`
+                const inFlight = isInFlightLog(row)
                 return (
                   <div
-                    key={row.id}
+                    key={rowKey}
                     style={style}
                     role='button'
                     tabIndex={0}
+                    data-in-flight={inFlight ? 'true' : undefined}
                     className={cn(
                       'flex cursor-pointer items-center border-b border-border/40 text-sm transition-colors outline-none hover:bg-accent/50 focus-visible:bg-accent/50',
-                      isNonBillingEndpoint(row.endpoint) &&
+                      inFlight && 'bg-sky-50/40 dark:bg-sky-950/20',
+                      !inFlight &&
+                        isNonBillingEndpoint(row.endpoint) &&
                         'bg-muted/30 text-muted-foreground dark:bg-muted/15'
                     )}
                     onClick={(event) => {

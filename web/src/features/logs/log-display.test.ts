@@ -1,13 +1,21 @@
-import type { ProviderChainItem } from '@/types/panel-usage-logs'
+import type { ProviderChainItem, UsageLogRow } from '@/types/panel-usage-logs'
 import { describe, expect, it } from 'vitest'
 import {
   queueWaitMs,
   cacheCostSplit,
   cacheWriteSplit,
   chainItemStatus,
+  dedupeUsageLogs,
   finalChainItem,
   formatShortDistance,
+  isGeminiTierEquivalentModel,
+  isInFlightLog,
   latencySegments,
+  livePhaseBadgeClass,
+  livePhaseLabel,
+  liveProviderName,
+  logRowKey,
+  resolveLiveMeta,
   resolveModelAuditDisplay,
   segmentWidth,
   statusBadgeClass,
@@ -279,6 +287,56 @@ describe('display helpers', () => {
     expect(audit.hasRedirect).toBe(true)
     expect(audit.secondaryActualModel).toBe('claude-z')
   })
+
+  it('treats Gemini thinking-tier suffix vs bare upstream modelVersion as matching', () => {
+    const bareEcho = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-neon-high',
+      model: 'gemini-4-neon-high',
+      actualResponseModel: 'gemini-4-neon',
+    })
+    expect(bareEcho.primaryBillingModel).toBe('gemini-4-neon-high')
+    expect(bareEcho.hasRedirect).toBe(false)
+    expect(bareEcho.hasActualMismatch).toBe(false)
+    expect(bareEcho.secondaryActualModel).toBeNull()
+
+    const parenEcho = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-neon(high)[1m]',
+      model: 'gemini-4-neon-high',
+      actualResponseModel: 'gemini-4-neon',
+    })
+    expect(parenEcho.hasRedirect).toBe(false)
+    expect(parenEcho.hasActualMismatch).toBe(false)
+
+    expect(
+      isGeminiTierEquivalentModel('gemini-2.5-pro-thinking', 'gemini-2.5-pro')
+    ).toBe(true)
+    expect(
+      isGeminiTierEquivalentModel(
+        'models/gemini-4-neon-medium',
+        'gemini-4-neon'
+      )
+    ).toBe(true)
+
+    const tierDowngrade = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-neon-high',
+      model: 'gemini-4-neon-high',
+      actualResponseModel: 'gemini-4-neon-low',
+    })
+    expect(tierDowngrade.hasActualMismatch).toBe(true)
+    expect(tierDowngrade.secondaryActualModel).toBe('gemini-4-neon-low')
+
+    const crossModel = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-hydrogen-high',
+      model: 'gemini-4-hydrogen-high',
+      actualResponseModel: 'gemini-4-neon',
+    })
+    expect(crossModel.hasActualMismatch).toBe(true)
+    expect(crossModel.secondaryActualModel).toBe('gemini-4-neon')
+
+    expect(
+      isGeminiTierEquivalentModel('gemini-3.1-pro-preview', 'gemini-3.1-pro')
+    ).toBe(false)
+  })
 })
 
 describe('logs search', () => {
@@ -351,5 +409,110 @@ describe('scheduler versus capacity queue timings', () => {
       ['generation', 400],
       ['finalization', 100],
     ])
+  })
+})
+
+describe('failedOnly filter search & query serialization (#1213)', () => {
+  it('round-trips failedOnly through URL search and serializes failed_only=1', () => {
+    const search = validateLogsSearch({ failedOnly: '1', statusCode: '200' })
+    expect(search.failedOnly).toBe(true)
+    expect(search.statusCode).toBe(200)
+    const filters = searchToFilters(search)
+    expect(filters.failedOnly).toBe(true)
+    expect(filtersToSearch(filters)).toEqual({
+      failedOnly: true,
+      statusCode: 200,
+    })
+    expect(activeFilterCount(filters)).toBe(2)
+    const qs = usageLogFiltersQuery(filtersToApi(filters, []))
+    expect(qs.get('failed_only')).toBe('1')
+    expect(qs.get('status_code')).toBe('200')
+  })
+})
+
+describe('in-flight log helpers and stable row key', () => {
+  it('keeps the same row key when transitioning from Redis temp id to PG id', () => {
+    const inFlightKey = logRowKey({ id: '0', requestId: 'req_abc123' })
+    const livePrefixKey = logRowKey({
+      id: 'live_req_abc123',
+      requestId: 'req_abc123',
+    })
+    const persistedKey = logRowKey({
+      id: 'log_9f8e7d6c5b4a',
+      requestId: 'req_abc123',
+    })
+    expect(inFlightKey).toBe('req:req_abc123')
+    expect(livePrefixKey).toBe(inFlightKey)
+    expect(persistedKey).toBe(inFlightKey)
+    expect(logRowKey({ id: 'log_legacy_1', requestId: null })).toBe(
+      'id:log_legacy_1'
+    )
+  })
+
+  it('detects in-flight rows via in_flight flag or statusCode==null with _live', () => {
+    expect(
+      isInFlightLog({ in_flight: true, statusCode: null, _live: null })
+    ).toBe(true)
+    expect(
+      isInFlightLog({ statusCode: null, _live: { phase: 'routing' } })
+    ).toBe(true)
+    expect(
+      isInFlightLog({
+        in_flight: false,
+        statusCode: 200,
+        _live: { phase: 'finalizing' },
+      })
+    ).toBe(false)
+    expect(isInFlightLog({ statusCode: null, _live: null })).toBe(false)
+    expect(isInFlightLog({ statusCode: 200, _live: null })).toBe(false)
+  })
+
+  it('maps live phases to Chinese labels and distinct styles', () => {
+    expect(livePhaseLabel('routing')).toBe('路由中')
+    expect(livePhaseLabel('retrying')).toBe('重试中')
+    expect(livePhaseLabel('streaming')).toBe('输出中')
+    expect(livePhaseLabel('finalizing')).toBe('收尾中')
+    expect(livePhaseLabel(null)).toBe('进行中')
+    expect(livePhaseBadgeClass('retrying')).toContain('amber')
+    expect(livePhaseBadgeClass('streaming')).toContain('sky')
+  })
+
+  it('resolves live node name, metadata, and deduplicates rows by stable key', () => {
+    const row = {
+      id: '0',
+      requestId: 'req_1',
+      createdAt: '2026-11-28T10:00:00.000Z',
+      vmId: null,
+      vmName: null,
+      accountId: null,
+      providerName: null,
+      attemptCount: null,
+      ttftMs: null,
+      providerChain: [],
+      in_flight: true,
+      _live: {
+        phase: 'streaming',
+        attempt_count: 2,
+        started_at: 1795860000000,
+        ttft_ms: 350,
+        vm_id: 'vm-2',
+        active_provider: 'slot-02',
+      },
+    } as unknown as UsageLogRow
+    expect(liveProviderName(row)).toBe('slot-02')
+    expect(resolveLiveMeta(row)).toMatchObject({
+      phase: 'streaming',
+      attemptCount: 2,
+      startedAtMs: 1795860000000,
+      ttftMs: 350,
+      vmId: 'vm-2',
+      activeProvider: 'slot-02',
+    })
+    const deduped = dedupeUsageLogs([
+      { ...row, id: 'log_final', in_flight: false, statusCode: 200 },
+      row,
+    ])
+    expect(deduped).toHaveLength(1)
+    expect(deduped[0].id).toBe('log_final')
   })
 })

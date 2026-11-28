@@ -4,12 +4,15 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  countTokensEnabled,
   parseCountTokensBody,
   buildUsageView,
   handleUserCountTokens,
   handleUserUsage,
   resolveUsageWindows,
+  sanitizeThirdPartyCountTokensBody,
 } from '../../src/lib/protocol/user-count-tokens.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 import { createUsageCache } from '../../src/lib/oauth/usage-cache.mjs'
 
 function jsonCapture() {
@@ -539,4 +542,301 @@ test('usage platform filter picks one side and rejects unknown values', async (t
   assert.equal(cap.calls[2].status, 400)
   assert.equal(cap.calls[2].body.error.code, 'invalid_platform')
   assert.equal(peeks(), 0)
+})
+
+test('count_tokens is off unless routing says exactly true', () => {
+  assert.equal(countTokensEnabled(undefined), false)
+  assert.equal(countTokensEnabled({}), false)
+  assert.equal(countTokensEnabled({ compatibility: {} }), false)
+  assert.equal(countTokensEnabled({ compatibility: { count_tokens: true } }), true)
+  // Off for anything truthy-but-not-true, so a stray string in routing.json cannot
+  // open a public endpoint by accident.
+  for (const value of ['true', 1, {}, [], 'yes'])
+    assert.equal(countTokensEnabled({ compatibility: { count_tokens: value } }), false)
+})
+
+test('routing patch requires count_tokens to be boolean', async () => {
+  const { validatePersonaRoutingPatch } = await import('../../src/lib/admin/panel-api.mjs')
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { count_tokens: true } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { count_tokens: false } }), [])
+  assert.match(JSON.stringify(validatePersonaRoutingPatch({ compatibility: { count_tokens: 'on' } })), /count_tokens/)
+})
+
+test('handleUserCountTokens applies getRoutingConfig to inboundBodyLimit', async () => {
+  const cap = jsonCapture()
+  let seenLimit = null
+  await handleUserCountTokens(
+    {},
+    {},
+    {
+      json: cap.json,
+      requireAuth: () => true,
+      readBody: async (_req, limit) => {
+        seenLimit = limit
+        return { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }
+      },
+      cfg: { limits: { max_body_bytes: 64 * 1024 * 1024 } },
+      getRoutingConfig: () => ({ failover: { max_request_mib: 12 } }),
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => ({
+          ok: true,
+          vmId: 'vm-01',
+          accountId: 'acc-1',
+          vm: { credential_mode: 'setup-token' },
+          exec: { vmId: 'vm-01' },
+        }),
+      }),
+      countTokensViaWorker: async () => ({ ok: true, status: 200, body: { input_tokens: 5 } }),
+    },
+  )
+  assert.equal(seenLimit, 12 * 1024 * 1024)
+  assert.equal(cap.calls[0].status, 200)
+})
+
+test('panel count-tokens route is gated by the switch, not removed', async () => {
+  const { createPanelHandler } = await import('../../src/lib/admin/panel-routes.mjs')
+  const call = async (routingConfig) => {
+    let response
+    const panel = createPanelHandler({
+      cfg: { paths: { project: os.tmpdir() } },
+      routingConfig,
+      requireAuth(req) {
+        req.panelUser = 'operator'
+        req.panelRole = 'admin'
+        return true
+      },
+      json(_res, status, body) {
+        response = { status, body }
+      },
+    })
+    await panel({ method: 'POST' }, {}, new URL('/api/panel/vms/vm-nope/count-tokens', 'http://localhost'))
+    return response
+  }
+  // Switch off: the generic not_found the stub returned.
+  const off = await call({})
+  assert.equal(off.status, 404)
+  assert.equal(off.body.error.code, 'not_found')
+  // Switch on: past the gate and into the restored body, which is why the code is now
+  // the route's own vm_not_found rather than the gate's not_found.
+  const on = await call({ compatibility: { count_tokens: true } })
+  assert.equal(on.status, 404)
+  assert.equal(on.body.error.code, 'vm_not_found')
+})
+
+test('V7: third-party /v1/messages/count_tokens relocates system + role=system, rewrites tools to mcp__, strips max_tokens and client headers', async () => {
+  const thirdPartyBody = {
+    model: 'claude-sonnet-5-5',
+    system: [{ type: 'text', text: 'You are OpenCode, a coding agent.' }],
+    tools: [
+      { name: 'fs_read', description: 'Read file', input_schema: { type: 'object', properties: {} } },
+      { name: 'mcp_resource_list', description: 'List', input_schema: { type: 'object', properties: {} } },
+      { name: 'mcp__srv__ok', description: 'OK', input_schema: { type: 'object', properties: {} } },
+    ],
+    messages: [
+      { role: 'system', content: 'Follow OpenCode system rules.' },
+      { role: 'user', content: 'Count my tokens' },
+    ],
+  }
+  const spoofHeaders = {
+    'user-agent': 'claude-cli/2.1.321 (external, cli)',
+    'anthropic-beta': 'evil-custom-beta-2026',
+    'x-claude-code-session-id': 'spoof-sess',
+  }
+
+  // Direct helper check
+  const sanitized = sanitizeThirdPartyCountTokensBody(thirdPartyBody, { routing: {} })
+  assert.equal('max_tokens' in sanitized, false)
+  assert.deepEqual(
+    sanitized.tools.map((t) => t.name),
+    ['mcp__fs_read', 'mcp__resource_list', 'mcp__srv__ok'],
+  )
+  assert.equal(
+    sanitized.messages.some((m) => m.role === 'system'),
+    false,
+  )
+  assert.deepEqual(sanitized.system, [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }])
+  assert.ok(JSON.stringify(sanitized.messages[0]).includes('coding agent'))
+  assert.ok(JSON.stringify(sanitized.messages[0]).includes('system rules'))
+
+  // End-to-end countTokensViaKernel (count_tokens_v1)
+  const capKernel = jsonCapture()
+  let seenKernel = null
+  await handleUserCountTokens(
+    { headers: spoofHeaders },
+    {},
+    {
+      json: capKernel.json,
+      requireAuth: () => true,
+      readBody: async () => structuredClone(thirdPartyBody),
+      cfg: { limits: { max_body_bytes: 1024 * 1024 } },
+      getRoutingConfig: () => ({ compatibility: { count_tokens: true } }),
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => ({
+          ok: true,
+          vmId: 'vm-crag',
+          accountId: 'acc-1',
+          vm: { credential_mode: 'oauth' },
+          workerStatus: { capabilities: ['count_tokens_v1'] },
+          exec: { vmId: 'vm-crag' },
+        }),
+      }),
+      countTokensViaKernel: async (_exec, args) => {
+        seenKernel = args
+        return { ok: true, status: 200, body: { input_tokens: 42 } }
+      },
+    },
+  )
+  assert.equal(capKernel.calls[0].status, 200)
+  assert.equal(capKernel.calls[0].body.input_tokens, 42)
+  assert.deepEqual(seenKernel.headers, {})
+  assert.equal('max_tokens' in seenKernel.body, false)
+  assert.deepEqual(
+    seenKernel.body.tools.map((t) => t.name),
+    ['mcp__fs_read', 'mcp__resource_list', 'mcp__srv__ok'],
+  )
+  assert.equal(
+    seenKernel.body.messages.some((m) => m.role === 'system'),
+    false,
+  )
+
+  // End-to-end countTokensViaWorker (setup-token)
+  const capWorker = jsonCapture()
+  let seenWorker = null
+  await handleUserCountTokens(
+    { headers: spoofHeaders },
+    {},
+    {
+      json: capWorker.json,
+      requireAuth: () => true,
+      readBody: async () => structuredClone(thirdPartyBody),
+      cfg: { limits: { max_body_bytes: 1024 * 1024 } },
+      getRoutingConfig: () => ({ compatibility: { count_tokens: true } }),
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => ({
+          ok: true,
+          vmId: 'vm-st',
+          accountId: 'acc-2',
+          vm: { credential_mode: 'setup-token' },
+          exec: { vmId: 'vm-st' },
+        }),
+      }),
+      countTokensViaWorker: async (_exec, args) => {
+        seenWorker = args
+        return { ok: true, status: 200, body: { input_tokens: 19 } }
+      },
+    },
+  )
+  assert.equal(capWorker.calls[0].status, 200)
+  assert.equal(seenWorker.headers['user-agent'], 'kin-inference/1.0')
+  assert.doesNotMatch(String(seenWorker.headers['anthropic-beta'] || ''), /evil-custom-beta/)
+  assert.equal('max_tokens' in seenWorker.body, false)
+  assert.deepEqual(
+    seenWorker.body.tools.map((t) => t.name),
+    ['mcp__fs_read', 'mcp__resource_list', 'mcp__srv__ok'],
+  )
+})
+
+test('V7: claude_code_only on /v1/messages/count_tokens rejects bare UA spoof and preserves genuine verified CC', async () => {
+  const capSpoof = jsonCapture()
+  await handleUserCountTokens(
+    { headers: { 'user-agent': 'claude-cli/2.1.321 (external, cli)', 'anthropic-beta': 'claude-code-20250219' } },
+    {},
+    {
+      json: capSpoof.json,
+      requireAuth: () => true,
+      readBody: async () => ({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'hi' }] }),
+      cfg: { limits: { max_body_bytes: 1024 * 1024 } },
+      getRoutingConfig: () => ({ compatibility: { count_tokens: true, claude_code_only: true } }),
+    },
+  )
+  assert.equal(capSpoof.calls[0].status, 403)
+  assert.equal(capSpoof.calls[0].body.error.code, 'claude_code_only')
+
+  // Genuine verified official CC passes claude_code_only and keeps official tools untouched
+  const sessionId = '11111111-1111-4111-8111-111111111111'
+  const capOfficial = jsonCapture()
+  let seenOfficial = null
+  await handleUserCountTokens(
+    {
+      headers: {
+        'user-agent': 'claude-cli/2.1.321 (external, cli)',
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'anthropic-beta': 'claude-code-20250219',
+        'x-app': 'cli',
+        'x-stainless-lang': 'js',
+        'x-stainless-os': 'Linux',
+        'x-stainless-arch': 'x64',
+        'x-stainless-runtime': 'node',
+        'x-stainless-runtime-version': 'v24.3.0',
+        'x-stainless-package-version': '0.128.0',
+        'x-stainless-retry-count': '0',
+        'x-stainless-timeout': '600',
+        'x-claude-code-session-id': sessionId,
+      },
+    },
+    {},
+    {
+      json: capOfficial.json,
+      requireAuth: () => true,
+      readBody: async () => ({
+        model: 'claude-sonnet-5-5',
+        system: [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }],
+        tools: [{ name: 'Bash', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      cfg: { limits: { max_body_bytes: 1024 * 1024 } },
+      getRoutingConfig: () => ({ compatibility: { count_tokens: true, claude_code_only: true } }),
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => ({
+          ok: true,
+          vmId: 'vm-crag',
+          accountId: 'acc-1',
+          vm: { credential_mode: 'oauth' },
+          workerStatus: { capabilities: ['count_tokens_v1'] },
+          exec: { vmId: 'vm-crag' },
+        }),
+      }),
+      countTokensViaKernel: async (_exec, args) => {
+        seenOfficial = args
+        return { ok: true, status: 200, body: { input_tokens: 7 } }
+      },
+    },
+  )
+  assert.equal(capOfficial.calls[0].status, 200)
+  assert.deepEqual(
+    seenOfficial.body.tools.map((t) => t.name),
+    ['Bash'],
+  )
+  assert.equal(seenOfficial.headers['anthropic-beta'], 'claude-code-20250219')
+  assert.equal(seenOfficial.headers['x-claude-code-session-id'], sessionId)
+
+  // Third-party count_tokens preserves tool_addition in role:system while folding text prose
+  const inlineSanitized = sanitizeThirdPartyCountTokensBody({
+    model: 'claude-opus-5-5',
+    messages: [
+      {
+        role: 'system',
+        content: [
+          { type: 'text', text: 'Hidden prompt' },
+          {
+            type: 'tool_addition',
+            tool: {
+              type: 'tool_definition',
+              definition: { name: 'inline_fn', input_schema: { type: 'object' } },
+            },
+          },
+        ],
+      },
+      { role: 'user', content: 'hello' },
+    ],
+  })
+  assert.equal(inlineSanitized.messages[0].role, 'system')
+  assert.equal(inlineSanitized.messages[0].content[0].type, 'tool_addition')
+  assert.equal(inlineSanitized.messages[0].content[0].tool.definition.name, 'mcp__inline_fn')
+  assert.ok(JSON.stringify(inlineSanitized.messages[1]).includes('Hidden prompt'))
 })

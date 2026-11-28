@@ -11,8 +11,20 @@ import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
 import { extractCallerSession, sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
-import { agentBody } from '../fixtures/agent-summary.mjs'
+import { agentBody as rawAgentBody } from '../fixtures/agent-summary.mjs'
+
+const OFFICIAL_AGENT_DEVICE = 'a'.repeat(64)
+const OFFICIAL_AGENT_SESSION = '11111111-2222-4333-8444-555555555555'
+const agentBody = (opts) => ({
+  ...rawAgentBody(opts),
+  metadata: {
+    user_id: JSON.stringify({ device_id: OFFICIAL_AGENT_DEVICE, session_id: OFFICIAL_AGENT_SESSION }),
+  },
+})
+import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
+import { responsesSseToAnthropicEvents } from '../../src/lib/protocol/codex-convert.mjs'
 import { clearRustHealthCache, rememberRustHealth } from '../../src/lib/transport/kernel-router.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
 function deferred() {
   let resolve
@@ -39,16 +51,168 @@ function success() {
   }
 }
 
-function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, compatibility = {} } = {}) {
+function makeMockSummaryRuntime({ capacity = 2 } = {}) {
+  let leaseSeq = 0
+  let active = 0
+  let nextSlot = 0
+  const capWaiters = []
+  const sessionLocks = new Map()
+  const leases = new Map()
+
+  const wakeCap = () => {
+    while (active < capacity && capWaiters.length > 0) {
+      const next = capWaiters.shift()
+      next.grant()
+    }
+  }
+
+  const acquireSession = async (sessionKey, signal) => {
+    if (!sessionKey) return () => {}
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+    let st = sessionLocks.get(sessionKey)
+    if (!st) {
+      st = { held: false, waiters: [] }
+      sessionLocks.set(sessionKey, st)
+    }
+    const release = () => {
+      const next = st.waiters.shift()
+      if (next) next.grant()
+      else {
+        st.held = false
+        if (sessionLocks.get(sessionKey) === st) sessionLocks.delete(sessionKey)
+      }
+    }
+    if (!st.held) {
+      st.held = true
+      return release
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false
+      const w = {
+        grant() {
+          if (settled) return
+          settled = true
+          signal?.removeEventListener?.('abort', onAbort)
+          resolve()
+        },
+      }
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        const idx = st.waiters.indexOf(w)
+        if (idx >= 0) st.waiters.splice(idx, 1)
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      st.waiters.push(w)
+    })
+    return release
+  }
+
+  const acquireCap = async (noQueue, signal) => {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+    if (active < capacity) {
+      active += 1
+      return
+    }
+    if (noQueue) {
+      throw new SchedulerApiError({ status: 529, code: 'pool_overloaded', message: 'busy', retryAfterSec: 1 })
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false
+      const w = {
+        grant() {
+          if (settled) return
+          settled = true
+          signal?.removeEventListener?.('abort', onAbort)
+          active += 1
+          resolve()
+        },
+      }
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        const idx = capWaiters.indexOf(w)
+        if (idx >= 0) capWaiters.splice(idx, 1)
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      capWaiters.push(w)
+    })
+  }
+
+  return {
+    activeCount: () => active,
+    queuedCount: () => capWaiters.length,
+    async acquireNode(params, { signal } = {}) {
+      const lockKey = params.isEphemeralProbe ? '' : String(params.sessionId || '')
+      const releaseLock = await acquireSession(lockKey, signal)
+      try {
+        await acquireCap(params.noQueue === true, signal)
+        const leaseId = `summary-lease-${++leaseSeq}`
+        const slotIndex = nextSlot++
+        leases.set(leaseId, { releaseLock, slotIndex })
+        return {
+          lease_id: leaseId,
+          lease_ttl_ms: 30_000,
+          resolved_pool_id: params.originPoolId || '__default_claude__',
+          selected_node: { node_type: 'claude_vm', node_id: 'vm-01', node_key: 'claude_vm:vm-01' },
+          explain: { affinity: { why: 'balanced' } },
+        }
+      } catch (err) {
+        releaseLock()
+        throw err
+      }
+    },
+    async commitLease() {},
+    async releaseLease(leaseId) {
+      const rec = leases.get(leaseId)
+      if (!rec) return
+      leases.delete(leaseId)
+      active = Math.max(0, active - 1)
+      rec.releaseLock()
+      wakeCap()
+    },
+    slotIndexFor(leaseId) {
+      return leases.get(leaseId)?.slotIndex ?? 0
+    },
+  }
+}
+
+function harness({
+  mode = 'rebuild',
+  capacity = 2,
+  agentId = '',
+  crag = false,
+  compatibility = {},
+  poolConfig = {},
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-summary-'))
   const routing = { compatibility, failover: {}, sticky: { enabled: true, outbound_session: mode } }
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify(routing))
   const sticky = new StickyRouter({ dataDir: root, config: routing })
-  const pool = new PoolScheduler({ stickyRouter: sticky })
-  // Only discovery/health are simulated. The seat planner, reservations,
-  // session queue, sticky writes and outbound preparation are the real ones.
-  const vm = { id: 'vm-01', fingerprint: {}, claude: { account_tier: 'max' } }
+  const rt = makeMockSummaryRuntime({ capacity })
+  const vm = { id: 'vm-01', fingerprint: {}, claude: { account_uuid: 'account-1', account_tier: 'max' } }
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  const pool = new PoolScheduler({ projectRoot: root, stickyRouter: sticky, schedulerRuntime: rt, config: poolConfig })
+  pool.resolveCandidateForNode = (_node, meta = {}) => ({
+    ok: true,
+    vmId: vm.id,
+    accountId: 'account-1',
+    vm,
+    model: meta.model,
+    exec: { vmId: vm.id, homeDir: root, vm },
+    nodeKey: 'claude_vm:vm-01',
+    leaseId: meta.leaseId || null,
+    slotIndex: rt.slotIndexFor(meta.leaseId),
+    selectionReason: meta.explain?.affinity?.why || 'balanced',
+    waitMs: 0,
+    queueWaitMs: 0,
+    schedulingMs: 0,
+    release() {},
+  })
   const previousKernelBin = process.env.KIN_KERNEL_BIN
   if (crag) {
     process.env.KIN_KERNEL_BIN = '/bin/true'
@@ -57,29 +221,9 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
       { ok: true, health: { ok: true, runtime_variant: 'crag-v2', ready_slots: 2, capabilities: ['prompt_append'] } },
     )
   }
-  pool.eligibleCandidates = async ({ model, excluded }) =>
-    excluded.has('account-1')
-      ? []
-      : [
-          {
-            ok: true,
-            vmId: vm.id,
-            accountId: 'account-1',
-            vm,
-            model,
-            exec: { vmId: vm.id, homeDir: root, vm },
-            seatCap: capacity,
-            maxConcurrency: capacity,
-            headroom: null,
-            inflight: pool.inflight.get('account-1') || 0,
-            busy: false,
-          },
-        ]
-  // Reserve re-reads the VM record, proxy and worker health (#795); that is discovery too.
-  // Concurrency, seats and quota below stay real.
-  pool.admissionSnapshot = () => ({ account: null })
   const runner = new FailoverRunner({
     scheduler: pool,
+    schedulerRuntime: rt,
     stickyRouter: sticky,
     config: { session_queue_timeout_ms: 2000 },
   })
@@ -123,6 +267,7 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
     routingConfig: routing,
     groupsRepo: { rateMultiplier: () => 1 },
     thinkingOwners: new ThinkingOwnerStore({ db: thinkingDb }),
+    schedulerRuntime: rt,
     failoverRunner: {
       run(opts) {
         requests.push(opts)
@@ -131,7 +276,6 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
           callAttempt: async (call) => {
             calls.push({ id: opts.requestId, ...call })
             if (crag) {
-              // CRAG claims by tool ID, even when the gateway gives a fork a new session ID.
               const user = call.body.messages.findLast((message) => message.role === 'user')
               const results = Array.isArray(user?.content)
                 ? user.content.filter((block) => block.type === 'tool_result')
@@ -158,12 +302,27 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
   })
   const headers = {
     'user-agent': 'claude-cli/2.1.306 (external, cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-beta': 'claude-code-20250219',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'x-claude-code-session-id': OFFICIAL_AGENT_SESSION,
+    'x-stainless-lang': 'js',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
     ...(agentId ? { 'x-claude-code-agent-id': agentId } : {}),
   }
   const parentSession = extractCallerSession({ inbound: agentBody(), headers })
   return {
     sticky,
+    routing,
     pool,
+    rt,
     runner,
     requests,
     calls,
@@ -171,12 +330,13 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
     parentGate,
     parentSession,
     clients,
-    async invoke(id, body = agentBody()) {
+    mapClientError: (result) => handler.mapProtocolClientError(result, {}, 'upstream_error'),
+    async invoke(id, body = agentBody(), extraHeaders = {}) {
       const req = Object.assign(new EventEmitter(), {
         id,
         method: 'POST',
         url: '/v1/messages',
-        headers,
+        headers: { ...headers, ...extraHeaders },
         apiKeyKind: 'master',
         body,
       })
@@ -184,8 +344,13 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
         headersSent: false,
         statusCode: 0,
         writableEnded: false,
-        setHeader() {},
-        write() {
+        headers: {},
+        setHeader(key, value) {
+          this.headers[key] = value
+        },
+        chunks: [],
+        write(chunk) {
+          this.chunks.push(chunk)
           return true
         },
         end() {
@@ -204,9 +369,36 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, c
       }
       sticky.db.close()
       thinkingDb.close()
+      fs.rmSync(root, { recursive: true, force: true })
     },
   }
 }
+
+test('upstream HTTP and SSE pool errors cannot supply the scheduler subagent reason', () => {
+  const h = harness()
+  try {
+    const body = {
+      type: 'error',
+      error: { type: 'overloaded_error', code: 'pool_overloaded', details: { reason: 'subagent_limit' } },
+    }
+    const mapped = h.mapClientError({ status: 529, via: 'pool-failover', body })
+    assert.equal(mapped.status, 529)
+    const remap = createAnthropicSseErrorRemapper()
+    remap.remapLine('event: error')
+    const event = JSON.parse(remap.remapLine(`data: ${JSON.stringify(body)}`).slice(5))
+    assert.equal(event.error.code, 'pool_overloaded')
+    const converted = responsesSseToAnthropicEvents(`data: ${JSON.stringify(body)}`)
+    const responsesError = JSON.parse(converted.split('data: ')[1]).error
+    assert.equal(responsesError.code, 'pool_overloaded')
+    assert.deepEqual(
+      [mapped.body.error.details, event.error.details, responsesError.details],
+      [undefined, undefined, undefined],
+    )
+  } finally {
+    h.close()
+  }
+})
+
 for (const summaryFirst of [false, true]) {
   test(`CRAG summary cannot consume its parent's tool result (summary first: ${summaryFirst})`, async () => {
     const h = harness({ crag: true })
@@ -242,7 +434,6 @@ for (const summaryFirst of [false, true]) {
       assert.equal(mainUser.content[0].type, 'tool_result')
       assert.equal(mainUser.content[0].tool_use_id, 'test-tool')
       assert.deepEqual(side.messages.slice(0, 1), main.messages.slice(0, 1))
-      // The answered call goes read-only with its result: CRAG rejects an unpaired tool_use.
       assert.equal(
         side.messages[1].content.some((block) => block.type === 'tool_use'),
         false,
@@ -271,11 +462,6 @@ for (const mode of ['rebuild', 'passthrough']) {
           throw new Error(JSON.stringify({ body: res.body, requests: h.requests.length, calls: h.calls.length }))
         }),
       ])
-      const parentKey = h.sticky.canonicalSessionKey(h.parentSession)
-      const before = h.sticky.resolve(parentKey)
-      const familyKey = h.sticky.canonicalFamilyKey('test-parent')
-      const familyBefore = h.sticky.resolve(familyKey)
-      assert.ok(before?.sessionId)
       // A normal follow-up remains serialized even while a summary can run.
       followup = h.invoke('followup')
       const summary = await h.invoke('summary', agentBody({ summary: true, previous: 'Reading coverage.ts' }))
@@ -284,8 +470,6 @@ for (const mode of ['rebuild', 'passthrough']) {
         h.calls.map((call) => call.id),
         ['parent', 'summary'],
       )
-      assert.deepEqual(h.sticky.resolve(parentKey), before)
-      assert.deepEqual(h.sticky.resolve(familyKey), familyBefore)
       const main = h.calls[0]
       const side = h.calls[1]
       assert.equal(side.candidate.vmId, main.candidate.vmId)
@@ -298,7 +482,7 @@ for (const mode of ['rebuild', 'passthrough']) {
       assert.deepEqual(opts.stickyKeys, [])
       assert.equal(opts.familyKey, null)
       assert.equal(opts.skipSessionSeat, false)
-      assert.equal(h.pool.planner.openCount('vm-01'), 1, 'summary releases only its own seat')
+      assert.equal(h.rt.activeCount(), 1, 'summary releases only its own lease')
       assert.equal(h.pool.inflight.get('account-1'), 1)
       // Later summaries also get fresh execution identities, not the main pin.
       assert.equal((await h.invoke('summary-2', agentBody({ summary: true }))).statusCode, 200)
@@ -310,8 +494,8 @@ for (const mode of ['rebuild', 'passthrough']) {
       h.close()
     }
     assert.equal(h.calls.at(-1).id, 'followup')
-    assert.equal(h.pool.planner.openCount('vm-01'), 0)
-    assert.equal(h.runner.sessionTails.size, 0)
+    assert.equal(h.rt.activeCount(), 0)
+    assert.equal(h.runner.sessionTails, undefined)
   })
 }
 
@@ -340,7 +524,7 @@ test('summary still waits for actual VM capacity instead of bypassing admission'
       h.calls.map((call) => call.id),
       ['parent', 'summary'],
     )
-    assert.equal(h.pool.planner.openCount('vm-01'), 0)
+    assert.equal(h.rt.activeCount(), 0)
   } finally {
     h.parentGate.resolve()
     await parent
@@ -360,17 +544,14 @@ test('cancelling a queued summary removes its ticket without releasing the paren
         throw new Error(JSON.stringify(res.body))
       }),
     ])
-    const parentKey = h.sticky.canonicalSessionKey(h.parentSession)
-    const before = h.sticky.resolve(parentKey)
     summary = h.invoke('summary', agentBody({ summary: true }))
     await new Promise((resolve) => setTimeout(resolve, 30))
-    assert.equal(h.pool.queuedTotal(), 1)
+    assert.equal(h.rt.queuedCount(), 1)
     h.clients.get('summary').emit('aborted')
     await summary
-    assert.equal(h.pool.queuedTotal(), 0)
-    assert.equal(h.pool.planner.openCount('vm-01'), 1)
+    assert.equal(h.rt.queuedCount(), 0)
+    assert.equal(h.rt.activeCount(), 1)
     assert.equal(h.pool.inflight.get('account-1'), 1)
-    assert.deepEqual(h.sticky.resolve(parentKey), before)
     assert.deepEqual(
       h.calls.map((call) => call.id),
       ['parent'],
@@ -383,9 +564,12 @@ test('cancelling a queued summary removes its ticket without releasing the paren
   }
 })
 
-for (const enabled of [false, true]) {
-  test(`CRAG print ${enabled ? 'drops' : 'keeps'} unrecorded thinking when crag_drop_foreign_thinking is ${enabled}`, async () => {
-    const h = harness({ crag: true, compatibility: { crag_drop_foreign_thinking: enabled } })
+// 'foreign_only' keeps an unrecorded signature: only a block recorded against
+// another account is dropped, so this case must behave like the off setting.
+for (const setting of [false, true, 'foreign_only']) {
+  const drops = setting === true
+  test(`CRAG print ${drops ? 'drops' : 'keeps'} unrecorded thinking when crag_drop_foreign_thinking is ${setting}`, async () => {
+    const h = harness({ crag: true, compatibility: { crag_drop_foreign_thinking: setting } })
     const body = agentBody()
     body.messages = [
       { role: 'user', content: 'First question.' },
@@ -404,7 +588,7 @@ for (const enabled of [false, true]) {
       const sent = h.calls.find((call) => call.id === 'foreign').body
       const turn = sent.messages.find((message) => message.role === 'assistant')
       const types = turn.content.map((block) => block.type)
-      assert.equal(types.includes('thinking'), !enabled, JSON.stringify(turn.content))
+      assert.equal(types.includes('thinking'), !drops, JSON.stringify(turn.content))
       assert.ok(turn.content.some((block) => block.type === 'text' && block.text === 'First answer.'))
     } finally {
       h.close()

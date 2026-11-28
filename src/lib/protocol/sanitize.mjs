@@ -1,4 +1,5 @@
 import { mayRepairAutoModeReminder, repairAutoModeReminders } from './auto-mode-reminder.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
 /**
@@ -241,12 +242,74 @@ function reusableContent(content) {
   return true
 }
 
+function hasEmptyEffortKey(config) {
+  return (
+    config != null &&
+    typeof config === 'object' &&
+    !Array.isArray(config) &&
+    Object.prototype.hasOwnProperty.call(config, 'effort') &&
+    isEmptyEffortValue(config.effort)
+  )
+}
+
+function withoutEmptyEffort(config) {
+  if (!hasEmptyEffortKey(config)) return { value: config, changed: false }
+  const next = { ...config }
+  delete next.effort
+  return { value: Object.keys(next).length ? next : undefined, changed: true }
+}
+
+/**
+ * Treat empty / null / whitespace-only effort as omitted across top-level
+ * output_config, CRAG effort aliases, and per-message output_config so every
+ * downstream hop fills the model default instead of forwarding an empty value.
+ */
+export function stripEmptyEffort(body) {
+  if (!body || typeof body !== 'object') return body
+  let out = body
+  const ensureCopy = () => {
+    if (out === body) out = { ...body }
+    return out
+  }
+  const topConfig = withoutEmptyEffort(body.output_config)
+  if (topConfig.changed) {
+    const target = ensureCopy()
+    if (topConfig.value === undefined) delete target.output_config
+    else target.output_config = topConfig.value
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'effort') && isEmptyEffortValue(body.effort)) {
+    delete ensureCopy().effort
+  }
+  const cragOptions = withoutEmptyEffort(body.crag_options)
+  if (cragOptions.changed) {
+    const target = ensureCopy()
+    if (cragOptions.value === undefined) delete target.crag_options
+    else target.crag_options = cragOptions.value
+  }
+  if (Array.isArray(body.messages)) {
+    let messagesChanged = false
+    const messages = body.messages.map((message) => {
+      if (!message || typeof message !== 'object') return message
+      const msgConfig = withoutEmptyEffort(message.output_config)
+      if (!msgConfig.changed) return message
+      messagesChanged = true
+      const next = { ...message }
+      if (msgConfig.value === undefined) delete next.output_config
+      else next.output_config = msgConfig.value
+      return next
+    })
+    if (messagesChanged) ensureCopy().messages = messages
+  }
+  return out
+}
+
 export function canReuseCanonicalHistory(messages) {
   if (!Array.isArray(messages) || !messages.length) return false
   let previousRole = 'assistant'
   for (const message of messages) {
     const role = message?.role
     if ((role !== 'user' && role !== 'assistant') || role === previousRole) return false
+    if (hasEmptyEffortKey(message.output_config)) return false
     if (!Array.isArray(message.content) || !message.content.length || !reusableContent(message.content)) return false
     previousRole = role
   }
@@ -255,18 +318,20 @@ export function canReuseCanonicalHistory(messages) {
 
 export function sanitizeAnthropicBody(
   body,
-  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false } = {},
+  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {},
 ) {
   if (!body || typeof body !== 'object') return body
 
-  const out = copyOfficialAnthropicFields(body)
+  let out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
+  out = stripEmptyEffort(out)
 
   if (!preserveContentShape && out.system != null && typeof out.system !== 'string') {
     const list = Array.isArray(out.system)
     out.system = (list ? out.system : [out.system]).map((value, index) => {
       const source = canonicalSystemBlock(value, list ? `system[${index}]` : 'system')
       const block = { type: 'text', text: source.text }
+      if (source.citations !== undefined) block.citations = source.citations
       if (source.cache_control) block.cache_control = source.cache_control
       onSystemBlock?.(block, index)
       return block
@@ -284,7 +349,7 @@ export function sanitizeAnthropicBody(
     if (reuseCanonicalHistory && Array.isArray(out.messages)) {
       out.messages = out.messages.map((message) => (message && typeof message === 'object' ? { ...message } : message))
     }
-    normalizeAnthropicMessages(out)
+    normalizeAnthropicMessages(out, { preserveConsecutiveUser })
     stripIllegalBodyContentFields(out)
   }
 
@@ -320,7 +385,10 @@ export function sanitizeAnthropicBody(
  *     control which the per-message effort beta allows as the first entry
  *   - a system turn that cannot be kept still contributes its effort the same way
  */
-export function normalizeAnthropicMessages(body, { keepMidConversationSystem = true } = {}) {
+export function normalizeAnthropicMessages(
+  body,
+  { keepMidConversationSystem = true, preserveConsecutiveUser = false } = {},
+) {
   if (!body || !Array.isArray(body.messages)) return body
   repairAutoModeReminders(body)
 
@@ -346,6 +414,28 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
         if (effort) trailingEmptyEffort = effort
         continue
       }
+      if (!seenUser && keepMidConversationSystem) {
+        const split = splitLeadingSystemProtocolMessage(message)
+        if (split.hasProtocolBlocks) {
+          if (split.textBlocks.length) {
+            appendLiftedSystemMessage(systemParts, mapped, { ...message, content: split.textBlocks })
+          }
+          if (effort) {
+            liftedContentEffort = null
+            trailingEmptyEffort = null
+          }
+          mapped.push(keptAnthropicMessage({ ...message, content: split.remainingBlocks }, 'system'))
+          continue
+        }
+        if (message.clear_at != null) {
+          if (effort) {
+            liftedContentEffort = null
+            trailingEmptyEffort = null
+          }
+          mapped.push(keptAnthropicMessage(message, 'system'))
+          continue
+        }
+      }
       if (!seenUser || !keepMidConversationSystem) {
         appendLiftedSystemMessage(systemParts, mapped, message)
         if (effort) liftedContentEffort = effort
@@ -365,8 +455,8 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
     mapped.push(keptAnthropicMessage(message, nextRole))
   }
 
-  const merged = mergeConsecutiveAnthropicMessages(mapped)
-  if (merged.length && merged[0].role !== 'user' && !isEmptyEffortControl(merged[0])) {
+  const merged = mergeConsecutiveAnthropicMessages(mapped, { preserveConsecutiveUser })
+  if (merged.length && merged[0].role !== 'user' && !isLeadingSystemControl(merged[0])) {
     merged.unshift({ role: 'user', content: '.' })
   }
 
@@ -437,6 +527,40 @@ function messageOutputConfigEffort(message) {
   return typeof effort === 'string' && effort.trim() ? effort : null
 }
 
+const SYSTEM_PROTOCOL_CONTROL_BLOCK_TYPES = new Set(['tool_addition', 'tool_removal', 'tool_reference'])
+
+function isSystemProtocolControlBlock(block) {
+  return Boolean(block && typeof block === 'object' && SYSTEM_PROTOCOL_CONTROL_BLOCK_TYPES.has(block.type))
+}
+
+function isLiftableSystemTextBlock(part) {
+  if (typeof part === 'string') return true
+  if (!part || typeof part !== 'object') return false
+  return (
+    typeof part.text === 'string' && (part.type == null || ['text', 'input_text', 'output_text'].includes(part.type))
+  )
+}
+
+function splitLeadingSystemProtocolMessage(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) {
+    return { hasProtocolBlocks: false, textBlocks: [], remainingBlocks: [] }
+  }
+  const textBlocks = []
+  const remainingBlocks = []
+  let hasProtocolBlocks = false
+  for (const part of content) {
+    if (part == null) continue
+    if (isLiftableSystemTextBlock(part)) {
+      textBlocks.push(part)
+    } else {
+      if (isSystemProtocolControlBlock(part)) hasProtocolBlocks = true
+      remainingBlocks.push(part)
+    }
+  }
+  return { hasProtocolBlocks, textBlocks, remainingBlocks }
+}
+
 function isEmptyEffortControl(message) {
   const role = String(message?.role || '')
     .trim()
@@ -446,6 +570,16 @@ function isEmptyEffortControl(message) {
     anthropicContentIsEmpty(message?.content) &&
     !!messageOutputConfigEffort(message)
   )
+}
+
+function isLeadingSystemControl(message) {
+  if (isEmptyEffortControl(message)) return true
+  const role = String(message?.role || '')
+    .trim()
+    .toLowerCase()
+  if (role !== 'system' && role !== 'developer') return false
+  if (message?.clear_at != null && !anthropicContentIsEmpty(message?.content)) return true
+  return Array.isArray(message?.content) && message.content.some(isSystemProtocolControlBlock)
 }
 
 /**
@@ -530,11 +664,21 @@ export function anthropicContentIsEmpty(content) {
   })
 }
 
-export function mergeConsecutiveAnthropicMessages(messages) {
+export function mergeConsecutiveAnthropicMessages(
+  messages,
+  { preserveConsecutiveUser = false, preserveConsecutiveSystem = false } = {},
+) {
   const out = []
   for (const message of messages) {
     const last = out[out.length - 1]
-    if (!last || last.role !== message.role || messageHasTurnControls(last) || messageHasTurnControls(message)) {
+    if (
+      !last ||
+      last.role !== message.role ||
+      (preserveConsecutiveUser && message.role === 'user') ||
+      (preserveConsecutiveSystem && (message.role === 'system' || message.role === 'developer')) ||
+      messageHasTurnControls(last) ||
+      messageHasTurnControls(message)
+    ) {
       out.push({ ...message })
       continue
     }

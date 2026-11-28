@@ -45,6 +45,7 @@ function usageObject(body) {
 function hasAnthropicCacheNames(usage) {
   return (
     usage.cache_read_input_tokens != null ||
+    usage.cache_read_tokens != null ||
     usage.cache_creation_input_tokens != null ||
     (usage.cache_creation && typeof usage.cache_creation === 'object')
   )
@@ -228,6 +229,14 @@ export function mergeUsage(current, next) {
     if (value && typeof value === 'object' && !Array.isArray(value)) {
       const prev = out[key]
       out[key] = mergeUsage(prev && typeof prev === 'object' && !Array.isArray(prev) ? prev : {}, value)
+    } else if (
+      key === 'iterations' &&
+      Array.isArray(value) &&
+      value.length === 0 &&
+      Array.isArray(out[key]) &&
+      out[key].length > 0
+    ) {
+      continue
     } else {
       out[key] = value
     }
@@ -260,6 +269,7 @@ function detailScore(usage) {
   if (usage.output_tokens_details) score++
   if (usage.completion_tokens_details) score++
   if (usage.cache_creation && typeof usage.cache_creation === 'object') score++
+  if (Array.isArray(usage.iterations) && usage.iterations.length > 0) score++
   if (usage.cached_tokens != null || usage.cache_read_input_tokens != null || usage.cache_read_tokens != null) score++
   if (
     usage.cache_write_tokens != null ||

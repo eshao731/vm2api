@@ -41,6 +41,23 @@ test('session slots default to native capacity and clamp persisted values', () =
   assert.equal(normalizeInferenceConfig({}).session_slots, 20)
   assert.equal(normalizeInferenceConfig({}).prewarm_enabled, false)
   assert.equal(normalizeInferenceConfig({ prewarm_enabled: true }).prewarm_enabled, true)
+  // health_timeout_ms is consumed by rustHealthTimeoutMs; normalization must
+  // keep it or the panel can never configure it (silent dead key).
+  assert.equal(normalizeInferenceConfig({}).health_timeout_ms, 800)
+  assert.equal(normalizeInferenceConfig({ health_timeout_ms: 5000 }).health_timeout_ms, 5000)
+  assert.equal(normalizeInferenceConfig({ health_timeout_ms: -1 }).health_timeout_ms, 800)
+  // kernel_down_reprobe_ms (rustDownReprobeMs) must survive a panel save; 0 means "off".
+  assert.equal(normalizeInferenceConfig({}).kernel_down_reprobe_ms, 2500)
+  assert.equal(normalizeInferenceConfig({ kernel_down_reprobe_ms: 0 }).kernel_down_reprobe_ms, 0)
+  assert.equal(normalizeInferenceConfig({ kernel_down_reprobe_ms: 4000 }).kernel_down_reprobe_ms, 4000)
+  assert.equal(normalizeInferenceConfig({ kernel_down_reprobe_ms: 99999 }).kernel_down_reprobe_ms, 10000)
+  assert.equal(normalizeInferenceConfig({ kernel_down_reprobe_ms: -5 }).kernel_down_reprobe_ms, 2500)
+  // Saving an unrelated inference field keeps a configured re-probe window.
+  assert.equal(
+    normalizeInferenceConfig({ ...normalizeInferenceConfig({ kernel_down_reprobe_ms: 0 }), health_ttl_ms: 1500 })
+      .kernel_down_reprobe_ms,
+    0,
+  )
   assert.deepEqual(validateInferenceRoutingPatch({ inference: { prewarm_enabled: false } }), [])
   assert.ok(validateInferenceRoutingPatch({ inference: { prewarm_enabled: 'false' } }).length)
 })
@@ -125,11 +142,11 @@ test('crag kernel version is native v2, including a stored legacy pin', () => {
   ])
 })
 
-test('resolveCliSystemLayout follows persona_preset, not leftover inject-only', () => {
-  assert.equal(resolveCliSystemLayout({}, {}), 'identity')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'identity')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official' } }), 'identity')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_inject: 'rewrite' } }), 'identity')
+test('resolveCliSystemLayout follows unified persona_preset, not legacy identity alias', () => {
+  assert.equal(resolveCliSystemLayout({}, {}), 'official_full')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'official_full')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official' } }), 'official')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_inject: 'rewrite' } }), 'custom')
   assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'zero' } }), 'zero')
   assert.equal(
     resolveCliSystemLayout({ persona_preset: 'zero' }, { compatibility: { persona_inject: 'rewrite' } }),

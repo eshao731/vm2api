@@ -2,6 +2,7 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
 import { usedPctOf } from '@/lib/format'
+import { windowProbed } from '@/lib/pool-quota'
 import { isCodexVm, platformLabel } from '@/lib/vm-kind'
 import { claudeTier, fleetGroup, vmCredDead, vmFailedAt } from '@/lib/vm-status'
 import { vmCacheHitPct, vmTotalCost, vmWindowCosts } from '@/lib/vm-usage'
@@ -17,12 +18,16 @@ export type VmSortKey =
 /**
  * 状态优先级：在池 → 受限 → 关闭调用 → 未使用 → 无效凭证 → revoke。
  * cool / quota 是受限，不与在池同级。
+ * Gemini 的推理证据单独排列，不参与在池或坏凭证的排序口径。
  */
 function statusRank(vm: Vm): number {
   return (
     {
       pool: 0,
+      host_verified: 0.25,
+      pending: 0.5,
       restricted: 1,
+      host_failed: 1.5,
       off: 2,
       none: 3,
       unschedulable: 4,
@@ -95,8 +100,12 @@ export function sortVms(
     const db = vmCredDead(b)
     if (da !== db) return da ? 1 : -1
     if (da && db) return deadCmp(a, b)
-    if (key === 'remain' && !!a.gemini !== !!b.gemini) return a.gemini ? 1 : -1
-    if (key === 'remain' && a.gemini && b.gemini) return deadCmp(a, b)
+    if (key === 'remain') {
+      const ua = Boolean(a.gemini && !windowProbed(a, '5h'))
+      const ub = Boolean(b.gemini && !windowProbed(b, '5h'))
+      if (ua !== ub) return ua ? 1 : -1
+      if (ua && ub) return deadCmp(a, b)
+    }
     const av = val(a)
     const bv = val(b)
     if (typeof av === 'string' || typeof bv === 'string') {

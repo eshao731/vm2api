@@ -679,7 +679,35 @@ function extractResponsesText(body) {
   return parts.join('')
 }
 
-async function consumeResponsesResponse(res) {
+function strictFailureFromResponseStatus(status) {
+  if (status === 'completed') return null
+  if (status === 'incomplete') {
+    return { code: 'response_incomplete', message: 'upstream response status=incomplete' }
+  }
+  if (status === undefined || status === null || status === '') {
+    return { code: 'no_terminal_event', message: 'response.completed missing status=completed' }
+  }
+  return { code: 'response_not_completed', message: `upstream response status=${status}` }
+}
+
+function terminalResponsesFailure(code, message, partial = {}) {
+  return {
+    ok: false,
+    ...partial,
+    body: {
+      ...(partial.body && typeof partial.body === 'object' ? partial.body : {}),
+      error: { type: 'terminal_error', code, message },
+    },
+  }
+}
+
+/**
+ * OpenAI Responses loopback consumer. When `requireTerminal` is set (Codex
+ * preheat / auto-renew), a 2xx alone is not success: non-streaming bodies must
+ * have `status: completed`, and SSE must end with `response.completed` whose
+ * `response.status` is `completed`.
+ */
+export async function consumeResponsesResponse(res, { requireTerminal = false } = {}) {
   const status = res.status
   const headers = {}
   res.headers.forEach((v, k) => {
@@ -702,8 +730,7 @@ async function consumeResponsesResponse(res) {
   const ctype = String(headers['content-type'] || '')
   if (!ctype.includes('text/event-stream') && !ctype.includes('text/plain')) {
     const body = await res.json().catch(() => null)
-    return {
-      ok: true,
+    const base = {
       status,
       headers,
       body,
@@ -713,6 +740,20 @@ async function consumeResponsesResponse(res) {
       model: body?.model || null,
       vm_id: body?.kin?.vm_id || null,
     }
+    if (requireTerminal && String(body?.status || '') !== 'completed') {
+      const st = String(body?.status || '')
+      const code = st === 'incomplete' ? 'response_incomplete' : st ? 'response_not_completed' : 'no_terminal_event'
+      return terminalResponsesFailure(
+        code,
+        st === 'incomplete'
+          ? 'upstream response ended incomplete'
+          : st
+            ? `upstream response status=${st}`
+            : 'upstream JSON missing status=completed',
+        { ...base, ok: false },
+      )
+    }
+    return { ok: true, ...base }
   }
 
   let text = ''
@@ -721,6 +762,8 @@ async function consumeResponsesResponse(res) {
   let responseId = null
   let lastError = null
   let stopReason = null
+  let sawCompletedTerminal = false
+  let terminalFail = null
   const reader = res.body.getReader()
   const dec = new TextDecoder()
   let buf = ''
@@ -731,13 +774,29 @@ async function consumeResponsesResponse(res) {
       text += String(ev.delta || ev.text || '')
       return
     }
+    if (type === 'response.incomplete' && ev.response) {
+      if (ev.response.id) responseId = ev.response.id
+      if (ev.response.model) model = ev.response.model
+      if (ev.response.usage) usage = ev.response.usage
+      stopReason = ev.response.status || 'incomplete'
+      if (requireTerminal) {
+        terminalFail = { code: 'response_incomplete', message: 'upstream response.incomplete' }
+      }
+      return
+    }
     if (type === 'response.completed' && ev.response) {
       if (ev.response.id) responseId = ev.response.id
       if (ev.response.model) model = ev.response.model
       if (ev.response.usage) usage = ev.response.usage
       const completed = extractResponsesText(ev.response)
       if (completed && !text) text = completed
-      stopReason = ev.response.status || 'completed'
+      const rawStatus = ev.response.status
+      stopReason = rawStatus || 'completed'
+      if (requireTerminal) {
+        const fail = strictFailureFromResponseStatus(rawStatus)
+        if (fail) terminalFail = fail
+        else sawCompletedTerminal = true
+      }
       return
     }
     if (type === 'error' || type === 'response.failed') {
@@ -763,6 +822,30 @@ async function consumeResponsesResponse(res) {
       usage,
       stop_reason: stopReason,
       model,
+    }
+  }
+  if (requireTerminal) {
+    if (terminalFail) {
+      return terminalResponsesFailure(terminalFail.code, terminalFail.message, {
+        status,
+        headers,
+        text,
+        usage,
+        stop_reason: stopReason,
+        model,
+        body: { id: responseId, status: stopReason },
+      })
+    }
+    if (!sawCompletedTerminal) {
+      return terminalResponsesFailure('no_terminal_event', 'Responses stream ended without response.completed', {
+        status,
+        headers,
+        text,
+        usage,
+        stop_reason: stopReason,
+        model,
+        body: { id: responseId, status: stopReason },
+      })
     }
   }
   return {
@@ -815,7 +898,17 @@ function freshLoopbackRequest(rawUrl, init = {}) {
   })
 }
 
-async function postV1Loopback({ path, baseUrl, apiKey, inbound, headers, vmId, timeoutMs, extraHeaders = {} }) {
+async function postV1Loopback({
+  path,
+  baseUrl,
+  apiKey,
+  inbound,
+  headers,
+  vmId,
+  timeoutMs,
+  extraHeaders = {},
+  requireTerminal = false,
+}) {
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), timeoutMs)
   const endpoint = path === '/v1/responses' ? '/v1/responses' : '/v1/messages'
@@ -834,7 +927,9 @@ async function postV1Loopback({ path, baseUrl, apiKey, inbound, headers, vmId, t
       body: JSON.stringify(inbound),
       signal: ac.signal,
     })
-    return endpoint === '/v1/responses' ? await consumeResponsesResponse(res) : await consumeMessagesResponse(res)
+    return endpoint === '/v1/responses'
+      ? await consumeResponsesResponse(res, { requireTerminal })
+      : await consumeMessagesResponse(res)
   } catch (e) {
     const aborted = ac.signal.aborted
     return {
@@ -863,11 +958,11 @@ async function postV1Messages(opts) {
 }
 
 async function postV1Responses(opts) {
-  return postV1Loopback({ ...opts, path: '/v1/responses' })
+  return postV1Loopback({ ...opts, path: '/v1/responses', requireTerminal: opts.requireCodexTerminal === true })
 }
 
 /**
- * @param {{ projectRoot: string, vmId: string, model?: string, prompt?: string, max_tokens?: number, timeoutMs?: number, baseUrl?: string, apiKey?: string, accountQuota?: object }} opts
+ * @param {{ projectRoot: string, vmId: string, model?: string, prompt?: string, max_tokens?: number, timeoutMs?: number, baseUrl?: string, apiKey?: string, accountQuota?: object, requireCodexTerminal?: boolean }} opts
  */
 export async function runVmTestChat(opts = {}) {
   const projectRoot = opts.projectRoot
@@ -964,9 +1059,9 @@ export async function runVmTestChat(opts = {}) {
           dataplane === 'crag'
             ? ` · ${kernelRoute}`
             : cliHop
-              ? cliLayout === 'identity'
-                ? ' · cli-hop · CLI 官方提示词'
-                : ' · cli-hop · 0注入'
+              ? cliLayout === 'zero'
+                ? ' · cli-hop · 0注入'
+                : ' · cli-hop · CLI 官方提示词'
               : unofficial
                 ? ' · 非官方 inference 入站'
                 : ' · 官方 Claude Code 入站'
@@ -1151,6 +1246,7 @@ export async function runVmTestChat(opts = {}) {
       vmId,
       timeoutMs,
       extraHeaders: opts.extraHeaders || {},
+      requireCodexTerminal: opts.requireCodexTerminal === true,
     })
     if (codex && !result?.ok && looksLikeCodexUnauthorized(result)) {
       const first = readCodexAccounts(projectRoot, vmId)[0] || {}
@@ -1177,6 +1273,7 @@ export async function runVmTestChat(opts = {}) {
             vmId,
             timeoutMs,
             extraHeaders: opts.extraHeaders || {},
+            requireCodexTerminal: opts.requireCodexTerminal === true,
           })
         } else {
           push('error', `Codex OAuth 刷新失败: ${tok.error || 'refresh_failed'}`)
@@ -1210,6 +1307,16 @@ export async function runVmTestChat(opts = {}) {
       ...errObj,
       code: 'apikey_invalid',
       message: `${errObj.message}。Console Key 入站已去掉 oauth beta；上游仍 401 表示密钥无效。`,
+    }
+  } else if (errObj && opts.nodePenalty && /pinned node \S+ is busy/i.test(errObj.message)) {
+    // Rust reports every refused pin as NodeBusy; the slot is really in a scheduler cooldown.
+    const leftSec = Math.max(1, Math.ceil((Number(opts.nodePenalty.until) - Date.now()) / 1000))
+    errObj = {
+      ...errObj,
+      type: 'api_error',
+      code: 'node_cooldown',
+      message: `该槽位处于调度冷却（node_cooldown，原因 ${opts.nodePenalty.reason}），剩余约 ${Math.floor(leftSec / 60)} 分 ${leftSec % 60} 秒；不是并发泄漏或上游过载。可在槽位详情清除限制后重试。`,
+      upstream_message: errObj.message,
     }
   } else if (errObj && credMode === 'codex' && looksLikeCodexUnauthorized(result)) {
     const refreshFailed = log.some((row) => /OAuth 刷新失败/.test(String(row.message || '')))

@@ -1,43 +1,39 @@
+import {
+  CRAG_PROVIDER_EXECUTION_NAMES,
+  CRAG_PROVIDER_HISTORY_BLOCK_TYPES,
+  CRAG_PROVIDER_TOOL_NAMES,
+  assertNoUnrepresentableCragFields,
+  sanitizeCragBodyWhitelist,
+} from './crag-whitelist.mjs'
+import { rectifyCrag321Request } from './crag-321-rectifier.mjs'
 import { isSmallTextTurn, messageHasTurnControls, reusableContentBlock, sanitizeAnthropicBody } from './sanitize.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
-const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shape', 'request_id', 'delivery_mode']
+const INTERNAL_FIELDS = [
+  'gateway_policy',
+  'request_context',
+  'kin_outbound_shape',
+  'request_id',
+  'delivery_mode',
+  'prompt_spec',
+]
+const STRICT_PRIVATE_FIELDS = new Set([...INTERNAL_FIELDS, 'caller_cwd'])
 const CRAG_ALIASES = new Set(['model', 'max_tokens', 'effort', 'cache_ttl', 'session_slots'])
-const CRAG_PROVIDER_TOOLS = new Map([
-  ['web_search_20250305', 'web_search'],
-  ['web_search_20260209', 'web_search'],
-  ['web_fetch_20250910', 'web_fetch'],
-  ['web_fetch_20260209', 'web_fetch'],
-  ['code_execution_20250522', 'code_execution'],
-  ['code_execution_20250825', 'code_execution'],
-  ['code_execution_20260120', 'code_execution'],
-  ['code_execution_20260521', 'code_execution'],
-  ['tool_search_tool_regex_20251119', 'tool_search_tool_regex'],
-  ['tool_search_tool_bm25_20251119', 'tool_search_tool_bm25'],
-])
-const CRAG_PROVIDER_HISTORY = new Set([
-  'web_search_tool_result',
-  'web_fetch_tool_result',
-  'code_execution_tool_result',
-  'bash_code_execution_tool_result',
-  'text_editor_code_execution_tool_result',
-  'tool_search_tool_result',
-  'container_upload',
-])
-const CRAG_PROVIDER_NAMES = new Set([
-  ...CRAG_PROVIDER_TOOLS.values(),
-  'bash_code_execution',
-  'text_editor_code_execution',
-])
 
-function invalid(param, reason) {
+function invalid(param, reason, code = 'invalid_kernel_request', details = null) {
   const message = `${param}: ${reason}`
   const error = new Error(message)
   error.status = 400
-  error.code = 'invalid_kernel_request'
+  error.code = code
   error.body = {
     type: 'error',
-    error: { type: 'invalid_request_error', code: error.code, message, param, details: { retryable: false } },
+    error: {
+      type: 'invalid_request_error',
+      code,
+      message,
+      param,
+      details: { retryable: false, ...(details || {}) },
+    },
   }
   throw error
 }
@@ -53,7 +49,7 @@ export function needsCragProviderCompatibility(body, capabilities) {
   for (const [index, tool] of (Array.isArray(body?.tools) ? body.tools : []).entries()) {
     const type = tool?.type
     if (type == null || type === 'custom' || type === 'advisor_20260301') continue
-    const name = CRAG_PROVIDER_TOOLS.get(type)
+    const name = CRAG_PROVIDER_TOOL_NAMES.get(type)
     if ((native || name) && (!providerTools || !name)) {
       invalid(`tools[${index}].type`, 'this CRAG runtime does not support this provider-managed tool')
     }
@@ -71,8 +67,10 @@ export function needsCragProviderCompatibility(body, capabilities) {
         Array.isArray(message?.content) &&
         message.content.some(
           (block) =>
-            CRAG_PROVIDER_HISTORY.has(block?.type) ||
-            (block?.type === 'server_tool_use' && CRAG_PROVIDER_NAMES.has(block.name)),
+            (CRAG_PROVIDER_HISTORY_BLOCK_TYPES.has(block?.type) &&
+              block?.type !== 'advisor_tool_result' &&
+              block?.type !== 'server_tool_use') ||
+            (block?.type === 'server_tool_use' && CRAG_PROVIDER_EXECUTION_NAMES.has(block.name)),
         ),
     )
   if (history && native && !providerTools)
@@ -127,7 +125,24 @@ function validateMessages(messages, checkReuse = false) {
   return reusable
 }
 
-function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
+function hasInlineToolDefinition(messages, name) {
+  if (!Array.isArray(messages) || typeof name !== 'string' || !name) return false
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (
+        block?.type === 'tool_addition' &&
+        block.tool?.type === 'tool_definition' &&
+        block.tool.definition?.name === name
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function canonicalRequest(body, { reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {}) {
   if (!object(body)) invalid('body', 'must be an object')
   const tools = normalizeToolInputSchemas(body.tools, invalid)
   if (tools !== body.tools) body = { ...body, tools }
@@ -154,7 +169,11 @@ function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
       }
       names.add(tool.name)
     }
-    if (body.tool_choice?.type === 'tool' && !names.has(body.tool_choice.name)) {
+    if (
+      body.tool_choice?.type === 'tool' &&
+      !names.has(body.tool_choice.name) &&
+      !hasInlineToolDefinition(body.messages, body.tool_choice.name)
+    ) {
       invalid('tool_choice.name', 'must identify a supplied tool')
     }
   }
@@ -163,6 +182,7 @@ function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
   // changing tool IDs or thinking signatures here invalidates CRAG continuation hashes.
   const out = sanitizeAnthropicBody(body, {
     reuseCanonicalHistory: reuseCanonicalHistory && ((messages) => validateMessages(messages, true)),
+    preserveConsecutiveUser,
   })
   for (const key of INTERNAL_FIELDS) delete out[key]
   if (!out.messages.length) invalid('messages', 'contains no content after normalization')
@@ -170,8 +190,33 @@ function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
 }
 
 /** Structured native_messages: the CLI owns system layout and cache policy. */
-export function prepareCliNodeRequest(body) {
-  const out = canonicalRequest(body)
+export function prepareCliNodeRequest(body, { requestContext = null } = {}) {
+  if (body?.service_tier != null) {
+    if (body.service_tier !== 'auto' && body.service_tier !== 'standard_only') {
+      invalid('service_tier', 'must be "auto" or "standard_only"')
+    }
+    if (body.service_tier === 'standard_only') {
+      invalid(
+        'service_tier',
+        'service_tier="standard_only" is not supported on the Claude VM / cli-node execution path; omit service_tier or use "auto" if default capacity is acceptable',
+        'unsupported_capability',
+        { field: 'service_tier', value: body.service_tier, execution_path: 'claude_vm' },
+      )
+    }
+  }
+  const out = canonicalRequest(body, {
+    preserveConsecutiveUser: requestContext?.purpose === 'auto_mode_classifier',
+  })
+  if (
+    Array.isArray(out.tools) &&
+    out.tools.some((t) => String(t?.type || '').startsWith('advisor_') && Object.hasOwn(t, 'input_schema'))
+  ) {
+    out.tools = out.tools.map((t) => {
+      if (!t || !String(t.type || '').startsWith('advisor_') || !Object.hasOwn(t, 'input_schema')) return t
+      const { input_schema: _dropped, ...rest } = t
+      return rest
+    })
+  }
   for (const key of Object.keys(out)) {
     if (key.startsWith('crag_')) delete out[key]
   }
@@ -179,26 +224,59 @@ export function prepareCliNodeRequest(body) {
   delete out.cacheTtl
   delete out.session_slots
   delete out.effort
+  if (out.service_tier === 'auto') delete out.service_tier
   return out
 }
 
 /** Native CRAG imports history itself; PTY projection remains worker-owned. */
-export function prepareCragRequest(body, health) {
-  const out = canonicalRequest(body, { reuseCanonicalHistory: !isSmallTextTurn(body) })
-  if (needsCragProviderCompatibility(out, health?.capabilities) && out.crag_prompt != null) {
+export function prepareCragRequest(
+  body,
+  health,
+  { requestContext = null, strictPassthrough = false, safeguardsSanitized = false } = {},
+) {
+  if (strictPassthrough) {
+    if (!object(body)) invalid('body', 'must be an object')
+    if (typeof body.model !== 'string' || !body.model.trim()) invalid('model', 'is required')
+    if (!Array.isArray(body.messages) || !body.messages.length) invalid('messages', 'must be a non-empty array')
+    const out = {}
+    for (const [key, value] of Object.entries(body)) {
+      if (value === undefined || STRICT_PRIVATE_FIELDS.has(key)) continue
+      out[key] = value
+    }
+    const rectified = rectifyCrag321Request(out, {
+      strictPassthrough: true,
+      capabilities: health?.capabilities,
+    })
+    if (!rectified.messages.some((message) => message.role === 'user')) invalid('messages', 'must include a user turn')
+    return rectified
+  }
+  assertNoUnrepresentableCragFields(body)
+  const isClassifier = requestContext?.purpose === 'auto_mode_classifier'
+  const reuseHistory = !isSmallTextTurn(body) && !isClassifier
+  const normalized = canonicalRequest(body, {
+    reuseCanonicalHistory: reuseHistory,
+    preserveConsecutiveUser: isClassifier,
+  })
+  if (needsCragProviderCompatibility(normalized, health?.capabilities) && normalized.crag_prompt != null) {
     invalid('crag_prompt', 'provider compatibility requests must use system instead')
   }
-  delete out.auto_compact_window
-  // Claude Code 2.1.325+ sends `diagnostics: { previous_message_id }` (cache-diagnosis beta) on every turn.
-  // CRAG's bundled Claude Code predates it and rejects the whole request with 400
-  // "unsupported request field: diagnostics"; the field only asks for optional cache diagnostics.
-  delete out.diagnostics
+  const { body: out } = sanitizeCragBodyWhitelist(normalized, {
+    capabilities: health?.capabilities,
+    health,
+    preserveCanonicalHistory: reuseHistory,
+    toolsNormalized: true,
+    safeguardsSanitized,
+  })
   if (out.crag_options != null) {
     if (!object(out.crag_options)) invalid('crag_options', 'must be an object')
     const aliases = Object.fromEntries(Object.entries(out.crag_options).filter(([key]) => CRAG_ALIASES.has(key)))
     if (Object.keys(aliases).length) out.crag_options = aliases
     else delete out.crag_options
   }
-  if (!out.messages.some((message) => message.role === 'user')) invalid('messages', 'must include a user turn')
-  return out
+  const rectified = rectifyCrag321Request(out, {
+    strictPassthrough: false,
+    capabilities: health?.capabilities,
+  })
+  if (!rectified.messages.some((message) => message.role === 'user')) invalid('messages', 'must include a user turn')
+  return rectified
 }
