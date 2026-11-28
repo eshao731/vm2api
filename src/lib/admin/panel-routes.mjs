@@ -57,7 +57,7 @@ import {
   persistCodexCredentialState,
   markCodexGrantDead,
 } from '../vm/codex-slot.mjs'
-import { clearOpenAIAccountHold } from '../pool/openai-account-runtime.mjs'
+import { clearOpenAIAccountHold, onOpenAICredentialReplaced } from '../pool/openai-account-runtime.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -557,10 +557,18 @@ async function commitImportedCodexVm({
   account,
   catalogClientVersion = 'auto',
   routingConfig = {},
+  schedulerRuntime = null,
 }) {
   const wasCodex = isCodexVm(existing)
   const previousPolicy = existing.policy && typeof existing.policy === 'object' ? existing.policy : {}
+  const previousCredential = readCodexAccounts(cfg.paths.project, existing.id)[0]
   const saved = upsertCodexAccount(cfg.paths.project, existing.id, account, { replaceCredentials: true })
+  const credentialChanged =
+    (saved.access_token || '') !== (previousCredential?.access_token || '') ||
+    (saved.refresh_token || '') !== (previousCredential?.refresh_token || '')
+  const credentialVersion = credentialChanged
+    ? Math.max(Date.now(), Number(existing.codex?._token_version || 0) + 1)
+    : existing.codex?._token_version
   existing.platform = 'openai'
   existing.family = 'codex'
   existing.codex_kernel = true
@@ -571,6 +579,7 @@ async function commitImportedCodexVm({
     chatgpt_account_id: saved.chatgpt_account_id || null,
     email: saved.email || null,
     expires_at: saved.expires_at || null,
+    ...(credentialVersion ? { _token_version: credentialVersion } : {}),
   }
   const global = normalizeOpenAIQuotaPolicy(routingConfig.codex?.quota || {})
   const preservePin = (value, override) =>
@@ -605,9 +614,12 @@ async function commitImportedCodexVm({
   if (saved.access_token || saved.refresh_token) {
     const reopened = clearUnschedulable(cfg.paths.project, existing.id, { by: 'credential_import' })
     if (reopened) Object.assign(existing, getVm(cfg.paths.project, existing.id) || {})
-    // 凭证换新同时清进程内存 hold（含 grant-death 的 MAX_SAFE_INTEGER 永久占位），
-    // 否则复活号磁盘健康但调度层恒 cooldown，直到进程重启才回池。
-    clearOpenAIAccountHold(existing.id)
+    if (credentialChanged) {
+      onOpenAICredentialReplaced(existing.id)
+      try {
+        await schedulerRuntime?.unrestNode?.(`codex_vm:${existing.id}`)
+      } catch {}
+    }
   }
   let catalog = null
   try {
@@ -7175,6 +7187,7 @@ export function createPanelHandler(ctx) {
               account,
               catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
               routingConfig: ctx.routingConfig,
+              schedulerRuntime: resolveSchedulerRuntime(),
             })
             return json(res, 200, panel.ok(committed))
           }
@@ -7401,6 +7414,7 @@ export function createPanelHandler(ctx) {
               existing,
               catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
               routingConfig: ctx.routingConfig,
+              schedulerRuntime: resolveSchedulerRuntime(),
               account: {
                 access_token: oauth.access_token,
                 refresh_token: oauth.refresh_token,

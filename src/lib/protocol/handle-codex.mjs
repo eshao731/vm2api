@@ -66,6 +66,7 @@ import {
   refreshCodexAccessToken,
 } from './codex-models.mjs'
 import { codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
+import { openAICredentialGeneration } from '../pool/openai-account-runtime.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { canonicalImageToolModel, imageGenerationTools } from './image-tool-models.mjs'
 import { isImageToolModelEnabled, resolveGptFastAlias } from './gpt-model-policy.mjs'
@@ -948,35 +949,45 @@ export async function handleCodexProtocol({
     activeVmId = String(acquired.selected_node?.node_id || '')
     if (acquired.resolved_pool_id) logBag.resolved_pool_id = acquired.resolved_pool_id
 
-    const switchCodexNode = async (failureReport) => {
+    const switchCodexNode = async (failureReport, { neutral = false } = {}) => {
       excludedNodeKeys.add(formatNodeKey('codex_vm', activeVmId))
       switches += 1
       if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts || preCheck.pin) {
-        await releaseActiveLeaseNow({
-          outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
-          http_status: failureReport.http_status || undefined,
-          error_class: failureReport.error_class,
-          error_signature: failureReport.error_signature,
-          error_message: failureReport.error_message,
-          retry_after_sec: failureReport.retry_after_sec,
-        })
+        await releaseActiveLeaseNow(
+          neutral
+            ? { outcome: 'aborted' }
+            : {
+                outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+                http_status: failureReport.http_status || undefined,
+                error_class: failureReport.error_class,
+                error_signature: failureReport.error_signature,
+                error_message: failureReport.error_message,
+                retry_after_sec: failureReport.retry_after_sec,
+              },
+        )
         return { ok: false, exhausted: true }
       }
       const prevLeaseId = activeLeaseId
       activeLeaseId = null
       try {
-        const switched = await rt.switchNode(
-          {
-            release_lease_id: prevLeaseId,
-            failure: failureReport,
-            next_attempt: {
-              ...baseAcquireParams,
-              attemptNo: attempts + 1,
-              excludeNodes: [...excludedNodeKeys],
-            },
-          },
-          { signal: gone.signal },
-        )
+        const nextAttempt = {
+          ...baseAcquireParams,
+          attemptNo: attempts + 1,
+          excludeNodes: [...excludedNodeKeys],
+        }
+        const switched = neutral
+          ? await (async () => {
+              await rt.releaseLease(prevLeaseId, { outcome: 'aborted' })
+              return rt.acquireNode(nextAttempt, { signal: gone.signal })
+            })()
+          : await rt.switchNode(
+              {
+                release_lease_id: prevLeaseId,
+                failure: failureReport,
+                next_attempt: nextAttempt,
+              },
+              { signal: gone.signal },
+            )
         activeLeaseId = switched.lease_id
         activeVmId = String(switched.selected_node?.node_id || '')
         activeCommitted = false
@@ -1012,6 +1023,8 @@ export async function handleCodexProtocol({
         if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
         break
       }
+      const runtimeCredentialGeneration = openAICredentialGeneration(vm.id)
+      const credentialVersion = Number(vm.codex?._token_version || 0)
       attempts += 1
       if (attempts > failoverBudget.maxAttempts) {
         await releaseActiveLeaseNow({ outcome: 'error' })
@@ -1297,6 +1310,9 @@ export async function handleCodexProtocol({
       const preferredUsage = preferUsage(hopUsage, streamedUsage)
       const usage = mergeUsage(preferredUsage === hopUsage ? streamedUsage : hopUsage, preferredUsage)
       const delivered = !policyRefusal && !conversionError && result?.ok
+      const liveCredentialVersion = Number(getVm(projectRoot, vm.id)?.codex?._token_version || 0)
+      const staleCredential =
+        runtimeCredentialGeneration !== openAICredentialGeneration(vm.id) || liveCredentialVersion > credentialVersion
 
       if (delivered) {
         const serviceTier = normalizeServiceTier(outboundBody.service_tier)
@@ -1320,7 +1336,7 @@ export async function handleCodexProtocol({
         }
         const totalTokens = Number(logged?.input_tokens || 0) + Number(logged?.output_tokens || 0)
         await releaseActiveLeaseNow({
-          outcome: 'ok',
+          outcome: staleCredential ? 'aborted' : 'ok',
           http_status: 200,
           ...(Number.isFinite(result?.ttftMs) ? { ttft_ms: Math.max(0, Math.round(result.ttftMs)) } : {}),
           ...(totalTokens > 0 ? { tokens_used: totalTokens } : {}),
@@ -1381,20 +1397,27 @@ export async function handleCodexProtocol({
         return res.end()
       }
 
-      if (!policyRefusal && isCodexGrantDead(result)) {
+      if (!staleCredential && !policyRefusal && isCodexGrantDead(result)) {
         try {
-          persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
-          markCodexGrantDead(projectRoot, vm.id, {
-            description: result?.body?.error?.message || result?.body?.error?.code || null,
-            status: Number(result.status) || 0,
-          })
-          rt.enqueueTelemetry?.([
+          const parked = markCodexGrantDead(
+            projectRoot,
+            vm.id,
             {
-              node_key: formatNodeKey('codex_vm', vm.id),
-              schedulable: false,
-              unschedulable_reason: 'oauth_revoked',
+              description: result?.body?.error?.message || result?.body?.error?.code || null,
+              status: Number(result.status) || 0,
             },
-          ])
+            { tokenVersion: credentialVersion || null },
+          )
+          if (parked?.unschedulable?.reason === 'oauth_revoked') {
+            persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
+            rt.enqueueTelemetry?.([
+              {
+                node_key: formatNodeKey('codex_vm', vm.id),
+                schedulable: false,
+                unschedulable_reason: 'oauth_revoked',
+              },
+            ])
+          }
         } catch {}
       }
 
@@ -1431,7 +1454,7 @@ export async function handleCodexProtocol({
       }
 
       if (!policyRefusal && isCodexFailoverError(result)) {
-        const sw = await switchCodexNode(failureReport)
+        const sw = await switchCodexNode(failureReport, { neutral: staleCredential })
         if (sw.ok) continue
         if (sw.aborted) {
           logBag.final_state = 'cancelled'

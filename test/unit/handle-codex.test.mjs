@@ -15,7 +15,11 @@ import {
 } from '../../src/lib/protocol/handle-codex.mjs'
 import { persistCodexUsage, getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
-import { openAIAccountHold, resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import {
+  onOpenAICredentialReplaced,
+  openAIAccountHold,
+  resetOpenAIAccountRuntime,
+} from '../../src/lib/pool/openai-account-runtime.mjs'
 import { codexSlotAllowsModel } from '../../src/lib/pool/codex-slot-pool.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../../src/lib/pool/active-hours.mjs'
 import { markCodexGrantDead, persistCodexCredentialState } from '../../src/lib/vm/codex-slot.mjs'
@@ -1297,6 +1301,32 @@ test('a 401 parks the GPT slot so the next request skips it', async () => {
   assert.deepEqual(seen, ['vm-gpt-b'])
   rt.resetOpenAIAccountRuntime()
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a 401 from an in-flight old credential does not park the replacement', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-reauth-inflight-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
+  const seen = []
+  const out = await handleCodexProtocol(
+    codexArgs(root, {
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ exec, onEvent }) => {
+        seen.push(exec.vm.id)
+        if (exec.vm.id === 'vm-gpt-a') {
+          onOpenAICredentialReplaced(exec.vm.id)
+          return { ok: false, status: 401, committed: false, body: { error: { code: 'token_revoked' } } }
+        }
+        await onEvent('data: {"type":"response.completed"}')
+        return { ok: true, status: 200, terminalState: 'verified' }
+      },
+    }),
+  )
+  assert.equal(out.status, 200)
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+  assert.equal(openAIAccountHold('vm-gpt-a'), null)
+  assert.equal(mockCodexRuntimeFor(root).heldVms.has('vm-gpt-a'), false)
+  assert.equal(getVm(root, 'vm-gpt-a').unschedulable, undefined)
 })
 
 test('failure holds ignore committed streams and request-shaped 400s', () => {

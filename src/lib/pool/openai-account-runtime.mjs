@@ -18,22 +18,23 @@ const feedback = new Map()
 // This is deliberately not the operator switch, which must not be flipped by
 // a transient 401/429/5xx. The hold expires on its own.
 const holds = new Map()
+const authHolds = new Map()
 let roundRobinCursor = 0
 
 function slotOf(id) {
   const key = String(id || '')
   let slot = slots.get(key)
   if (!slot) {
-    slot = { inFlight: 0, lastStartedAt: null, starts: [] }
+    slot = { inFlight: 0, lastStartedAt: null, starts: [], credentialGeneration: 0 }
     slots.set(key, slot)
   }
   return slot
 }
 
-function decayedFailure(entry, now) {
-  if (!entry?.updatedAt) return entry?.value || 0
+function failureDecay(entry, now) {
+  if (entry.updatedAt == null) return 1
   const elapsed = Math.max(0, now - entry.updatedAt)
-  return entry.value * 0.5 ** (elapsed / FAILURE_HALF_LIFE_MS)
+  return 0.5 ** (elapsed / FAILURE_HALF_LIFE_MS)
 }
 
 function recentStarts(slot, now) {
@@ -46,7 +47,7 @@ export function openAIRuntimeSignals(id, now = Date.now()) {
   const key = String(id || '')
   const slot = slots.get(key)
   const entry = feedback.get(key)
-  const failure = entry ? decayedFailure(entry, now) : 0
+  const failure = entry ? (entry.failure + entry.authFailure) * failureDecay(entry, now) : 0
   const latency = entry?.latency
   return {
     inFlight: slot?.inFlight || 0,
@@ -62,16 +63,23 @@ export function openAIRuntimeSnapshot(id, now = Date.now()) {
   return openAIRuntimeSignals(id, now)
 }
 
+function liveHold(map, key, now) {
+  const hold = map.get(key)
+  if (!hold) return null
+  if (hold.until <= now) {
+    map.delete(key)
+    return null
+  }
+  return hold
+}
+
 /** Live failure hold for a GPT account, or null once it has expired. */
 export function openAIAccountHold(id, now = Date.now()) {
   const key = String(id || '')
-  const hold = holds.get(key)
-  if (!hold) return null
-  if (hold.until <= now) {
-    holds.delete(key)
-    return null
-  }
-  return { until: hold.until, reason: hold.reason, set_at: hold.set_at }
+  const other = liveHold(holds, key, now)
+  const auth = liveHold(authHolds, key, now)
+  const hold = !other || (auth && auth.until > other.until) ? auth : other
+  return hold ? { ...hold } : null
 }
 
 /** Park an account after an uncommitted upstream failure. Longest live hold wins. */
@@ -79,15 +87,32 @@ export function holdOpenAIAccount(id, { until, reason = 'upstream_error', now = 
   const key = String(id || '')
   const at = Number(until) || 0
   if (!key || !(at > now)) return null
-  const current = holds.get(key)
-  if (current && current.until >= at) return { ...current }
-  const next = { until: at, reason: String(reason || 'upstream_error'), set_at: now }
-  holds.set(key, next)
-  return { ...next }
+  const code = String(reason || 'upstream_error')
+  const map = code === 'oauth_401' || code === 'permission_denied' ? authHolds : holds
+  const current = map.get(key)
+  if (!current || current.until < at) map.set(key, { until: at, reason: code, set_at: now })
+  return openAIAccountHold(key, now)
 }
 
 export function clearOpenAIAccountHold(id) {
-  holds.delete(String(id || ''))
+  const key = String(id || '')
+  holds.delete(key)
+  authHolds.delete(key)
+}
+
+export function openAICredentialGeneration(id) {
+  return slots.get(String(id || ''))?.credentialGeneration ?? 0
+}
+
+/** Replacing a credential invalidates its auth failures and late responses. */
+export function onOpenAICredentialReplaced(id) {
+  const key = String(id || '')
+  if (!key) return
+  slotOf(key).credentialGeneration += 1
+  authHolds.delete(key)
+  const entry = feedback.get(key)
+  if (entry) entry.authFailure = 0
+  wakeOpenAIWaiter(key)
 }
 
 export function readOpenAICursor() {
@@ -195,12 +220,12 @@ export function waitForOpenAICapacity({ deadline, signal = null, accounts = null
 export function reportOpenAIAttempt(id, kind, firstOutputMs = null, now = Date.now()) {
   const key = String(id || '')
   if (!key) return
-  if (kind === 'succeeded') holds.delete(key)
-  const entry = feedback.get(key) || { value: 0, updatedAt: null, latency: null }
-  const sample = kind === 'succeeded' ? 0 : 1
+  if (kind === 'succeeded') clearOpenAIAccountHold(key)
+  const entry = feedback.get(key) || { failure: 0, authFailure: 0, updatedAt: null, latency: null }
   const alpha = kind === 'capacity_rejected' ? CAPACITY_ALPHA : FAILURE_ALPHA
-  const decayed = decayedFailure(entry, now)
-  entry.value = alpha * sample + (1 - alpha) * decayed
+  const carry = (1 - alpha) * failureDecay(entry, now)
+  entry.failure = carry * entry.failure + (kind === 'succeeded' || kind === 'auth_failed' ? 0 : alpha)
+  entry.authFailure = carry * entry.authFailure + (kind === 'auth_failed' ? alpha : 0)
   entry.updatedAt = now
   const latency = Number(firstOutputMs)
   if (Number.isFinite(latency) && latency > 0) {
@@ -213,6 +238,7 @@ export function resetOpenAIAccountRuntime() {
   slots.clear()
   feedback.clear()
   holds.clear()
+  authHolds.clear()
   for (const entry of waiters.splice(0)) entry.wake()
   roundRobinCursor = 0
 }

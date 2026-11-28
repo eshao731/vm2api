@@ -5,6 +5,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import {
+  holdOpenAIAccount,
+  openAIAccountHold,
+  openAIRuntimeSignals,
+  reportOpenAIAttempt,
+  resetOpenAIAccountRuntime,
+  tryAcquireOpenAISlot,
+} from '../../src/lib/pool/openai-account-runtime.mjs'
+import {
   enrichCodexAccountIdentity,
   parseCodexCredentialInput,
   readCodexAccounts,
@@ -234,9 +242,12 @@ test('refresh preserves explicit identity while credential replacement clears th
   assert.equal(identified.id, 'other@example.com')
 })
 
-test('panel import replaces credentials and returns the current account email', async (t) => {
+test('panel import replaces credentials and clears their auth feedback while preserving unrelated limits', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-panel-id-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  t.after(() => {
+    resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   const vmId = 'vm-01'
   fs.mkdirSync(path.join(root, 'vms', vmId), { recursive: true })
   const vmFile = path.join(root, 'vms', `${vmId}.json`)
@@ -255,15 +266,29 @@ test('panel import replaces credentials and returns the current account email', 
     refresh_token: 'old-rt',
     id_token: jwt({ email: 'old@example.com' }),
   })
+  const now = Date.now()
+  const unrested = []
+  let previousCredentialVersion = 0
+  const activeLease = tryAcquireOpenAISlot(vmId, { concurrency: 2, now })
+  reportOpenAIAttempt(vmId, 'failed', 3000, now)
+  holdOpenAIAccount(vmId, { until: now + 60_000, reason: 'rate_limited', now })
   for (const [token, expectedEmail] of [
     [jwt({ email: 'new@example.com' }), 'new@example.com'],
     ['opaque-at', null],
   ]) {
+    reportOpenAIAttempt(vmId, 'auth_failed', null, now)
+    holdOpenAIAccount(vmId, { until: now + 300_000, reason: 'oauth_401', now })
+    assert.equal(openAIAccountHold(vmId, now).reason, 'oauth_401')
     let status
     let response
     const handlePanel = createPanelHandler({
       cfg: { paths: { project: root } },
       routingConfig: { codex: { catalog_client_version: '0.160.0' } },
+      schedulerRuntime: {
+        async unrestNode(nodeKey) {
+          unrested.push(nodeKey)
+        },
+      },
       requireAuth(req) {
         req.apiKeyKind = 'master'
         req.panelRole = 'admin'
@@ -285,8 +310,18 @@ test('panel import replaces credentials and returns the current account email', 
     assert.equal(saved.access_token, token)
     assert.equal(saved.refresh_token, '')
     assert.equal(saved.id_token, '')
-    assert.equal(JSON.parse(fs.readFileSync(vmFile, 'utf8')).codex.email, expectedEmail)
+    const writtenVm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    assert.equal(writtenVm.codex.email, expectedEmail)
+    assert.ok(writtenVm.codex._token_version > previousCredentialVersion)
+    previousCredentialVersion = writtenVm.codex._token_version
+    assert.equal(unrested.at(-1), `codex_vm:${vmId}`)
+    assert.equal(openAIAccountHold(vmId, now).reason, 'rate_limited')
+    assert.equal(openAIRuntimeSignals(vmId, now).inFlight, 1)
+    assert.equal(openAIRuntimeSignals(vmId, now).rpmCount, 1)
+    assert.equal(openAIRuntimeSignals(vmId, now).firstOutputLatencyMs, 3000)
   }
+  assert.equal(openAIRuntimeSignals(vmId, now).failureRateBps, 1280)
+  activeLease.release()
 })
 
 test('enrichCodexAccountIdentity extracts email from OAuth id_token', () => {
